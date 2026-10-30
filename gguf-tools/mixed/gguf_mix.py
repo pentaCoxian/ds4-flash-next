@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""List GGUF tensors and splice routed-expert layers between two GGUFs.
+"""List GGUF tensors and splice tensors between two GGUFs.
 
   gguf_mix.py list FILE
       one tab-separated line per tensor: name, type, dims, absolute data
       offset and payload bytes, then the payload per type.
 
   gguf_mix.py splice --base B --donor D --q4-layers 37-42 --out OUT
+  gguf_mix.py splice --base B --donor D --tensors REGEX --out OUT
       the base GGUF supplies metadata and all tensors by default.  For the
       selected layer IDs the routed expert tensors come from the donor GGUF,
-      rewriting the tensor directory and streaming the payloads without
-      dequantizing or requantizing.
+      or every tensor whose name REGEX matches (re.fullmatch), rewriting the
+      tensor directory and streaming the payloads without dequantizing or
+      requantizing.  The output records the base and donor file names and
+      the selection as general.mix.* strings.
 """
 
 from __future__ import annotations
@@ -263,7 +266,9 @@ def parse_layer_set(spec: str) -> set[int]:
     return layers
 
 
-def should_take_donor(name: str, q4_layers: set[int]) -> bool:
+def should_take_donor(name: str, q4_layers: set[int] | None, tensors: re.Pattern | None = None) -> bool:
+    if tensors is not None:
+        return tensors.fullmatch(name) is not None
     match = EXPERT_TENSOR_RE.match(name)
     return match is not None and int(match.group(1)) in q4_layers
 
@@ -272,7 +277,8 @@ def qtype_name(ggml_type: int) -> str:
     return GGML_QUANT_SIZES.get(ggml_type, (0, 0, f"type_{ggml_type}"))[2]
 
 
-def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[SplicePlan]:
+def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int] | None,
+               tensors: re.Pattern | None = None) -> list[SplicePlan]:
     if base.version != donor.version:
         raise ValueError(f"GGUF version mismatch: base={base.version} donor={donor.version}")
     if base.tensor_count != donor.tensor_count:
@@ -288,7 +294,7 @@ def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[Spl
             raise ValueError(f"donor is missing tensor {base_tensor.name}")
         if base_tensor.dims != donor_tensor.dims:
             raise ValueError(f"shape mismatch for {base_tensor.name}: {base_tensor.dims} vs {donor_tensor.dims}")
-        use_donor = should_take_donor(base_tensor.name, q4_layers)
+        use_donor = should_take_donor(base_tensor.name, q4_layers, tensors)
         source_tensor = donor_tensor if use_donor else base_tensor
         plan.append(SplicePlan(
             name=base_tensor.name,
@@ -331,7 +337,16 @@ def write_padding(out: BinaryIO, n_bytes: int, alignment: int) -> None:
         out.write(b"\0" * pad)
 
 
-def write_mixed(base: GGUFInfo, donor: GGUFInfo, plan: list[SplicePlan], out_path: Path, force: bool) -> None:
+GGUF_VALUE_STRING = 8
+
+
+def provenance_kv(entries: list[tuple[str, str]]) -> bytes:
+    """general.mix.* string pairs, appended to the base metadata."""
+    return b"".join(pack_string(k) + struct.pack("<I", GGUF_VALUE_STRING) + pack_string(v) for k, v in entries)
+
+
+def write_mixed(base: GGUFInfo, donor: GGUFInfo, plan: list[SplicePlan], out_path: Path, force: bool,
+                provenance: list[tuple[str, str]] | None = None) -> None:
     tmp_path = out_path.with_name(out_path.name + ".tmp")
     if out_path.exists() and not force:
         raise FileExistsError(f"{out_path} already exists; pass --force to overwrite")
@@ -346,8 +361,10 @@ def write_mixed(base: GGUFInfo, donor: GGUFInfo, plan: list[SplicePlan], out_pat
         out.write(b"GGUF")
         out.write(struct.pack("<I", base.version))
         out.write(struct.pack("<Q", base.tensor_count))
-        out.write(struct.pack("<Q", base.kv_count))
+        extra = provenance or []
+        out.write(struct.pack("<Q", base.kv_count + len(extra)))
         out.write(base.kv_blob)
+        out.write(provenance_kv(extra))
         for item in plan:
             write_tensor_info(out, item)
         write_padding(out, out.tell(), base.alignment)
@@ -407,7 +424,9 @@ def main() -> int:
     sp.add_argument("--base", required=True, type=Path, help="base GGUF used for metadata and default tensors")
     sp.add_argument("--donor", required=True, type=Path, help="donor GGUF used for selected routed expert layers")
     sp.add_argument("--out", required=True, type=Path, help="output mixed GGUF")
-    sp.add_argument("--q4-layers", required=True, help="comma-separated layer IDs/ranges to take from donor, e.g. 37-42")
+    pick = sp.add_mutually_exclusive_group(required=True)
+    pick.add_argument("--q4-layers", help="comma-separated layer IDs/ranges whose routed experts come from the donor, e.g. 37-42")
+    pick.add_argument("--tensors", help="regular expression; tensors whose full name matches come from the donor")
     sp.add_argument("--dry-run", action="store_true", help="print the plan without writing the output")
     sp.add_argument("--force", action="store_true", help="overwrite --out if it already exists")
     args = parser.parse_args()
@@ -416,18 +435,27 @@ def main() -> int:
         list_tensors(parse_gguf(args.gguf))
         return 0
 
-    q4_layers = parse_layer_set(args.q4_layers)
-    print("q4 layers:", ",".join(str(x) for x in sorted(q4_layers)))
+    q4_layers = tensors = None
+    if args.tensors is not None:
+        tensors = re.compile(args.tensors)
+        selection = args.tensors
+        print("donor tensors:", selection)
+    else:
+        q4_layers = parse_layer_set(args.q4_layers)
+        selection = "routed experts of layers " + ",".join(str(x) for x in sorted(q4_layers))
+        print("q4 layers:", ",".join(str(x) for x in sorted(q4_layers)))
 
     base = parse_gguf(args.base)
     donor = parse_gguf(args.donor)
-    plan = build_plan(base, donor, q4_layers)
+    plan = build_plan(base, donor, q4_layers, tensors)
     summarize(base, donor, plan)
 
     if args.dry_run:
         return 0
 
-    write_mixed(base, donor, plan, args.out, args.force)
+    provenance = [("general.mix.base", args.base.name), ("general.mix.donor", args.donor.name),
+                  ("general.mix.donor_tensors", selection)]
+    write_mixed(base, donor, plan, args.out, args.force, provenance)
     final_size = args.out.stat().st_size
     print(f"wrote: {args.out}")
     print(f"file size: {final_size:,} bytes ({final_size / (1024 ** 3):.2f} GiB)")

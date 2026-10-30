@@ -101,6 +101,26 @@ class ListAndSplice(unittest.TestCase):
             self.assertEqual(t.ggml_type, gtype, t.name)
             self.assertEqual(data[t.data_offset:t.data_offset + t.n_bytes], payload, t.name)
 
+    def test_splice_tensors_regex_and_provenance(self):
+        subprocess.run([sys.executable, str(ROOT/'gguf-tools'/'mixed'/'gguf_mix.py'), 'splice',
+                        '--base', str(self.base), '--donor', str(self.donor),
+                        '--tensors', r'blk\.0\.ffn_down_exps\.weight', '--out', str(self.out)],
+                       check=True, capture_output=True)
+        info = mix.parse_gguf(self.out)
+        data = self.out.read_bytes()
+        want = {name: (gtype, payload) for name, _dims, gtype, payload in self.base_t}
+        for name, _dims, gtype, payload in self.donor_t:
+            if name == 'blk.0.ffn_down_exps.weight':
+                want[name] = (gtype, payload)
+        for t in info.tensors:
+            gtype, payload = want[t.name]
+            self.assertEqual(t.ggml_type, gtype, t.name)
+            self.assertEqual(data[t.data_offset:t.data_offset + t.n_bytes], payload, t.name)
+        self.assertEqual(info.kv_count, 4)
+        for key, value in (('general.mix.base', 'base.gguf'), ('general.mix.donor', 'donor.gguf'),
+                           ('general.mix.donor_tensors', r'blk\.0\.ffn_down_exps\.weight')):
+            self.assertIn(w_str(key) + struct.pack('<I', 8) + w_str(value), info.kv_blob)
+
 
 if __name__ == '__main__':
     unittest.main()

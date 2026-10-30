@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <regex.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -3383,6 +3384,61 @@ static uint64_t model_map_qwen_draft_head(ds4_model *m, uint8_t *at, uint64_t ro
     return len;
 }
 
+/* DS4_QWEN_TENSOR_MIX_GGUF=<donor> with DS4_QWEN_TENSOR_MIX=<regex>: every
+ * tensor whose name matches takes the donor's copy (another ISTA quant of
+ * the same model: same shapes, its own type), mapped into the address space
+ * reserved after the main weights, so a mixed quant is measured without
+ * writing a spliced file.  A quality diagnostic: the main file's own copies
+ * stay mapped, so the memory plan does not shrink.  Needs DS4_QWEN_MTP_GGUF,
+ * whose reservation it shares.  Returns the bytes mapped at `at`. */
+static uint64_t model_mix_qwen_donor_tensors(ds4_model *m, uint8_t *at, uint64_t room) {
+    const char *path = getenv("DS4_QWEN_TENSOR_MIX_GGUF"), *pattern = getenv("DS4_QWEN_TENSOR_MIX");
+    if (!path || !path[0] || !pattern || !pattern[0]) return 0;
+    regex_t re;
+    if (regcomp(&re, pattern, REG_EXTENDED | REG_NOSUB)) ds4_die("DS4_QWEN_TENSOR_MIX is not a regular expression");
+    ds4_model d;
+    memset(&d, 0, sizeof(d));
+    d.fd = d.ngram_fd = -1;
+    g_qwen_ngram_sidecar_opening = true;
+    model_open(&d, path, false, false);
+    g_qwen_ngram_sidecar_opening = false;
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    uint64_t used = 0, count = 0, payload = 0;
+    char name[256];
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        ds4_tensor *t = &m->tensors[i];
+        if (t->name.len >= sizeof(name)) continue;
+        memcpy(name, t->name.ptr, t->name.len);
+        name[t->name.len] = '\0';
+        if (regexec(&re, name, 0, NULL, 0)) continue;
+        const ds4_tensor *src = NULL;
+        for (uint64_t j = 0; j < d.n_tensors && !src; j++) {
+            if (d.tensors[j].name.len == t->name.len && !memcmp(d.tensors[j].name.ptr, t->name.ptr, t->name.len))
+                src = &d.tensors[j];
+        }
+        if (!src || src->ndim != t->ndim || memcmp(src->dim, t->dim, sizeof(t->dim[0]) * t->ndim) || !src->bytes)
+            ds4_die("DS4_QWEN_TENSOR_MIX names a tensor the donor lacks or shapes differently");
+        const uint64_t start = src->abs_offset / page * page;
+        const uint64_t len = align_up(src->abs_offset + src->bytes - start, page);
+        if (used + len > room) ds4_die("the DS4_QWEN_TENSOR_MIX tensors exceed the reserved address space");
+        if (mmap(at + used, (size_t)len, PROT_READ, MAP_SHARED | MAP_FIXED, d.fd, (off_t)start) == MAP_FAILED)
+            ds4_die_errno("cannot map a donor tensor", path);
+        t->type = src->type;
+        t->bytes = src->bytes;
+        t->abs_offset = (uint64_t)(at + used - m->map) + (src->abs_offset - start);
+        t->rel_offset = t->abs_offset - m->tensor_data_pos;
+        if (t->bytes > m->max_tensor_bytes) m->max_tensor_bytes = t->bytes;
+        used += len;
+        payload += src->bytes;
+        count++;
+    }
+    regfree(&re);
+    model_close(&d);
+    fprintf(stderr, "ds4: %" PRIu64 " tensors from %s (%.2f GiB) replace the main file's\n",
+            count, path, (double)payload / (1024.0 * 1024.0 * 1024.0));
+    return used;
+}
+
 static void model_attach_qwen_mtp_sidecar(ds4_model *m) {
     const char *path = getenv("DS4_QWEN_MTP_GGUF");
     ds4_str arch = {0};
@@ -3422,7 +3478,8 @@ static void model_attach_qwen_mtp_sidecar(ds4_model *m) {
     if (len > (uint64_t)(hold_end - target)) ds4_die("the DS4_QWEN_MTP_GGUF block is larger than its reservation");
     if (mmap(target, (size_t)len, PROT_READ, MAP_SHARED | MAP_FIXED, s->fd, (off_t)lo) == MAP_FAILED)
         ds4_die_errno("cannot map the MTP block", path);
-    const uint64_t head_len = model_map_qwen_draft_head(m, target + len, (uint64_t)(hold_end - target) - len);
+    uint64_t head_len = model_map_qwen_draft_head(m, target + len, (uint64_t)(hold_end - target) - len);
+    head_len += model_mix_qwen_donor_tensors(m, target + len + head_len, (uint64_t)(hold_end - target) - len - head_len);
     if (target + len + head_len < hold_end &&
         munmap(target + len + head_len, (size_t)(hold_end - target - len - head_len)))
         ds4_die_errno("cannot release the MTP reservation", path);
