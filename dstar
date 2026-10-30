@@ -78,6 +78,8 @@ usage: dstar <command> [options]
 
 Environment: DSTAR_MODELS (Flash-Next directory), DSTAR_QUANT (q2, iq3 or iq3s),
 DSTAR_MODEL (the model serve and chat run when none is named), PORT, HOST.
+DSTAR_RAM_GB and DSTAR_WIRED_LIMIT_MB plan as on a Mac with less memory
+(for measuring a 64 GB Mac on a larger one).
 EOF
 }
 
@@ -128,7 +130,7 @@ pick_quant() {
         [ -f "$F_SHARD1" ] && return 0
     done
     QUANT=q2
-    [ $(( $(sysctl -n hw.memsize) / 1073741824 )) -lt 96 ] || QUANT=iq3s
+    [ "$(ram_gb)" -lt 96 ] || QUANT=iq3s
 }
 
 ensure_binaries() {
@@ -216,7 +218,7 @@ parse_power() {
 ANE_GIB=0
 need_mib() { awk -v c="$1" -v b="$BASE_GIB" -v a="$ANE_GIB" 'BEGIN { printf "%d", (b + a + c * 3.315e-5 + 2) * 1024 }'; }
 
-wired_limit() { sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0; }
+wired_limit() { echo "${DSTAR_WIRED_LIMIT_MB:-$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)}"; }
 
 # Does the context fit under the wired limit? A limit of 0 is the system
 # default: three quarters of the RAM, which on a 64 GB machine holds 131072
@@ -237,9 +239,26 @@ sysctl_hint() {
     echo "sudo sysctl iogpu.wired_limit_mb=$(( (need + 2047) / 2048 * 2048 ))"
 }
 
+# The RAM to plan for. DSTAR_RAM_GB below the real size plans as on that
+# smaller Mac, and ds4 then locks the difference before it loads the model,
+# so a 128 GB Mac measures like a 64 GB one (with DSTAR_WIRED_LIMIT_MB or
+# the sysctl set to that Mac's limit).
+ram_gb() {
+    local real=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+    if [ -n "${DSTAR_RAM_GB:-}" ] && [ "$DSTAR_RAM_GB" -lt "$real" ]; then echo "$DSTAR_RAM_GB"; else echo "$real"; fi
+}
+
 check_machine() {
     [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || die "this needs an Apple Silicon Mac"
-    RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+    RAM_GB=$(ram_gb)
+    SIM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 - RAM_GB ))
+}
+
+# Arguments that make ds4 hold back the RAM a smaller planned Mac lacks.
+simulate_args() {
+    [ "$SIM_GB" -gt 0 ] || return 0
+    echo "dstar: planning for a $RAM_GB GB Mac, ds4 locks the other $SIM_GB GB" >&2
+    echo "--simulate-used-memory ${SIM_GB}GB"
 }
 
 # Absolute path of a model given by the user, so it survives the cd to $HERE.
@@ -392,7 +411,7 @@ cmd_serve() {
     if [ "$ane" = 1 ]; then export DS4_ANE=1; fi
     set -- --ctx "$ctx" --prefill-chunk 2048 --host "$HOST" --port "$PORT" \
         --kv-disk-dir "$kv_dir" --kv-disk-space-mb "$kv_mb" \
-        --kv-cache-continued-interval-tokens "$kv_every" "$@"
+        --kv-cache-continued-interval-tokens "$kv_every" $(simulate_args) "$@"
     if [ "$mtp" = 1 ] && [ -f "$F_MTP" ]; then
         export DS4_QWEN_MTP_GGUF=$F_MTP
         set -- --mtp "$@"
@@ -452,7 +471,7 @@ cmd_chat() {
         set -- --mtp "$@"
     fi
     cd "$HERE"
-    exec ./ds4 -m "$F_SHARD1" --ctx 32768 "$@"
+    exec ./ds4 -m "$F_SHARD1" --ctx 32768 $(simulate_args) "$@"
 }
 
 cmd_doctor() {
