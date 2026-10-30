@@ -48744,48 +48744,76 @@ static bool glm_graph_profile_stage(
     return metal_graph_layer_stage_profile_boundary(part, stage, il, pos0, n_tokens, stage_t0);
 }
 
+/* Expert profile of one layer: reads the router ids and weights of n_tokens
+ * rows at pos0 back from the GPU, ending and resuming the command batch. */
+static bool graph_profile_router_rows(
+        ds4_gpu_tensor *selected_t,
+        ds4_gpu_tensor *weights_t,
+        uint32_t        il,
+        uint32_t        pos0,
+        uint32_t        n_tokens,
+        bool            is_hash) {
+    if (!g_expert_profile.active) return true;
+    if (!selected_t || !weights_t || n_tokens == 0) return false;
+
+    const size_t selected_count = (size_t)n_tokens * DS4_N_EXPERT_USED;
+    if (selected_count / n_tokens != DS4_N_EXPERT_USED ||
+        selected_count > SIZE_MAX / sizeof(int32_t) ||
+        selected_count > SIZE_MAX / sizeof(float)) {
+        return false;
+    }
+
+    if (ds4_gpu_end_commands() == 0) {
+        fprintf(stderr,
+                "ds4: failed to end Metal command batch for expert profile readback\n");
+        return false;
+    }
+
+    int32_t *selected = xmalloc(selected_count * sizeof(selected[0]));
+    float *weights = xmalloc(selected_count * sizeof(weights[0]));
+    const bool read_ok =
+        ds4_gpu_tensor_read(selected_t,
+                            0,
+                            selected,
+                            (uint64_t)selected_count * sizeof(selected[0])) != 0 &&
+        ds4_gpu_tensor_read(weights_t,
+                            0,
+                            weights,
+                            (uint64_t)selected_count * sizeof(weights[0])) != 0;
+
+    if (ds4_gpu_begin_commands() == 0) {
+        free(weights);
+        free(selected);
+        fprintf(stderr,
+                "ds4: failed to resume Metal command batch after expert profile readback\n");
+        return false;
+    }
+    if (!read_ok) {
+        free(weights);
+        free(selected);
+        fprintf(stderr, "ds4: failed to read Metal router tensors for expert profile\n");
+        return false;
+    }
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const size_t off = (size_t)t * DS4_N_EXPERT_USED;
+        ds4_expert_profile_record(il, pos0 + t, selected + off, weights + off, is_hash);
+    }
+
+    free(weights);
+    free(selected);
+    return true;
+}
+
 static bool glm_graph_profile_router_selection(
         ds4_glm_gpu_graph       *g,
         const ds4_layer_weights *layer,
         uint32_t                 il,
         uint32_t                 pos) {
     if (!g_expert_profile.active) return true;
-    if (!g || !layer || !g->router_selected || !g->router_weights) return false;
-
-    if (ds4_gpu_end_commands() == 0) {
-        fprintf(stderr,
-                "ds4: failed to end GLM Metal command batch for expert profile readback\n");
-        return false;
-    }
-
-    int32_t selected[DS4_MAX_EXPERT_USED] = {0};
-    float weights[DS4_MAX_EXPERT_USED] = {0};
-    const bool read_ok =
-        ds4_gpu_tensor_read(g->router_selected,
-                            0,
-                            selected,
-                            (uint64_t)DS4_N_EXPERT_USED * sizeof(selected[0])) != 0 &&
-        ds4_gpu_tensor_read(g->router_weights,
-                            0,
-                            weights,
-                            (uint64_t)DS4_N_EXPERT_USED * sizeof(weights[0])) != 0;
-
-    if (ds4_gpu_begin_commands() == 0) {
-        fprintf(stderr,
-                "ds4: failed to resume GLM Metal command batch after expert profile readback\n");
-        return false;
-    }
-    if (!read_ok) {
-        fprintf(stderr, "ds4: failed to read GLM Metal router tensors for expert profile\n");
-        return false;
-    }
-
-    ds4_expert_profile_record(il,
-                              pos,
-                              selected,
-                              weights,
-                              layer->ffn_gate_tid2eid != NULL);
-    return true;
+    if (!g || !layer) return false;
+    return graph_profile_router_rows(g->router_selected, g->router_weights, il, pos, 1,
+                                     layer->ffn_gate_tid2eid != NULL);
 }
 
 static bool glm_graph_profile_router_selection_batch(
@@ -48795,64 +48823,9 @@ static bool glm_graph_profile_router_selection_batch(
         uint32_t                 pos0,
         uint32_t                 n_tokens) {
     if (!g_expert_profile.active) return true;
-    if (!g || !layer || !g->batch_router_selected ||
-        !g->batch_router_weights || n_tokens == 0) {
-        return false;
-    }
-
-    const size_t selected_count = (size_t)n_tokens * DS4_N_EXPERT_USED;
-    if (n_tokens != 0 && selected_count / n_tokens != DS4_N_EXPERT_USED) {
-        return false;
-    }
-    if (selected_count > SIZE_MAX / sizeof(int32_t) ||
-        selected_count > SIZE_MAX / sizeof(float)) {
-        return false;
-    }
-
-    if (ds4_gpu_end_commands() == 0) {
-        fprintf(stderr,
-                "ds4: failed to end GLM Metal command batch for batch expert profile readback\n");
-        return false;
-    }
-
-    int32_t *selected = xmalloc(selected_count * sizeof(selected[0]));
-    float *weights = xmalloc(selected_count * sizeof(weights[0]));
-    const bool read_ok =
-        ds4_gpu_tensor_read(g->batch_router_selected,
-                            0,
-                            selected,
-                            (uint64_t)selected_count * sizeof(selected[0])) != 0 &&
-        ds4_gpu_tensor_read(g->batch_router_weights,
-                            0,
-                            weights,
-                            (uint64_t)selected_count * sizeof(weights[0])) != 0;
-
-    if (ds4_gpu_begin_commands() == 0) {
-        free(weights);
-        free(selected);
-        fprintf(stderr,
-                "ds4: failed to resume GLM Metal command batch after batch expert profile readback\n");
-        return false;
-    }
-    if (!read_ok) {
-        free(weights);
-        free(selected);
-        fprintf(stderr, "ds4: failed to read GLM Metal batch router tensors for expert profile\n");
-        return false;
-    }
-
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const size_t off = (size_t)t * DS4_N_EXPERT_USED;
-        ds4_expert_profile_record(il,
-                                  pos0 + t,
-                                  selected + off,
-                                  weights + off,
-                                  layer->ffn_gate_tid2eid != NULL);
-    }
-
-    free(weights);
-    free(selected);
-    return true;
+    if (!g || !layer) return false;
+    return graph_profile_router_rows(g->batch_router_selected, g->batch_router_weights, il, pos0,
+                                     n_tokens, layer->ffn_gate_tid2eid != NULL);
 }
 
 static bool glm_graph_prefill_stage_boundary(
@@ -59048,7 +59021,9 @@ static bool qwen4_ane_build(const ds4_model *m, const ds4_weights *w) {
 
 /* Builds the ANE programs on first use; true if a chunk of T rows uses them. */
 static bool qwen4_ane_ready(const ds4_model *m, const ds4_weights *w, uint32_t T) {
-    if (g_qwen4_ane.state < 0) g_qwen4_ane.state = qwen4_ane_env("DS4_ANE", 0u) ? 2 : 0;
+    /* the expert profile ends the command batch inside a layer, which the
+     * Neural Engine's queued programs do not expect */
+    if (g_qwen4_ane.state < 0) g_qwen4_ane.state = qwen4_ane_env("DS4_ANE", 0u) && !g_expert_profile.active ? 2 : 0;
     if (g_qwen4_ane.state == 2) {
         g_qwen4_ane.state = qwen4_ane_build(m, w) ? 1 : 0;
         if (!g_qwen4_ane.state) fprintf(stderr, "ds4: Neural Engine setup failed; the GPU runs the prefill alone\n");
@@ -59703,6 +59678,7 @@ static bool qwen4_layer_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     qwen4_ane_set_moe_layer((int)il);
     bool ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
     qwen4_ane_set_moe_layer(-1);
+    if (ok) ok = graph_profile_router_rows(g->selected, g->weights, il, pos0, T, false);
     if (ok && g->dump_prompt_rows)
         metal_graph_debug_dump_tensor("qwen_router", g->router, (uint64_t)T * DS4_N_EXPERT, il, pos0);
     if (ok && g->dump_prompt_rows) qwen4_graph_dump_last_ffn(g, il, T);
