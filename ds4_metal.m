@@ -48798,11 +48798,12 @@ typedef struct {
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
-     * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows. */
+     * M3 Ultra uses low-bit and MXFP4 down rows; M5 and the other Apple9
+     * parts (M3 Max: the MTP block's MXFP4 down rows) use MXFP4 down rows. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
         ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
-        (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
+        (type == 39u && (ds4_gpu_device_is_m5_apple_silicon() || g_metal_apple_family == 9));
 }
 
 static uint32_t qwen4_moe_mv_rows(void) {
@@ -48810,11 +48811,12 @@ static uint32_t qwen4_moe_mv_rows(void) {
 }
 
 static uint32_t qwen4_moe_mv_groups(uint32_t type) {
-    /* Q2_K and MXFP4 use sixteen groups on M3 Ultra; MXFP4 also does on M5.
-     * Each group keeps its own rows and unchanged per-lane reduction order. */
+    /* Q2_K and MXFP4 use sixteen groups on M3 Ultra; MXFP4 also does on M5
+     * and Apple9.  Each group keeps its own rows and unchanged per-lane
+     * reduction order. */
     const uint32_t default_nsg =
         ((type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
-        (type == 39u && ds4_gpu_device_is_m5_apple_silicon()) ? 16u : 8u;
+        (type == 39u && (ds4_gpu_device_is_m5_apple_silicon() || g_metal_apple_family == 9)) ? 16u : 8u;
     return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NSG", default_nsg, 1u, 16u);
 }
 
@@ -50769,9 +50771,11 @@ int ds4_gpu_qwen4_gdn_front_tensor(
     }
     /* One threadgroup per key head: simdgroups 0/1 normalize, the rest take
      * the alpha/beta rows, and every channel's conv stays on one thread, so
-     * the thread count only spreads the conv wider.  M5 measured 1024. */
+     * the thread count only spreads the conv wider.  M5 measured 1024, and
+     * the M3 Max a fifth less time with it than with 256. */
     const uint64_t nth = ds4_gpu_env_u64("DS4_QWEN4_GDN_FRONT_THREADS",
-                                         ds4_gpu_device_is_m5_apple_silicon() ? 1024u : 256u, 96u, 1024u);
+                                         ds4_gpu_device_is_m5_apple_silicon() || g_metal_apple_family == 9 ? 1024u : 256u,
+                                         96u, 1024u);
     return qwen4_dispatch(QWEN4_K_GDN_FRONT, &args, sizeof(args), b, 12,
                           MTLSizeMake(n_k_head, 1, 1), MTLSizeMake((NSUInteger)(nth / 32u * 32u), 1, 1), 0);
 }
