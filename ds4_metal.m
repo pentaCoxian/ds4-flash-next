@@ -48738,7 +48738,6 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 ds4_gpu_device_is_m5_apple_silicon();
             const uint32_t type = specialize ?
                 ((const qwen4_moe_mm_args *)args)->weight_type : 0u;
-            if (type >= 40u) return 0;
             const uint32_t tail_base = ((const qwen4_moe_mm_args *)args)->tail_base;
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_tail=%u",
                              qwen4_kernel_names[kernel], type, tail_base];
