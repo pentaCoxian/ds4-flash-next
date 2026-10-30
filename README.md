@@ -1,7 +1,7 @@
 # ds4 Flash-Next: Qwen3.8-Flash-Next on Apple Silicon
 
 A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar), tuned
-mostly for M1/M2, that runs **Qwen3.8-Flash-Next** on Apple Silicon Macs with
+for the M1 to M3 Max, that runs **Qwen3.8-Flash-Next** on Apple Silicon Macs with
 64 GB of memory or more:
 the **full 262K context**, MTP speculative decoding and vision, as a local
 OpenAI/Anthropic compatible server for OpenCode, Claude Code, Pi or any
@@ -40,26 +40,32 @@ better and is slower. `--quant` picks one, in `dstar pull` and in
 | Your Mac | Quant | `--quant` | Weights | Context it runs with |
 |---|---|---|---|---|
 | 64 GB | Q2_0, the fastest | `q2` (default) | 35 GiB | 262K; up to 524K |
-| 64 GB | IQ3_XXS, better answers | `iq3` | 44 GiB | 131K; 262K with `--ctx 262k` |
+| 64 GB | IQ3_XXS with four layers from Q2_0, better answers | `iq3m` | 43 GiB | 262K, with the Neural Engine |
+| 64 GB | IQ3_XXS | `iq3` | 44 GiB | 262K, without the Neural Engine |
 | 96 GB or more | IQ3_S, the best file | `iq3s` | 51 GiB | 262K; up to 524K from 128 GB |
 
-The 64 GB rows are measured on an M1 Max. The IQ3_S row comes from the
-memory plan: on 64 GB that file runs, but only with a 32K context.
-ISTA's LiveCodeBench scores are 81.1, 86.3 and 86.9; speeds are in
+On a 64 GB Mac `iq3m` is the one to pick for answers: it is IQ3_XXS (same
+KL to the best file, 0.18 against 0.44 for Q2_0, and much better Japanese)
+with the routed down experts of four layers taken from Q2_0, which leaves
+room at 262K for the Neural Engine to prefill a quarter faster. Q2_0
+decodes about 10% faster. `dstar pull --quant iq3m` builds it from the
+`iq3` and `q2` files. ISTA's LiveCodeBench scores are 81.1, 86.3 and 86.9
+for Q2_0, IQ3_XXS and IQ3_S; speeds are in
 [The larger quants](docs/FLASH_NEXT_FORK.md#the-larger-quants).
 `dstar doctor` prints the largest context each quant can hold on your Mac.
 
-**On 64 GB the GPU memory limit has to be raised for the long contexts**
-(above 131K with Q2_0, 262K with IQ3_XXS). macOS lets the GPU use about
-three quarters of the memory by default, 48 GiB of 64. When a context does
-not fit, `dstar serve` takes a smaller one and prints the line to run:
+**On 64 GB the GPU memory limit has to be raised for the IQ3 files and the
+longest contexts.** macOS lets the GPU use about three quarters of the
+memory by default, 48 GiB of 64: enough for Q2_0 at 262K. When a context
+does not fit, `dstar serve` takes a smaller one and prints the line to run:
 
 ```sh
-sudo sysctl iogpu.wired_limit_mb=57344    # 61440 for iq3 at 262K or q2 at 524K
+sudo sysctl iogpu.wired_limit_mb=57344    # iq3m and iq3 at 262K; 61440 for q2 at 524K
 ```
 
-The setting is lost at every reboot. With IQ3_XXS at 262K the server holds
-56.6 GiB of the 64, so close the browser first.
+The setting is lost at every reboot. With iq3m at 262K the server plans
+55.6 GiB of the 64 (54.4 measured, other apps included), so close the
+browser first.
 
 Below 64 GB nothing has been tried. Qwen3.8 has no SSD streaming in ds4, so
 the weights must fit in memory: Q2_0 with a 32K context needs 42 GiB.
@@ -82,9 +88,23 @@ tokens per second and prefill from 328 to 292.
 IQ3_XXS runs at about 0.8 of this speed (35 to 31 tokens per second with
 MTP up to 259K) and IQ3_S a little below that.
 
-These are the only measured numbers so far. Newer chips have faster GPUs and
-run the same kernels, but nobody has timed them; if you do, the two commands
-at the end of [Which Macs gain](docs/FLASH_NEXT_FORK.md#which-macs-gain) make a useful report.
+## Flash-Next speed on an M3 Max
+
+M3 Max, 40-core GPU, measured with `dstar`'s settings at a 262K context,
+greedy decoding of 200 tokens after 8K prompts (a coding agent prompt and
+Japanese prose), alternating runs on a laptop whose speed varies about 10%
+with its temperature:
+
+| Quant | Prefill | Decode with MTP |
+|---|---|---|
+| `iq3m`, 1024-row chunks with the Neural Engine | 585 to 607 tok/s | 47 to 52 tok/s |
+| `iq3`, 1024-row chunks | 450 to 505 tok/s | 47 to 53 tok/s |
+| `q2`, 2048-row chunks with the Neural Engine | about 610 tok/s at 32K | about 59 tok/s at 32K |
+
+The M3 has its own settings for a few kernels, see
+[Which Macs gain](docs/FLASH_NEXT_FORK.md#which-macs-gain). Other chips run
+the same kernels but nobody has timed them; if you do, the two commands at
+the end of that section make a useful report.
 
 ## DeepSeek V4 Flash on a 64 GB Mac
 

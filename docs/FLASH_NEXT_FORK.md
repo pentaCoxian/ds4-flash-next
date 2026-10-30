@@ -189,9 +189,29 @@ nothing but the M1 Max was measured:
 | Register tiles for Q2_0 experts in prefill | M1 | `DS4_QWEN4_MOE_REG=1` |
 | Packed group rows in the DeepSeek V4 attention output | M1 | `DS4_METAL_ATTN_OUT_DENSE=1` |
 
-An M2 reports itself as M2, so it starts with the last two off. It has the
-same GPU family as the M1 and they are expected to help there; set the
-variables and compare.
+An M2 reports itself as M2, so it starts with the last two off. Its GPU is
+the family between the M1's and the M3's (Apple8, after Apple7 and before
+Apple9), and they are expected to help there; set the variables and compare.
+
+**On by default on M3 and M4 (Apple9), measured on an M3 Max.** ds4 reads
+the GPU family at start (the device line says `Apple9`), and these follow
+it rather than the chip name:
+
+| Change | Measured | Off switch |
+|---|---|---|
+| MTP verifies the Q3_K/Q4_K/Q5_K/Q6_K weights with the one-token matvec over a grid of tokens: their two- and three-token kernels, which make MTP pay on the M1, run at a third to a half of the one-token speed here | MTP decode +7 to 11% on IQ3_XXS and Q2_0, outputs unchanged | `DS4_METAL_MIXED_MV_NT_MAX=8` |
+| The router's softmax and top-10 in one simdgroup per token, bit-identical | 0.3 ms per token | `DS4_QWEN4_ROUTER_SG=0` |
+| The M5's 1024-thread GDN front and the MXFP4 expert rows of the MTP block (M3 Ultra and M5 settings) | 0.2 ms per MTP cycle | `DS4_QWEN4_GDN_FRONT_THREADS=256`, `DS4_QWEN4_MOE_MV_SPECIALIZE=0` |
+
+M4 shares the family and has not been timed. Other settings tuned for the
+M3 Ultra did not carry over to the M3 Max: eight GDN scan groups and 32-key
+attention splits for the verify were slower, and the matvec row shapes
+measured the same within the noise.
+
+The Neural Engine runs part of the prefill on every Mac where `dstar` finds
+room for it (0.9 GiB), with the same answers within KL 0.005: on the M3 Max
+it prefills 19% faster with 1024-row chunks than the GPU alone with 2048,
+and 30% with 2048.
 
 **Where the gain is smaller or unknown.** The numbers on this page are M1 Max
 numbers. On M5 stock ds4 already uses Metal 4 tensor kernels for part of the
@@ -227,11 +247,22 @@ Q2_0 when there are several.
 | `--quant` | ISTA file | Weights | ISTA task average | LiveCodeBench | Plain | With MTP | Default context on 64 GB |
 |---|---|---|---|---|---|---|---|
 | `q2` | Q2_0 | 35.0 GiB | 89.07 | 81.14 | 35 tok/s | 39 to 47 | 262K |
-| `iq3` | IQ3_XXS | 43.8 GiB | 92.57 | 86.29 | 29 tok/s | 35 | 131K |
+| `iq3m` | IQ3_XXS, four layers from Q2_0 | 42.9 GiB | | | | | 262K |
+| `iq3` | IQ3_XXS | 43.8 GiB | 92.57 | 86.29 | 29 tok/s | 35 | 262K |
 | `iq3s` | IQ3_S | 51.0 GiB | 93.26 | 86.86 | 26 tok/s | 32 to 34 | 32K |
 
 The scores are ISTA's own, from their model card. The speeds are M1 Max
-numbers at a short context, on one code prompt for IQ3_S.
+numbers at a short context, on one code prompt for IQ3_S; the M3 Max ones
+are in the README.
+
+**iq3m** is IQ3_XXS with the routed down experts of layers 29, 30, 31 and 35
+taken from Q2_0, copied byte for byte (`dstar pull --quant iq3m` splices it
+with `gguf-tools/mixed/gguf_mix.py`). Those four were chosen by swapping each
+of the 18 IQ4_NL down layers on its own and measuring KL against IQ3_S over
+2048-token sequences of C code, English and Japanese (`DS4_QWEN_TENSOR_MIX`
+does the swap at load time): they move it least, while layer 47 alone costs
++0.07 on Japanese. Together they keep the mean KL at 0.1835 (IQ3_XXS 0.1834,
+Q2_0 0.438) and top-1 agreement at 85.5% (85.7%, 78.9%), in 0.88 GiB less.
 
 These files keep the experts in IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS and
 many dense projections in IQ3_S, quants that stock ds4 does not load. This
@@ -239,10 +270,11 @@ fork dequantizes them on the CPU bit for bit as llama.cpp does and has Metal
 kernels for them, checked against that reference by `make test-quant-types`
 and `make test-qwen4-kernels`.
 
-**IQ3_XXS on 64 GB.** `dstar serve` starts it with a 131K context, which
-plans 52 GiB of GPU memory. `--ctx 262k` works and plans 56.6 GiB, but leaves
-the rest of the system about 5 GB, so close the browser first. Longer
-contexts do not fit.
+**IQ3_XXS on 64 GB.** With the indexer key ring and the vision encoder
+loaded only for images, `dstar serve` gives it the full 262K, planned at
+55.6 GiB with 1024-row prefill chunks (55.0 measured with 2048, other apps
+included). That leaves no room for the Neural Engine, which is what iq3m is
+for. Close the browser first; longer contexts do not fit.
 
 **IQ3_S is for 96 GB and more.** With MTP and vision it plans about 56 GiB
 at 32K and 60 GiB at 131K. On a 64 GB Mac it therefore runs with a 32K
@@ -330,6 +362,12 @@ send `"temperature": 0` or a `seed`.
 | `DS4_QWEN4_SPEC_TIMING=1` | print the draft and verify time of the MTP cycle |
 | `DS4_METAL_ENCODER_TIMELINE=file` | write the GPU time of every dispatch (slows the run) |
 | `DS4_QWEN4_MTP_DRAFT_VOCAB=file` | draft with a reduced vocabulary head |
+| `DS4_QWEN_TENSOR_MIX_GGUF=file DS4_QWEN_TENSOR_MIX=regex` | take the matching tensors from another quant at load time, for KL runs of a mix (needs `DS4_QWEN_MTP_GGUF`; the memory plan does not shrink) |
+| `DS4_METAL_MIXED_MV_NT_MAX=N` | cap the multi-token matvecs of the mixed types at N tokens (`8` restores the M1 path on M3) |
+| `DS4_QWEN4_ROUTER_SG=0/1` | the one-simdgroup router off or on, on any chip |
+| `make qwen4-mv-bench` | `speed-bench/qwen4_mv_bench`: GB/s of a file's dense matvecs per weight type, for 1 to 3 tokens |
 
 Compare variants in alternating runs: on a Mac in use, tokens per second of
-a single run moves by 1 to 2 percent.
+a single run moves by 1 to 2 percent. A laptop under a long run moves by up
+to 10% more as it warms, and under `--simulate-used-memory` swap adds its
+own noise, so time kernels without it and in ABBA order.
