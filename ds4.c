@@ -39988,6 +39988,25 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 static ds4_context_memory ds41_graph_memory(uint32_t ctx);
 #endif
+/* The raw indexer keys are read only when a block of four completes: by the
+ * chunk that wrote them or, for the up to three rows before a chunk, by the
+ * next one.  On Metal they live in a ring of cap_tokens + 8 rows that the
+ * kernels index by pos % rows, instead of one row per context position
+ * (1.6 GiB less at 262K); a rewind past the ring, to the prompt anchor or a
+ * disk checkpoint, brings its last rows along.  CUDA indexes the cache by
+ * absolute position.  DS4_QWEN4_IK_FULL=1 does so on Metal too, as the
+ * reference to check the ring against. */
+#define QWEN4_IK_TAIL 4u
+static uint32_t qwen4_ik_cache_rows(uint32_t ctx_cap, uint32_t cap_tokens) {
+#if defined(__APPLE__)
+    const uint64_t ring = (uint64_t)cap_tokens + 8u;
+    if (ring < ctx_cap && !getenv("DS4_QWEN4_IK_FULL")) return (uint32_t)ring;
+#else
+    (void)cap_tokens;
+#endif
+    return ctx_cap;
+}
+
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
@@ -40014,7 +40033,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         m.raw_cap = ctx;
         m.comp_cap = (uint32_t)blocks;
         m.raw_bytes = (uint64_t)n_attn * ctx * kv_row + (uint64_t)ctx * 16u;
-        m.compressed_bytes = (uint64_t)n_attn * (ctx * DS4_N_INDEXER_HEAD_DIM * 4u + blocks * DS4_N_INDEXER_HEAD_DIM * 2u);
+        m.compressed_bytes = (uint64_t)n_attn * ((uint64_t)qwen4_ik_cache_rows(ctx, (uint32_t)T) * DS4_N_INDEXER_HEAD_DIM * 4u +
+                                                 blocks * DS4_N_INDEXER_HEAD_DIM * 2u);
         m.scratch_bytes = T * (12u * hc_dim + 24u * E + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + 2u * DS4_N_FF_EXP) +
                                2u * blocks) * 4u;
         /* Recurrent layers have fixed state even at a tiny context. Reserve
@@ -58047,7 +58067,8 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *layer_lin_hist[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_k_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_v_cache[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_ik_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_ik_cache[DS4_MAX_LAYER];   /* ik_rows rows, indexed pos % ik_rows */
+    uint32_t ik_rows;
     ds4_gpu_tensor *layer_block_key[DS4_MAX_LAYER];
     /* A separate injection buffer keeps combined normalization race-free. */
     ds4_gpu_tensor *inj_alt;
@@ -58092,6 +58113,7 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *anchor_lin_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *anchor_lin_hist[DS4_MAX_LAYER];
     ds4_gpu_tensor *anchor_ple_hist;
+    ds4_gpu_tensor *anchor_ik_tail;   /* ring caches: raw indexer keys of the rows before anchor_pos */
     int anchor_ple_prev[DS4_MAX_PLE_NGRAM];
     uint32_t anchor_pos;
     int32_t anchor_mrope_delta;
@@ -58239,7 +58261,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     ds4_gpu_tensor **all[] = {
         &g->ple_hist, &g->logits,
         &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
-        &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->anchor_ple_hist, &g->pos3,
+        &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->anchor_ple_hist, &g->anchor_ik_tail, &g->pos3,
         &g->draft_head, &g->steer_dirs,
     };
     if (g->owns_scratch) {
@@ -58423,6 +58445,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     const uint64_t iq_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
     g->ctx_cap = ctx_cap;
     g->cap_tokens = cap_tokens;
+    g->ik_rows = qwen4_ik_cache_rows(ctx_cap, cap_tokens);
     g->k_blocks = DS4_N_INDEXER_TOP_K / 4u;
     g->n_logit_rows = mtp ? 3u : 1u;
     g->n_block_cap = ctx_cap / 4u + 1u;
@@ -58529,7 +58552,7 @@ private_state:
         } else {
             g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
             g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-            g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)ctx_cap * DS4_N_INDEXER_HEAD_DIM);
+            g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)g->ik_rows * DS4_N_INDEXER_HEAD_DIM);
             g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
             ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] && g->layer_ik_cache[il] && g->layer_block_key[il];
         }
@@ -60098,10 +60121,36 @@ static bool qwen4_graph_state_copy0(ds4_qwen4_gpu_graph *g, bool save) {
                                       &g->snap0_pos, &g->snap0_mrope_delta);
 }
 
+/* With the raw indexer keys in a ring, a state that rewinds past the ring's
+ * span keeps the keys of the QWEN4_IK_TAIL rows before its position, which
+ * a partial block still pools; row p sits at slot p % QWEN4_IK_TAIL. */
+static bool qwen4_graph_ik_tail_copy(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *tail, bool save) {
+    if (g->ik_rows >= g->ctx_cap) return true;
+    if (!tail) return false;
+    const uint64_t row = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint32_t p0 = g->pos > QWEN4_IK_TAIL ? g->pos - QWEN4_IK_TAIL : 0u;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    bool ok = true;
+    uint32_t k = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (ds4_qwen4_layer_is_linear(il) || !g->layer_ik_cache[il]) continue;
+        for (uint32_t p = p0; p < g->pos && ok; p++) {
+            const uint64_t live = (uint64_t)(p % g->ik_rows) * row;
+            const uint64_t kept = ((uint64_t)k * QWEN4_IK_TAIL + p % QWEN4_IK_TAIL) * row;
+            ok = ds4_gpu_tensor_copy(save ? tail : g->layer_ik_cache[il], save ? kept : live,
+                                     save ? g->layer_ik_cache[il] : tail, save ? live : kept, row) != 0;
+        }
+        k++;
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    return ok;
+}
+
 static bool qwen4_graph_state_copy_anchor(ds4_qwen4_gpu_graph *g, bool save) {
     return qwen4_graph_state_copy_set(g, save, g->anchor_lin_state, g->anchor_lin_hist,
                                       &g->anchor_ple_hist, g->anchor_ple_prev,
-                                      &g->anchor_pos, &g->anchor_mrope_delta);
+                                      &g->anchor_pos, &g->anchor_mrope_delta) &&
+           qwen4_graph_ik_tail_copy(g, g->anchor_ik_tail, save);
 }
 
 /* A full state set (the anchor, the ANE chunk's) is allocated on first use,
@@ -60130,6 +60179,12 @@ static bool qwen4_graph_ensure_state_set(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor 
 }
 
 static bool qwen4_graph_ensure_anchor(ds4_qwen4_gpu_graph *g) {
+    if (g->ik_rows < g->ctx_cap && !g->anchor_ik_tail) {
+        uint32_t n_attn = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) n_attn += g->layer_ik_cache[il] != NULL;
+        g->anchor_ik_tail = qwen4_graph_alloc_f32((uint64_t)n_attn * QWEN4_IK_TAIL * DS4_N_INDEXER_HEAD_DIM);
+        if (!g->anchor_ik_tail) return false;
+    }
     return qwen4_graph_ensure_state_set(g, g->anchor_lin_state, g->anchor_lin_hist, &g->anchor_ple_hist);
 }
 
@@ -63733,7 +63788,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 }
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
-static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
+static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool ik_tail);
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
@@ -63748,7 +63803,8 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
         const uint32_t rows = (uint32_t)s->checkpoint.len;
         const uint32_t mtp_rows = s->qwen4_graph.mtp_pos < rows ? s->qwen4_graph.mtp_pos : rows;
-        bytes += qwen4_payload_tensor_bytes(rows, mtp_rows);
+        bytes += qwen4_payload_tensor_bytes(rows, mtp_rows,
+                                            s->qwen4_graph.ik_rows < s->qwen4_graph.ctx_cap);
         return bytes;
 #endif
     }
@@ -63891,17 +63947,27 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
  * GDN state + conv history (linear layers) or the live KV/indexer rows and
  * pooled block keys (attention layers, incl. the MTP block), then the PLE
  * conv history and n-gram context.  The header's raw_live field carries the
- * family tag so a DeepSeek payload is never read as a Qwen one. */
+ * family tag so a DeepSeek payload is never read as a Qwen one.  A ring
+ * cache (qwen4_ik_cache_rows) writes only the last QWEN4_IK_TAIL raw indexer
+ * key rows, under the TAIL tag; every session reads both layouts, since a
+ * continuation pools no key from before them. */
 #define DS4_QWEN4_PAYLOAD_TAG 0x51573802u
+#define DS4_QWEN4_PAYLOAD_TAG_TAIL 0x51573803u
 
 /* The cached keys carry their rotation, so a checkpoint only fits a session
  * with the same YaRN factor: fold the factor into the tag.  Without YaRN the
  * tag is unchanged and older checkpoints still load. */
-static uint32_t qwen4_payload_tag(void) {
+static uint32_t qwen4_payload_tag(bool ik_tail) {
+    const uint32_t tag = ik_tail ? DS4_QWEN4_PAYLOAD_TAG_TAIL : DS4_QWEN4_PAYLOAD_TAG;
     uint32_t bits = 0;
-    if (!g_qwen4_rope_yarn) return DS4_QWEN4_PAYLOAD_TAG;
+    if (!g_qwen4_rope_yarn) return tag;
     memcpy(&bits, &g_qwen4_rope_factor, sizeof(bits));
-    return DS4_QWEN4_PAYLOAD_TAG ^ (bits | 1u);
+    return tag ^ (bits | 1u);
+}
+
+/* raw indexer key rows a payload of n rows carries */
+static uint32_t qwen4_payload_ik_rows(uint32_t n, bool ik_tail) {
+    return ik_tail && n > QWEN4_IK_TAIL ? QWEN4_IK_TAIL : n;
 }
 
 static uint64_t qwen4_payload_lin_state_bytes(void) {
@@ -63924,14 +63990,15 @@ static uint64_t qwen4_payload_ple_hist_bytes(void) {
     return (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * DS4_N_EMBD * DS4_N_HC * sizeof(float);
 }
 
-static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows) {
+static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool ik_tail) {
     uint64_t bytes = sizeof(uint32_t);   /* mtp_rows */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
             bytes += qwen4_payload_lin_state_bytes() + qwen4_payload_lin_hist_bytes();
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            bytes += 2u * qwen4_payload_kv_bytes(n) + qwen4_payload_ik_bytes(n) + qwen4_payload_block_key_bytes(n);
+            bytes += 2u * qwen4_payload_kv_bytes(n) + qwen4_payload_ik_bytes(qwen4_payload_ik_rows(n, ik_tail)) +
+                     qwen4_payload_block_key_bytes(n);
         }
     }
     bytes += qwen4_payload_ple_hist_bytes();
@@ -63969,7 +64036,7 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
         DS4_N_HEAD_DIM,
         DS4_N_INDEXER_HEAD_DIM,
         DS4_N_VOCAB,
-        qwen4_payload_tag(),
+        qwen4_payload_tag(g->ik_rows < g->ctx_cap),
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -63996,8 +64063,13 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
                                                         buf, DS4_SESSION_IO_CHUNK, err, errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_ik_cache[il], 0, qwen4_payload_ik_bytes(n),
-                                                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            /* the last ik rows of a ring, in row order */
+            const uint32_t nik = qwen4_payload_ik_rows(n, g->ik_rows < g->ctx_cap);
+            for (uint32_t p = n - nik; rc == 0 && p < n; p += g->ik_rows < g->ctx_cap ? 1u : nik) {
+                const uint32_t span = g->ik_rows < g->ctx_cap ? 1u : nik;
+                rc = payload_write_tensor_span(fp, g->layer_ik_cache[il], qwen4_payload_ik_bytes(p % g->ik_rows),
+                                               qwen4_payload_ik_bytes(span), buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
             if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_block_key[il], 0, qwen4_payload_block_key_bytes(n),
                                                         buf, DS4_SESSION_IO_CHUNK, err, errlen);
         }
@@ -64032,10 +64104,11 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
         return 1;
     }
-    if (h[12] != qwen4_payload_tag()) {
+    if (h[12] != qwen4_payload_tag(false) && h[12] != qwen4_payload_tag(true)) {
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or YaRN factor");
         return 1;
     }
+    const bool file_tail = h[12] == qwen4_payload_tag(true);
     if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {
         payload_set_err(err, errlen, "KV checkpoint is longer than this session's context");
         return 1;
@@ -64091,8 +64164,20 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
                                           buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
             if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
                                                        buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_ik_cache[il], 0, qwen4_payload_ik_bytes(n),
-                                                       buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            /* keep the rows a continuation pools: all of them in a full cache,
+             * the last QWEN4_IK_TAIL at their ring slots in a ring */
+            const uint32_t nfile = qwen4_payload_ik_rows(n, file_tail);
+            const uint32_t nkeep = qwen4_payload_ik_rows(nfile, g->ik_rows < g->ctx_cap);
+            if (rc == 0 && nfile > nkeep) {
+                rc = payload_skip_bytes(fp, qwen4_payload_ik_bytes(nfile - nkeep), buf, DS4_SESSION_IO_CHUNK,
+                                        remaining, err, errlen);
+            }
+            for (uint32_t p = n - nkeep; rc == 0 && p < n; p += g->ik_rows < g->ctx_cap ? 1u : nkeep) {
+                const uint32_t span = g->ik_rows < g->ctx_cap ? 1u : nkeep;
+                rc = payload_read_tensor_span(fp, g->layer_ik_cache[il], qwen4_payload_ik_bytes(p % g->ik_rows),
+                                              qwen4_payload_ik_bytes(span), buf, DS4_SESSION_IO_CHUNK,
+                                              remaining, err, errlen);
+            }
             if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_block_key[il], 0, qwen4_payload_block_key_bytes(n),
                                                        buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
         }

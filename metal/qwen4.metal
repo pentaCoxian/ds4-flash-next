@@ -1334,7 +1334,7 @@ struct ds4_metal_args_qwen4_attn_prep {
     uint32_t cache_cap;
     float    rope_base;
     float    eps;
-    uint32_t pad0;
+    uint32_t ik_rows;          /* rows of the raw indexer key cache, a ring (pos % ik_rows) */
     float    rope_mscale;      /* YaRN magnitude scale on cos/sin (1 without) */
     float    rope_freq[32];    /* per-pair inverse frequencies (YaRN-adjusted) */
 };
@@ -1366,7 +1366,7 @@ struct ds4_metal_qwen4_attn_row {
     uint32_t pos;          /* the row's token position */
     uint32_t n_blocks;     /* complete indexer blocks at pos: (pos + 1) / ratio */
     uint32_t use_sel;      /* 1: block-sparse attention, 0: dense over 0..pos */
-    uint32_t pad0;
+    uint32_t ik_bytes;     /* size of ik_cache, a ring of ik_bytes / (4 * Di) rows */
 };
 
 /* Per (token, head) simdgroup: RMSNorm + NeoX rope of one query head (from
@@ -1380,7 +1380,7 @@ static inline void qwen4_attn_prep_slot(
         device const float *iq, device const float *ik,
         device const float *g_q, device const float *g_k, device const float *g_iq,
         device float *q_out, device float *gate_out, device half *k_cache, device half *v_cache,
-        device float *iq_out, device float *ik_cache, threadgroup float *row, ushort tiisg) {
+        device float *iq_out, device float *ik_cache, uint ik_rows, threadgroup float *row, ushort tiisg) {
     const uint H = args.n_head, Hkv = args.n_head_kv, D = args.head_dim;
     const uint Hi = args.n_idx_head, Di = args.idx_dim;
     float v[8];   /* D/32 <= 8 */
@@ -1461,7 +1461,7 @@ static inline void qwen4_attn_prep_slot(
     {
         const uint npt = Di / 32;
         device const float *src = ik + (uint64_t)tok * Di;
-        device float *dst = ik_cache + (uint64_t)pos * Di;
+        device float *dst = ik_cache + (uint64_t)(pos % ik_rows) * Di;
         for (uint i = 0; i < npt; i++) dst[tiisg * npt + i] = src[tiisg * npt + i];
     }
 }
@@ -1492,7 +1492,7 @@ kernel void kernel_qwen4_attn_prep(
     const uint pos = args.pos0 + tok;
     threadgroup float row[576];
     qwen4_attn_prep_slot(args, slot, tok, pos, pos3[pos], qg, kproj, vproj, iq, ik, g_q, g_k, g_iq,
-                         q_out, gate_out, k_cache, v_cache, iq_out, ik_cache, row, tiisg);
+                         q_out, gate_out, k_cache, v_cache, iq_out, ik_cache, args.ik_rows, row, tiisg);
 }
 
 /* The same per (row, head) work for a decode batch: row r's projections and
@@ -1521,7 +1521,8 @@ kernel void kernel_qwen4_attn_prep_rows(
     qwen4_attn_prep_slot(args, tgpig.x, r, e.pos, reinterpret_cast<device const uint4 *>(e.pos3)[e.pos],
                          qg, kproj, vproj, iq, ik, g_q, g_k, g_iq, q_out, gate_out,
                          reinterpret_cast<device half *>(e.k_cache), reinterpret_cast<device half *>(e.v_cache),
-                         iq_out, reinterpret_cast<device float *>(e.ik_cache), row, tiisg);
+                         iq_out, reinterpret_cast<device float *>(e.ik_cache), e.ik_bytes / (4u * args.idx_dim),
+                         row, tiisg);
 }
 
 struct ds4_metal_args_qwen4_idx_block {
@@ -1532,7 +1533,7 @@ struct ds4_metal_args_qwen4_idx_block {
     uint32_t n_rot;
     float    rope_base;
     float    eps;
-    uint32_t pad0;
+    uint32_t ik_rows;     /* raw indexer key ring rows (pos % ik_rows) */
     float    rope_mscale;
     float    rope_freq[32];
 };
@@ -1541,7 +1542,7 @@ struct ds4_metal_args_qwen4_idx_block {
  * rope at the block's first token position.  One simdgroup per block. */
 static inline void qwen4_idx_block_key_one(
         constant ds4_metal_args_qwen4_idx_block &args, uint b,
-        device const float *ik_cache, device const float *g_ik, device const uint4 *pos3,
+        device const float *ik_cache, uint ik_rows, device const float *g_ik, device const uint4 *pos3,
         device half *block_key, threadgroup float *row, ushort tiisg) {
     const uint Di = args.idx_dim;
     const uint npt = Di / 32;
@@ -1549,7 +1550,7 @@ static inline void qwen4_idx_block_key_one(
     float tmp[64];
     for (uint i = 0; i < npt; i++) {
         float acc = 0.0f;
-        for (uint t = 0; t < args.ratio; t++) acc += ik_cache[((uint64_t)b * args.ratio + t) * Di + tiisg * npt + i];
+        for (uint t = 0; t < args.ratio; t++) acc += ik_cache[(uint64_t)((b * args.ratio + t) % ik_rows) * Di + tiisg * npt + i];
         v[i] = acc / (float)args.ratio;
     }
     float ss = 0.0f;
@@ -1578,7 +1579,7 @@ kernel void kernel_qwen4_idx_block_key(
         ushort tiisg [[thread_index_in_simdgroup]]) {
     if (tgpig.x >= args.n_blocks) return;
     threadgroup float row[128];
-    qwen4_idx_block_key_one(args, args.block0 + tgpig.x, ik_cache, g_ik, pos3, block_key, row, tiisg);
+    qwen4_idx_block_key_one(args, args.block0 + tgpig.x, ik_cache, args.ik_rows, g_ik, pos3, block_key, row, tiisg);
 }
 
 /* Decode batch: a row whose position ends a block completes that block's
@@ -1594,7 +1595,8 @@ kernel void kernel_qwen4_idx_block_key_rows(
     const ds4_metal_qwen4_attn_row e = rows[tgpig.x];
     if ((e.pos + 1u) % args.ratio != 0u) return;
     threadgroup float row[128];
-    qwen4_idx_block_key_one(args, e.pos / args.ratio, reinterpret_cast<device const float *>(e.ik_cache), g_ik,
+    qwen4_idx_block_key_one(args, e.pos / args.ratio, reinterpret_cast<device const float *>(e.ik_cache),
+                            e.ik_bytes / (4u * args.idx_dim), g_ik,
                             reinterpret_cast<device const uint4 *>(e.pos3),
                             reinterpret_cast<device half *>(e.block_key), row, tiisg);
 }

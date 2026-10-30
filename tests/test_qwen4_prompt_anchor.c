@@ -18,7 +18,11 @@
 #include <string.h>
 
 #define TEST_CTX 8192
-#define DECODE_STEPS 24
+/* Prefill chunks of 64 rows keep the Metal raw indexer key ring at 72 rows
+ * (qwen4_ik_cache_rows), so the detour of DECODE_STEPS overwrites the rows
+ * before the anchor and the restore needs the ones the anchor saved. */
+#define TEST_CHUNK 64
+#define DECODE_STEPS 96
 #define CHECK_STEPS 12
 
 static int failures;
@@ -43,6 +47,20 @@ static void sync_prefix(ds4_session *s, const ds4_tokens *p, int len) {
 static float *logits_copy(ds4_session *s, int n_vocab) {
     float *out = malloc((size_t)n_vocab * sizeof(float));
     if (!out || ds4_session_copy_logits(s, out, n_vocab) != n_vocab) die("copy logits", NULL);
+    return out;
+}
+
+/* The whole session state as a disk checkpoint writes it: KV and indexer
+ * rows, pooled block keys, recurrent state, logits. */
+static unsigned char *payload_copy(ds4_session *s, size_t *len) {
+    char err[256] = "";
+    FILE *fp = tmpfile();
+    if (!fp || ds4_session_save_payload(s, fp, err, sizeof(err)) != 0) die("save payload", err);
+    *len = (size_t)ftell(fp);
+    unsigned char *out = malloc(*len);
+    rewind(fp);
+    if (!out || fread(out, 1, *len, fp) != *len) die("read payload", NULL);
+    fclose(fp);
     return out;
 }
 
@@ -112,6 +130,18 @@ static void check_anchor(ds4_engine *e, const ds4_tokens *p, int anchor, bool mt
     check(memcmp(got, want, (size_t)n_vocab * sizeof(float)) == 0, what);
     snprintf(what, sizeof(what), "%s: greedy continuation matches", name);
     check(memcmp(got_tokens, want_tokens, sizeof(want_tokens)) == 0, what);
+    if (!mtp) {
+        /* A stale indexer block key rarely changes the logits (a recent block
+         * is selected anyway), so compare the state itself.  MTP drafts leave
+         * their own rows behind, which a straight prefill does not have. */
+        size_t want_len = 0, got_len = 0;
+        unsigned char *want_state = payload_copy(ref, &want_len);
+        unsigned char *got_state = payload_copy(s, &got_len);
+        snprintf(what, sizeof(what), "%s: restored state matches a straight prefill", name);
+        check(want_len == got_len && memcmp(want_state, got_state, want_len) == 0, what);
+        free(want_state);
+        free(got_state);
+    }
 
     /* A restore with nothing left to prefill replays the head instead of
      * serving logits from the far end of the old transcript. */
@@ -145,6 +175,7 @@ int main(void) {
         .backend = DS4_BACKEND_METAL,
         .n_threads = 1,
         .context_size = TEST_CTX,
+        .prefill_chunk = TEST_CHUNK,
         .glm_mtp = mtp,
     };
     ds4_engine *e = NULL;
