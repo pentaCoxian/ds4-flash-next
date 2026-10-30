@@ -42693,6 +42693,18 @@ struct ds4_engine {
     uint64_t       glm_session_graph_bytes;
 };
 
+/* On Apple the Qwen3.8 encoder is mapped only while it encodes an image
+ * (ds4_gpu_map_transient_model), so its 0.6 GB is not kept wired beside the
+ * language model between images. */
+static bool vision_maps_transiently(const ds4_engine *e) {
+#if defined(__APPLE__) && defined(DS4_HAS_QWEN4_GPU)
+    return e->vision_kind == DS4_VISION_QWEN4;
+#else
+    (void)e;
+    return false;
+#endif
+}
+
 static DS4_MAYBE_UNUSED uint64_t ds4_engine_glm_graph_budget(
         const ds4_engine *e, uint64_t next_graph_bytes) {
     /* Metal guards against host capacity, so include live sessions as well as
@@ -72990,7 +73002,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         }
-        if (e->vision_ready) {
+        if (e->vision_ready && !vision_maps_transiently(e)) {
 #if defined(__APPLE__)
             e->vision_map_ready = ds4_gpu_set_model_map_range(
                     e->vision_model.map,
@@ -73540,7 +73552,7 @@ static int ds4_engine_vision_encode_image(
     if (!e->metal_ready) {
         e->metal_ready = ds4_gpu_init() != 0;
     }
-    if (e->metal_ready && !e->vision_map_ready) {
+    if (e->metal_ready && !e->vision_map_ready && !vision_maps_transiently(e)) {
 #if defined(__APPLE__)
         e->vision_map_ready = ds4_gpu_set_model_map_range(
                 e->vision_model.map,
@@ -73556,7 +73568,7 @@ static int ds4_engine_vision_encode_image(
                 e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
 #endif
     }
-    if (!e->metal_ready || !e->vision_map_ready) {
+    if (!e->metal_ready || (!e->vision_map_ready && !vision_maps_transiently(e))) {
         if (error && error_cap) {
             snprintf(error, error_cap, "unable to map vision weights on %s",
                      ds4_backend_name(e->backend));
@@ -73596,8 +73608,21 @@ static int ds4_engine_vision_encode_image(
     } else if (e->vision_kind == DS4_VISION_QWEN4) {
 #ifdef DS4_HAS_QWEN4_GPU
         ds4_image_patches patches = {0};
-        if (!qwen4_vision_encode_image(&e->vision_model, &e->qwen4_vision_weights, image, 64u,
-                                       qwen4_vision_max_tokens(), &embedding, &patches, error, error_cap)) {
+        bool mapped = true;
+#if defined(__APPLE__)
+        mapped = ds4_gpu_map_transient_model(e->vision_model.map, e->vision_model.size,
+                                             e->vision_model.tensor_data_pos,
+                                             e->vision_model.size - e->vision_model.tensor_data_pos,
+                                             e->vision_model.max_tensor_bytes) != 0;
+        if (!mapped && error && error_cap) snprintf(error, error_cap, "unable to map vision weights on Metal");
+#endif
+        const bool encoded = mapped &&
+            qwen4_vision_encode_image(&e->vision_model, &e->qwen4_vision_weights, image, 64u,
+                                      qwen4_vision_max_tokens(), &embedding, &patches, error, error_cap);
+#if defined(__APPLE__)
+        if (mapped) ds4_gpu_unmap_transient_model(e->vision_model.map);
+#endif
+        if (!encoded) {
             ds4_image_patches_free(&patches);
             return 0;
         }

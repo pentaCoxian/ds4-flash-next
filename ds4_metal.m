@@ -12841,6 +12841,36 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
     }
 }
 
+/* Views over a model that is used only now and then, the Qwen3.8 vision
+ * encoder: they join the view list, so its tensors bind like any other, but
+ * not the model residency set, whose rebuild would also re-request and
+ * re-warm every view of the language model. The encoder binds them directly,
+ * so the GPU wires their pages while it runs, and unmapping hands the memory
+ * back once it is done. */
+int ds4_gpu_map_transient_model(const void *model_map, uint64_t model_size, uint64_t map_offset,
+                                uint64_t map_size, uint64_t max_tensor_bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0) return 0;
+    if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
+    max_tensor_bytes = ds4_gpu_effective_model_max_tensor_bytes(map_size, max_tensor_bytes);
+    @autoreleasepool {
+        uint64_t mapped = 0;
+        if (ds4_gpu_add_model_view_range(model_map, model_size, map_offset, map_size,
+                                         max_tensor_bytes, false, &mapped)) {
+            return 1;
+        }
+        ds4_gpu_model_views_remove_map(model_map);
+        return 0;
+    }
+}
+
+void ds4_gpu_unmap_transient_model(const void *model_map) {
+    if (!g_initialized || !model_map) return;
+    @autoreleasepool {
+        ds4_gpu_model_views_remove_map(model_map);
+    }
+}
+
 static int ds4_gpu_model_views_cover_spans(
         const void     *model_map,
         uint64_t        model_size,

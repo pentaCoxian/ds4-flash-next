@@ -241,6 +241,11 @@ void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
+/* Map a rarely used model (the Qwen3.8 vision encoder) for one piece of work
+ * without adding it to the model residency set; unmap it afterwards. */
+int ds4_gpu_map_transient_model(const void *model_map, uint64_t model_size, uint64_t map_offset,
+                                uint64_t map_size, uint64_t max_tensor_bytes);
+void ds4_gpu_unmap_transient_model(const void *model_map);
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
