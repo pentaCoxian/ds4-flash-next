@@ -68,6 +68,16 @@ reject "iq3 at 262K leaves the Neural Engine off" "DS4_ANE=1"
 serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344 DSTAR_QUANT=iq3 -- --ctx 131k
 expect "iq3 at 131K uses the Neural Engine" "DS4_ANE=1"
 
+# iq3m, the mix, makes room at 262K for the Neural Engine, and a plain
+# serve prefers it once it is on disk.
+mkdir -p "$MODELS/IQ3_XXS_M64"
+: > "$MODELS/IQ3_XXS_M64/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS_M64-00001-of-00002.gguf"
+serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344
+expect "a built iq3m is the default" "IQ3_XXS_M64-00001-of-00002.gguf"
+expect "iq3m at 57344 MiB picks 262K" "--ctx 262144 "
+expect "iq3m at 262K uses the Neural Engine" "DS4_ANE=1"
+rm -r "$MODELS/IQ3_XXS_M64"
+
 if [ "$REAL_GB" -gt 64 ]; then
     expect "a larger Mac locks the difference" "--simulate-used-memory $(( REAL_GB - 64 ))GB"
 else

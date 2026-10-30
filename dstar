@@ -39,21 +39,25 @@ usage() {
     cat <<EOF
 usage: dstar <command> [options]
 
-  pull [--no-vision] [--quant q2|iq3|iq3s]
+  pull [--no-vision] [--quant q2|iq3|iq3m|iq3s]
                          download what is missing into $MODELS:
                          one quant (q2 by default, 67 GB; iq3 76 GB; iq3s
                          83 GB), the 1.5 GB MTP block, the 0.6 GB vision
                          encoder. A second quant reuses the 27 GB n-gram
-                         table of the first
+                         table of the first. iq3m is built here from the
+                         iq3 and q2 files (or fetched from DSTAR_MIX_REPO)
   pull NAME              download another model into ./gguf (see: dstar models)
   models                 list the other models ds4 can run
   serve [options]        start the server on http://$HOST:$PORT/v1
       --ctx N            context: 131k, 262k (default), 400k, 524k or a number
-      --quant q2|iq3|iq3s
+      --quant q2|iq3|iq3m|iq3s
                          q2 (default) is the fast 2-bit file; iq3 is ISTA's
                          IQ3_XXS: better answers (most in Japanese), about
                          10% slower decoding, 9 GB more memory, so 262k is
-                         its ceiling on 64 GB; iq3s is
+                         its ceiling on 64 GB; iq3m is IQ3_XXS with four
+                         layers' down experts from q2: the same answers in
+                         0.9 GB less, which on 64 GB makes room at 262k for
+                         the Neural Engine (prefill a quarter faster); iq3s is
                          IQ3_S, ISTA's best file, 16 GB more than q2, for
                          Macs with 96 GB or more
       --port N           port (default $PORT)
@@ -78,7 +82,7 @@ usage: dstar <command> [options]
   link                   link this script into $BIN_DIR, so that "dstar"
                          works from any directory (DSTAR_BIN changes the place)
 
-Environment: DSTAR_MODELS (Flash-Next directory), DSTAR_QUANT (q2, iq3 or iq3s),
+Environment: DSTAR_MODELS (Flash-Next directory), DSTAR_QUANT (q2, iq3, iq3m or iq3s),
 DSTAR_MODEL (the model serve and chat run when none is named), PORT, HOST.
 DSTAR_RAM_GB and DSTAR_WIRED_LIMIT_MB plan as on a Mac with less memory
 (for measuring a 64 GB Mac on a larger one).
@@ -97,14 +101,18 @@ first_of() {
 
 # The quants of the ISTA release. Their second shard, the n-gram table, is
 # the same file in every one of them, so one copy serves all.
-QUANT_TAGS="Q2_0 IQ3_XXS IQ3_S"
+QUANT_TAGS="Q2_0 IQ3_XXS IQ3_S IQ3_XXS_M64"
+# iq3m: IQ3_XXS with these routed down experts from Q2_0 (gguf_mix.py splice;
+# KL against IQ3_S unchanged, see docs/FLASH_NEXT_FORK.md).
+MIX_TENSORS='blk\.(29|30|31|35)\.ffn_down_exps\.weight'
 locate_files() {
     local tag t
     case $QUANT in
         q2) tag=Q2_0; MODEL_GIB=35.03; SHARD1_GB=38 ;;
         iq3) tag=IQ3_XXS; MODEL_GIB=43.80; SHARD1_GB=47 ;;
         iq3s) tag=IQ3_S; MODEL_GIB=51.04; SHARD1_GB=55 ;;
-        *) die "unknown quant $QUANT (q2, iq3 or iq3s)" ;;
+        iq3m) tag=IQ3_XXS_M64; MODEL_GIB=42.92; SHARD1_GB=46 ;;
+        *) die "unknown quant $QUANT (q2, iq3, iq3m or iq3s)" ;;
     esac
     QDIR=$MODELS/$tag
     SHARD1=Qwen3.8-Flash-Next-GSQ-RCO-$tag-00001-of-00002.gguf
@@ -121,13 +129,14 @@ locate_files() {
     F_VISION=$(first_of "$MODELS/$VISION_FILE" "$HERE/gguf/$VISION_FILE")
 }
 
-# Without --quant or DSTAR_QUANT: the fastest quant that is on disk, so a
-# Mac that pulled only iq3s serves it with a plain "serve". When nothing is,
-# the one that suits the memory: q2 below 96 GB, iq3s, the best file, above.
+# Without --quant or DSTAR_QUANT: iq3m when it was built, else the fastest
+# quant that is on disk, so a Mac that pulled only iq3s serves it with a
+# plain "serve". When nothing is, the one that suits the memory: q2 below
+# 96 GB, iq3s, the best file, above.
 pick_quant() {
     local q
     [ -z "$QUANT" ] || return 0
-    for q in q2 iq3 iq3s; do
+    for q in iq3m q2 iq3 iq3s; do
         QUANT=$q; locate_files
         [ -f "$F_SHARD1" ] && return 0
     done
@@ -164,6 +173,30 @@ other_models() {
     exec sh ./download_model.sh "$@"
 }
 
+# iq3m: from DSTAR_MIX_REPO when it is set, else spliced here from the iq3 and
+# q2 first shards (pulled first when missing), without requantizing.
+build_mix() {
+    [ -f "$F_SHARD1" ] && { echo "have  $F_SHARD1"; return; }
+    if [ -n "${DSTAR_MIX_REPO:-}" ]; then
+        fetch "$DSTAR_MIX_REPO" "$SHARD1" "$F_SHARD1"
+        return
+    fi
+    local base donor
+    base=$MODELS/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+    donor=$MODELS/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
+    [ -f "$base" ] || (QUANT=iq3 cmd_pull --no-vision)
+    [ -f "$donor" ] || (QUANT=q2 cmd_pull --no-vision)
+    [ -f "$HERE/gguf-tools/mixed/gguf_mix.py" ] || die "gguf-tools/mixed/gguf_mix.py is missing next to this script"
+    mkdir -p "$QDIR"
+    echo "splice $SHARD1"
+    python3 "$HERE/gguf-tools/mixed/gguf_mix.py" splice --base "$base" --donor "$donor" \
+        --tensors "$MIX_TENSORS" --out "$F_SHARD1" | grep -v '^copied' || true
+    if [ "${PIPESTATUS[0]}" != 0 ]; then
+        rm -f "$F_SHARD1.tmp"
+        die "could not build $SHARD1"
+    fi
+}
+
 cmd_pull() {
     local vision=1
     case ${1:-} in
@@ -173,7 +206,7 @@ cmd_pull() {
     while [ $# -gt 0 ]; do
         case $1 in
             --no-vision) vision=0 ;;
-            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
+            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3, iq3m or iq3s"; QUANT=$2; shift ;;
             *) die "pull: unknown option $1" ;;
         esac
         shift
@@ -186,8 +219,17 @@ cmd_pull() {
     [ -f "$F_SHARD2" ] || need_gb=$(( need_gb + 29 ))
     free_gb=$(df -g "$MODELS" | awk 'NR == 2 { print $4 }')
     [ "$free_gb" -ge "$need_gb" ] || die "the download needs about $need_gb GB, $MODELS has $free_gb GB free"
-    fetch "$MODEL_REPO" "${QDIR##*/}/$SHARD1" "$F_SHARD1"
-    fetch "$MODEL_REPO" "${QDIR##*/}/$SHARD2" "$F_SHARD2"
+    if [ "$QUANT" = iq3m ]; then
+        build_mix
+    else
+        fetch "$MODEL_REPO" "${QDIR##*/}/$SHARD1" "$F_SHARD1"
+    fi
+    # the n-gram table is the same file in every quant; iq3m takes IQ3_XXS's
+    if [ "$QUANT" = iq3m ]; then
+        fetch "$MODEL_REPO" "IQ3_XXS/${SHARD2/IQ3_XXS_M64/IQ3_XXS}" "$F_SHARD2"
+    else
+        fetch "$MODEL_REPO" "${QDIR##*/}/$SHARD2" "$F_SHARD2"
+    fi
     fetch "$MTP_REPO" "$MTP_FILE" "$F_MTP"
     if [ "$vision" = 1 ]; then fetch "$VISION_REPO" "$VISION_FILE" "$F_VISION"; fi
     echo "Done. Start the server with: dstar serve"
@@ -354,7 +396,7 @@ cmd_serve() {
             --ane) ane=1 ;;
             --no-ane) ane=0 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
-            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
+            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3, iq3m or iq3s"; QUANT=$2; shift ;;
             --dry-run) dry=1 ;;
             --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift ;;
             --) shift; break ;;
@@ -461,7 +503,7 @@ cmd_chat() {
     local model="" power=""
     while :; do
         case ${1:-} in
-            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2 ;;
+            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3, iq3m or iq3s"; QUANT=$2 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1 ;;
             *) break ;;
         esac
@@ -530,7 +572,7 @@ cmd_doctor() {
     # The largest window each quant can hold on this machine with 8 GB left
     # for the rest of the system.
     local q best
-    for q in q2 iq3 iq3s; do
+    for q in q2 iq3 iq3m iq3s; do
         QUANT=$q; locate_files; best=""
         for c in 32768 131072 262144 400000 524288; do
             [ $(( $(need_mib "$c") + 8192 )) -gt $(( RAM_GB * 1024 )) ] || best=$c
