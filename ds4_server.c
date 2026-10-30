@@ -11508,6 +11508,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
+        slot->continued_last_store_tokens = loaded;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
@@ -13795,7 +13796,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
                    j->req.image_count, cached, prompt_for_sync->len);
     }
-    if (cached == 0) slot->continued_last_store_tokens = 0;
+    /* A stored frontier past the reused prefix belongs to the discarded
+     * branch, so continued checkpoints restart from the prefix. */
+    if (slot->continued_last_store_tokens > cached) slot->continued_last_store_tokens = cached;
     if (!multimodal && s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
@@ -21848,7 +21851,7 @@ static void test_kv_cache_chat_anchor_chatml_role_names(void) {
     ds4_tokens_free(&prompt);
 }
 
-static void test_kv_cache_continued_uses_aligned_frontiers(void) {
+static void test_kv_cache_continued_stores_past_each_interval(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
@@ -21865,6 +21868,23 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 10240;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
+
+    /* prefill resumed from an unaligned disk hit at 13457 in 2048 chunks */
+    kc.continued_last_store_tokens = 13457;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 13457 + 2048) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 13457 + 3 * 2048) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 13457 + 4 * 2048) == 13457 + 4 * 2048);
+
+    /* 4096-token chunks never land on a multiple of 10240 */
+    kc.continued_last_store_tokens = 0;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 8192) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 12288) == 12288);
+    kc.continued_last_store_tokens = 12288;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 16384) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
+    kc.continued_last_store_tokens = 20480;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 28672) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 32768) == 32768);
 
     kc.opt.boundary_align_tokens = 0;
     kc.continued_last_store_tokens = 20480;
@@ -23373,7 +23393,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_chat_anchor_chatml_role_names();
-    test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_stores_past_each_interval();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
