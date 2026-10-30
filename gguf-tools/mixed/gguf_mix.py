@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Build a mixed DeepSeek V4 Flash GGUF by splicing routed-expert layers.
+"""List GGUF tensors and splice routed-expert layers between two GGUFs.
 
-The base GGUF supplies metadata and all tensors by default.  For selected layer
-IDs, this copies the routed expert tensors from a donor GGUF, rewriting the GGUF
-tensor directory and streaming tensor payloads without dequantizing or
-requantizing.
+  gguf_mix.py list FILE
+      one tab-separated line per tensor: name, type, dims, absolute data
+      offset and payload bytes, then the payload per type.
+
+  gguf_mix.py splice --base B --donor D --q4-layers 37-42 --out OUT
+      the base GGUF supplies metadata and all tensors by default.  For the
+      selected layer IDs the routed expert tensors come from the donor GGUF,
+      rewriting the tensor directory and streaming the payloads without
+      dequantizing or requantizing.
 """
 
 from __future__ import annotations
@@ -50,17 +55,31 @@ GGUF_SCALAR_SIZES = {
     GGUF_VALUE_FLOAT64: 8,
 }
 
-# GGML quant type -> (block elements, bytes per block, display name).
-# This intentionally includes the formats used by the current DeepSeek V4 Flash
-# GGUFs.  Add entries here if future recipes introduce new tensor types.
+# GGML quant type -> (block elements, bytes per block, display name): the
+# DeepSeek V4 Flash formats plus those of the ISTA-DASLab Qwen3.8 GGUFs.
+# gguf-tools/tests/test_gguf_mix.py checks them against ds4_quants.c.
 GGML_QUANT_SIZES = {
     0: (1, 4, "F32"),
     1: (1, 2, "F16"),
+    2: (32, 18, "Q4_0"),
+    6: (32, 22, "Q5_0"),
     8: (32, 34, "Q8_0"),
     10: (256, 84, "Q2_K"),
+    11: (256, 110, "Q3_K"),
     12: (256, 144, "Q4_K"),
+    13: (256, 176, "Q5_K"),
+    14: (256, 210, "Q6_K"),
     16: (256, 66, "IQ2_XXS"),
+    17: (256, 74, "IQ2_XS"),
+    18: (256, 98, "IQ3_XXS"),
+    20: (32, 18, "IQ4_NL"),
+    21: (256, 110, "IQ3_S"),
+    22: (256, 82, "IQ2_S"),
+    23: (256, 136, "IQ4_XS"),
     26: (1, 4, "I32"),
+    30: (1, 2, "BF16"),
+    39: (32, 17, "MXFP4"),
+    42: (64, 18, "Q2_0"),
 }
 
 EXPERT_TENSOR_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
@@ -368,15 +387,34 @@ def summarize(base: GGUFInfo, donor: GGUFInfo, plan: list[SplicePlan]) -> None:
     print(f"payload delta: {delta:,} bytes ({delta / (1024 ** 3):.2f} GiB)")
 
 
+def list_tensors(info: GGUFInfo, out=sys.stdout) -> None:
+    by_type: dict[str, int] = {}
+    for t in info.tensors:
+        name = qtype_name(t.ggml_type)
+        by_type[name] = by_type.get(name, 0) + t.n_bytes
+        dims = ",".join(str(d) for d in t.dims)
+        print(f"{t.name}\t{name}\t{dims}\t{t.data_offset}\t{t.n_bytes}", file=out)
+    for name, n_bytes in sorted(by_type.items(), key=lambda kv: -kv[1]):
+        print(f"# {name}\t{n_bytes}\t{n_bytes / (1024 ** 3):.3f} GiB", file=out)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Splice selected DeepSeek V4 Flash routed-expert layers from a donor GGUF.")
-    parser.add_argument("--base", required=True, type=Path, help="base GGUF used for metadata and default tensors")
-    parser.add_argument("--donor", required=True, type=Path, help="donor GGUF used for selected routed expert layers")
-    parser.add_argument("--out", required=True, type=Path, help="output mixed GGUF")
-    parser.add_argument("--q4-layers", required=True, help="comma-separated layer IDs/ranges to take from donor, e.g. 37-42")
-    parser.add_argument("--dry-run", action="store_true", help="print the plan without writing the output")
-    parser.add_argument("--force", action="store_true", help="overwrite --out if it already exists")
+    parser = argparse.ArgumentParser(description="List GGUF tensors, or splice routed-expert layers from a donor GGUF.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    ls = sub.add_parser("list", help="print the tensor directory as TSV")
+    ls.add_argument("gguf", type=Path)
+    sp = sub.add_parser("splice", help="take the routed experts of some layers from a donor GGUF")
+    sp.add_argument("--base", required=True, type=Path, help="base GGUF used for metadata and default tensors")
+    sp.add_argument("--donor", required=True, type=Path, help="donor GGUF used for selected routed expert layers")
+    sp.add_argument("--out", required=True, type=Path, help="output mixed GGUF")
+    sp.add_argument("--q4-layers", required=True, help="comma-separated layer IDs/ranges to take from donor, e.g. 37-42")
+    sp.add_argument("--dry-run", action="store_true", help="print the plan without writing the output")
+    sp.add_argument("--force", action="store_true", help="overwrite --out if it already exists")
     args = parser.parse_args()
+
+    if args.cmd == "list":
+        list_tensors(parse_gguf(args.gguf))
+        return 0
 
     q4_layers = parse_layer_set(args.q4_layers)
     print("q4 layers:", ",".join(str(x) for x in sorted(q4_layers)))

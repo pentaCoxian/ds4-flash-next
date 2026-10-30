@@ -1,7 +1,15 @@
 # Mixed GGUF Splicing
 
-This directory contains a small GGUF splicer for experiments where only some
-routed-expert layers are upgraded from one quantization to another.
+`gguf_mix.py` lists the tensors of a GGUF and splices routed-expert layers
+between two GGUFs, for experiments where only some routed-expert layers are
+upgraded from one quantization to another.
+
+```bash
+python3 gguf-tools/mixed/gguf_mix.py list model.gguf
+```
+
+prints one tab-separated line per tensor (name, type, dims, absolute data
+offset, payload bytes) and then the payload per type.
 
 The tool does not dequantize or requantize weights. It reads two compatible
 GGUF files, uses the first one as the base, and copies selected routed-expert
@@ -23,7 +31,7 @@ the stronger Q4 model while keeping most of the 2-bit size.
 ## Usage
 
 ```bash
-python3 gguf-tools/mixed/splice_mixed_expert_layers_gguf.py \
+python3 gguf-tools/mixed/gguf_mix.py splice \
   --base /path/to/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf \
   --donor /path/to/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-fixed.gguf \
   --q4-layers 37-42 \
