@@ -60,6 +60,7 @@
 /tests/test_qwen4_moe_mm_specialize
 /tests/test_metal_ane_prefill
 /tests/test_qwen4_vision
+/tests/test_qwen4_vision_lazy
 /tests/test_deepseek4_vision_image
 /tests/test_image_decode
 /tests/test_deepseek41_metal
@@ -90,4 +91,5 @@ __pycache__/
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
 /speed-bench/long_context_probe
+/speed-bench/metal_residency_probe
 /dist
