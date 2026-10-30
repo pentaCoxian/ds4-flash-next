@@ -51,16 +51,18 @@ usage: dstar <command> [options]
       --ctx N            context: 131k, 262k (default), 400k, 524k or a number
       --quant q2|iq3|iq3s
                          q2 (default) is the fast 2-bit file; iq3 is ISTA's
-                         IQ3_XXS: better answers, a quarter slower, 9 GB more
-                         memory, so 262k is its ceiling on 64 GB; iq3s is
+                         IQ3_XXS: better answers (most in Japanese), about
+                         10% slower decoding, 9 GB more memory, so 262k is
+                         its ceiling on 64 GB; iq3s is
                          IQ3_S, ISTA's best file, 16 GB more than q2, for
                          Macs with 96 GB or more
       --port N           port (default $PORT)
       --lan              listen on every interface (there is no authentication)
       --no-mtp           plain decoding without the speculative MTP block
       --no-vision        do not load the vision encoder
-      --ane              run part of the prompt processing on the Neural
-                         Engine: about 30% faster prefill, 0.9 GB more memory
+      --ane, --no-ane    run part of the prompt processing on the Neural
+                         Engine, or not: about 20-30% faster prefill for
+                         0.9 GB; by default it does when the memory allows
       --power N          keep the GPU busy N% of the time, 1..100: a cooler
                          and quieter Mac for a proportionally slower model
       NAME or FILE       serve another model instead: a GGUF path or a word
@@ -99,9 +101,9 @@ QUANT_TAGS="Q2_0 IQ3_XXS IQ3_S"
 locate_files() {
     local tag t
     case $QUANT in
-        q2) tag=Q2_0; BASE_GIB=39.1; SHARD1_GB=38 ;;
-        iq3) tag=IQ3_XXS; BASE_GIB=47.9; SHARD1_GB=47 ;;
-        iq3s) tag=IQ3_S; BASE_GIB=55.2; SHARD1_GB=55 ;;
+        q2) tag=Q2_0; MODEL_GIB=35.03; SHARD1_GB=38 ;;
+        iq3) tag=IQ3_XXS; MODEL_GIB=43.80; SHARD1_GB=47 ;;
+        iq3s) tag=IQ3_S; MODEL_GIB=51.04; SHARD1_GB=55 ;;
         *) die "unknown quant $QUANT (q2, iq3 or iq3s)" ;;
     esac
     QDIR=$MODELS/$tag
@@ -202,9 +204,15 @@ parse_ctx() {
     esac
 }
 
-# GPU memory plan with MTP and vision, in MiB: about 39.1 GiB (47.9 for the
-# iq3 quant, 55.2 for iq3s) plus 33 KiB per context token, and 2 GiB of
-# headroom under the wired limit.
+# GPU memory plan, in MiB, as ds4 prints it ("memory: ... planned"): the
+# main weights (MODEL_GIB), the 1.40 GiB MTP block, the prefill buffers
+# (3.06 GiB for 2048-row chunks, 1.69 for 1024), 0.9 GiB for the Neural
+# Engine's surfaces and state copy when it runs, 26.9 KB of KV cache per
+# context token, and 2 GiB of headroom under the wired limit.  The vision
+# encoder maps only while it encodes and takes experts out of residency
+# when it needs the room, so it is not reserved.  Measured on an M3 Max
+# under the 64 GB emulation: the GPU's peak in-use memory stays below the
+# plan.
 parse_power() {
     case $1 in
         ''|*[!0-9]*) die "--power needs a number from 1 to 100" ;;
@@ -213,23 +221,23 @@ parse_power() {
     echo "$1"
 }
 
-# --ane adds the Neural Engine's two sets of surfaces, the second chunk's
-# rows and the state copy.
+MTP_GIB=1.40
+CHUNK=1024
 ANE_GIB=0
-need_mib() { awk -v c="$1" -v b="$BASE_GIB" -v a="$ANE_GIB" 'BEGIN { printf "%d", (b + a + c * 3.315e-5 + 2) * 1024 }'; }
+buffers_gib() { [ "$CHUNK" = 2048 ] && echo 3.06 || echo 1.69; }
+need_mib() {
+    awk -v c="$1" -v w="$MODEL_GIB" -v m="$MTP_GIB" -v f="$(buffers_gib)" -v a="$ANE_GIB" \
+        'BEGIN { printf "%d", (w + m + f + a + c * 2.5635e-5 + 2) * 1024 }'
+}
 
 wired_limit() { echo "${DSTAR_WIRED_LIMIT_MB:-$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)}"; }
 
 # Does the context fit under the wired limit? A limit of 0 is the system
-# default: three quarters of the RAM, which on a 64 GB machine holds 131072
-# and nothing larger.
+# default, three quarters of the RAM.
 ctx_fits() {
     local ctx=$1 limit
     limit=$(wired_limit)
-    if [ "$limit" = 0 ]; then
-        [ "$ctx" -le 131072 ] || [ "$(need_mib "$ctx")" -le $(( RAM_GB * 768 )) ]
-        return
-    fi
+    [ "$limit" != 0 ] || limit=$(( RAM_GB * 768 ))
     [ "$limit" -ge "$(need_mib "$ctx")" ]
 }
 
@@ -335,15 +343,16 @@ serve_other() {
 }
 
 cmd_serve() {
-    local ctx="" mtp=1 vision=1 dry=0 model="" power="" ane=0
+    local ctx="" mtp=1 vision=1 dry=0 model="" power="" ane=auto
     while [ $# -gt 0 ]; do
         case $1 in
             --ctx) [ $# -ge 2 ] || die "--ctx needs a value"; ctx=$(parse_ctx "$2"); shift ;;
             --port) [ $# -ge 2 ] || die "--port needs a value"; PORT=$2; shift ;;
             --lan) HOST=0.0.0.0 ;;
-            --no-mtp) mtp=0 ;;
+            --no-mtp) mtp=0; MTP_GIB=0 ;;
             --no-vision) vision=0 ;;
-            --ane) ane=1; ANE_GIB=0.9 ;;
+            --ane) ane=1 ;;
+            --no-ane) ane=0 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
             --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
             --dry-run) dry=1 ;;
@@ -365,9 +374,13 @@ cmd_serve() {
     [ "$dry" = 1 ] || ensure_binaries
     [ "$RAM_GB" -ge 60 ] || echo "dstar: this Mac has $RAM_GB GB of RAM; the model is tuned for 64 GB and may not fit" >&2
 
+    # The context comes first, planned with the leanest prefill (1024-row
+    # chunks, no Neural Engine); the prefill then takes the fastest setup
+    # that still fits below.
+    CHUNK=1024; ANE_GIB=0; [ "$ane" = 1 ] && ANE_GIB=0.9
     # Without --ctx take the largest window that leaves the rest of the
-    # system 8 GB (the iq3 quant on 64 GB fits 262K, but then it swaps), and
-    # step down again when the wired limit is lower, saying how to raise it.
+    # system 8 GB, and step down again when the wired limit is lower,
+    # saying how to raise it.
     if [ -z "$ctx" ]; then
         local want c
         for want in 262144 131072 65536 32768; do
@@ -395,6 +408,20 @@ cmd_serve() {
         exit 1
     fi
 
+    # Prefill: the Neural Engine takes part of the projections (about 20%
+    # faster with 1024-row chunks, 30% with 2048, the same answers within
+    # KL 0.005) when its 0.9 GiB fits, and 2048-row chunks (5-10% faster
+    # than 1024) when their 1.4 GiB does too.  --ane and --no-ane decide it.
+    local setup
+    for setup in "2048 0.9" "1024 0.9" "2048 0" "1024 0"; do
+        read -r CHUNK ANE_GIB <<<"$setup"
+        [ "$ane" = 0 ] && [ "$ANE_GIB" != 0 ] && continue
+        [ "$ane" = 1 ] && [ "$ANE_GIB" = 0 ] && continue
+        [ $(( $(need_mib "$ctx") + 8192 )) -le $(( RAM_GB * 1024 )) ] && ctx_fits "$ctx" && break
+    done
+    [ "$ANE_GIB" = 0 ] || ane=1
+    if [ "$ane" = 1 ] && [ "$ANE_GIB" = 0 ]; then ane=0; fi
+
     # Past the native 262144 window the positions need YaRN scaling. A
     # checkpoint only loads under the factor it was written with, so those
     # contexts keep their own cache directory and write snapshots less often.
@@ -409,7 +436,7 @@ cmd_serve() {
     export DS4_QWEN_NGRAM_GGUF=$F_SHARD2
     export DS4_QWEN4_MOE_TAILS=1
     if [ "$ane" = 1 ]; then export DS4_ANE=1; fi
-    set -- --ctx "$ctx" --prefill-chunk 2048 --host "$HOST" --port "$PORT" \
+    set -- --ctx "$ctx" --prefill-chunk "$CHUNK" --host "$HOST" --port "$PORT" \
         --kv-disk-dir "$kv_dir" --kv-disk-space-mb "$kv_mb" \
         --kv-cache-continued-interval-tokens "$kv_every" $(simulate_args) "$@"
     if [ "$mtp" = 1 ] && [ -f "$F_MTP" ]; then
@@ -425,7 +452,7 @@ cmd_serve() {
         echo "cd $HERE && caffeinate -i ./ds4-server -m $F_SHARD1 $*"
         return
     fi
-    echo "dstar: $QUANT, context $ctx, http://$HOST:$PORT/v1" >&2
+    echo "dstar: $QUANT, context $ctx, prefill in $CHUNK-row chunks$([ "$ane" = 1 ] && echo " with the Neural Engine"), http://$HOST:$PORT/v1" >&2
     cd "$HERE"   # the Metal shaders load from ./metal
     exec caffeinate -i ./ds4-server -m "$F_SHARD1" "$@"
 }

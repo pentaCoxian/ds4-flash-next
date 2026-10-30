@@ -19,12 +19,16 @@ for t in Q2_0 IQ3_XXS; do
     mkdir -p "$MODELS/$t"
     for s in 00001 00002; do : > "$MODELS/$t/Qwen3.8-Flash-Next-GSQ-RCO-$t-$s-of-00002.gguf"; done
 done
+: > "$MODELS/Qwen3.8-Flash-Next-MTP-block.gguf"
 
 REAL_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 
-# serve NAME ENV... -- ARGS: dry-run output (stdout and stderr) in $OUT
+# serve ENV... [-- ARGS]: dry-run output (stdout and stderr) in $OUT
 serve() {
-    OUT=$(env DSTAR_MODELS="$MODELS" "$@" ./dstar serve --dry-run 2>&1)
+    local envs=()
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+    [ $# -gt 0 ] && shift
+    OUT=$(env DSTAR_MODELS="$MODELS" "${envs[@]}" ./dstar serve --dry-run "$@" 2>&1)
 }
 
 expect() {
@@ -39,14 +43,30 @@ reject() {
     if grep -q -- "$2" <<<"$OUT"; then fail "$1 (unexpected: $2)"; sed 's/^/    /' <<<"$OUT"; else ok "$1"; fi
 }
 
-# A 64 GB Mac at its default limit (three quarters of the RAM) holds 131K.
+# A 64 GB Mac at its default limit (three quarters of the RAM) holds q2 at
+# 262K in 1024-row chunks; iq3 needs the limit raised.
 serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=0
-expect "64 GB default limit picks 131K" "--ctx 131072 "
-expect "64 GB default limit says how to reach 262K" "sudo sysctl iogpu.wired_limit_mb="
+expect "64 GB default limit holds q2 at 262K" "--ctx 262144 "
+expect "64 GB default limit prefills q2 in 1024 rows" "--prefill-chunk 1024 "
+serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=0 DSTAR_QUANT=iq3
+expect "64 GB default limit says how to fit iq3" "sudo sysctl iogpu.wired_limit_mb="
 
-# The raised limit of the README holds the native window.
+# The raised limit of the README holds the native window, with 2048-row
+# prefill chunks and the Neural Engine for q2.
 serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344
 expect "64 GB at 57344 MiB picks 262K" "--ctx 262144 "
+expect "q2 at 262K prefills 2048 rows" "--prefill-chunk 2048 "
+expect "q2 at 262K uses the Neural Engine" "DS4_ANE=1"
+serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344 -- --no-ane
+reject "--no-ane keeps the Neural Engine off" "DS4_ANE=1"
+
+# iq3 holds 262K too, in 1024-row chunks without the Neural Engine.
+serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344 DSTAR_QUANT=iq3
+expect "iq3 at 57344 MiB picks 262K" "--ctx 262144 "
+expect "iq3 at 262K prefills 1024 rows" "--prefill-chunk 1024 "
+reject "iq3 at 262K leaves the Neural Engine off" "DS4_ANE=1"
+serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344 DSTAR_QUANT=iq3 -- --ctx 131k
+expect "iq3 at 131K uses the Neural Engine" "DS4_ANE=1"
 
 if [ "$REAL_GB" -gt 64 ]; then
     expect "a larger Mac locks the difference" "--simulate-used-memory $(( REAL_GB - 64 ))GB"
