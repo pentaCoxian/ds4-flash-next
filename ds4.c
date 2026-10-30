@@ -69071,6 +69071,86 @@ static void qwen4_dump_f32(const char *path, const float *v, uint64_t n) {
     fclose(f);
 }
 
+/* DS4_QWEN4_FT_REF=write|compare with DS4_QWEN4_FT_LIST: instead of the
+ * logits, write per position the top QWEN4_FT_REF_K log-probabilities, the
+ * log of the remaining mass and the log-probability of the next token
+ * (write), or compare against such a file (compare): per sequence the mean
+ * and p99 of KL(reference || this model) over the reference's top tokens
+ * plus the rest as one bucket, a lower bound of the full KL; the share of
+ * positions whose argmax agrees; and the mean NLL of the next token.  This
+ * is how quants and mixed quants are compared with a reference quant. */
+#define QWEN4_FT_REF_K 128u
+typedef struct {
+    uint32_t id[QWEN4_FT_REF_K];   /* by descending probability */
+    float lp[QWEN4_FT_REF_K];
+    float lp_rest;
+    float lp_next;
+} qwen4_ft_ref_row;
+
+static double qwen4_ft_logsumexp(const float *x, uint32_t n) {
+    float mx = x[0];
+    for (uint32_t i = 1; i < n; i++) mx = x[i] > mx ? x[i] : mx;
+    double sum = 0.0;
+    for (uint32_t i = 0; i < n; i++) sum += exp((double)x[i] - mx);
+    return mx + log(sum);
+}
+
+static void qwen4_ft_ref_make(const float *logits, int next, qwen4_ft_ref_row *r) {
+    const double lse = qwen4_ft_logsumexp(logits, DS4_N_VOCAB);
+    uint32_t n = 0;
+    for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+        if (n == QWEN4_FT_REF_K && logits[v] <= logits[r->id[n - 1u]]) continue;
+        uint32_t at = n < QWEN4_FT_REF_K ? n++ : n - 1u;
+        while (at > 0 && logits[r->id[at - 1u]] < logits[v]) { r->id[at] = r->id[at - 1u]; at--; }
+        r->id[at] = v;
+    }
+    double kept = 0.0;
+    for (uint32_t i = 0; i < QWEN4_FT_REF_K; i++) {
+        r->lp[i] = (float)(logits[r->id[i]] - lse);
+        kept += exp(r->lp[i]);
+    }
+    r->lp_rest = (float)log(fmax(1.0 - kept, 1e-12));
+    r->lp_next = (float)(logits[next] - lse);
+}
+
+static int qwen4_ft_cmp_double(const void *a, const void *b) {
+    const double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+/* positions 0..n-2 of logits[n][vocab], against the reference rows */
+static void qwen4_ft_ref_compare(const float *logits, const int *seq, uint32_t n,
+                                 const qwen4_ft_ref_row *ref, const char *path) {
+    double *kl = xmalloc((size_t)n * sizeof(double));
+    double kl_sum = 0.0, nll = 0.0, ref_nll = 0.0;
+    uint32_t agree = 0;
+    for (uint32_t t = 0; t + 1u < n; t++) {
+        const float *x = logits + (uint64_t)t * DS4_N_VOCAB;
+        const qwen4_ft_ref_row *r = ref + t;
+        const double lse = qwen4_ft_logsumexp(x, DS4_N_VOCAB);
+        double d = 0.0, q_kept = 0.0;
+        uint32_t best = 0;
+        for (uint32_t v = 1; v < DS4_N_VOCAB; v++) best = x[v] > x[best] ? v : best;
+        for (uint32_t i = 0; i < QWEN4_FT_REF_K; i++) {
+            const double lq = x[r->id[i]] - lse;
+            q_kept += exp(lq);
+            d += exp(r->lp[i]) * (r->lp[i] - lq);
+        }
+        d += exp(r->lp_rest) * (r->lp_rest - log(fmax(1.0 - q_kept, 1e-12)));
+        kl[t] = d;
+        kl_sum += d;
+        agree += best == r->id[0];
+        nll -= x[seq[t + 1u]] - lse;
+        ref_nll -= r->lp_next;
+    }
+    const uint32_t m = n - 1u;
+    qsort(kl, m, sizeof(double), qwen4_ft_cmp_double);
+    printf("ft_ref %s positions=%u kl=%.6f kl_p99=%.6f top1=%.5f nll=%.6f ref_nll=%.6f\n",
+           path, m, kl_sum / m, kl[(uint32_t)(0.99 * (m - 1u))], (double)agree / m, nll / m, ref_nll / m);
+    fflush(stdout);
+    free(kl);
+}
+
 /* --first-token-test for Qwen3.8: DS4_QWEN4_FT_TOKENS (comma-separated ids,
  * default: the prompt) runs the sequential CPU reference; DS4_QWEN4_FT_OUT
  * dumps [n][vocab] f32 logits, DS4_QWEN4_FT_HIDDEN [n][trunk][hc*embd]
@@ -69150,6 +69230,31 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
                 free(out); free(lseq); free(line);
                 qwen4_graph_free(g); free(g); fclose(lf);
                 return 1;
+            }
+            const char *ref_mode = getenv("DS4_QWEN4_FT_REF");
+            if (ref_mode && !bar && ln > 1u) {
+                const bool write_ref = !strcmp(ref_mode, "write");
+                qwen4_ft_ref_row *ref = xmalloc((size_t)(ln - 1u) * sizeof(*ref));
+                FILE *rf = fopen(out_path, write_ref ? "wb" : "rb");
+                bool rok = rf != NULL;
+                if (rok && write_ref) {
+                    for (uint32_t t = 0; t + 1u < ln; t++)
+                        qwen4_ft_ref_make(out + (uint64_t)t * DS4_N_VOCAB, lseq[t + 1u], &ref[t]);
+                    rok = fwrite(ref, sizeof(*ref), ln - 1u, rf) == ln - 1u;
+                } else if (rok) {
+                    rok = fread(ref, sizeof(*ref), ln - 1u, rf) == ln - 1u;
+                    if (rok) qwen4_ft_ref_compare(out, lseq, ln, ref, out_path);
+                }
+                if (rf) fclose(rf);
+                free(ref);
+                if (!rok) {
+                    fprintf(stderr, "ds4: FT_REF %s failed: %s\n", write_ref ? "write" : "read", out_path);
+                    free(out); free(lseq); free(line);
+                    qwen4_graph_free(g); free(g); fclose(lf);
+                    return 1;
+                }
+                if (write_ref) printf("ft_ref %u positions -> %s\n", ln - 1u, out_path);
+                continue;
             }
             FILE *of = fopen(out_path, "wb");
             if (!of || fwrite(out, sizeof(float), (size_t)ln * DS4_N_VOCAB, of) != (size_t)ln * DS4_N_VOCAB) {
