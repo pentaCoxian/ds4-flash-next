@@ -94,5 +94,6 @@ __pycache__/
 /tests/test_q8_prefill_variants
 /speed-bench/long_context_probe
 /speed-bench/metal_residency_probe
+/speed-bench/qwen4_mv_bench
 /dist
 /tests/test_qwen4_prompt_anchor

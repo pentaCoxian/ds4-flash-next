@@ -115,6 +115,29 @@ static const ds4_gpu_quant_kind ds4_gpu_q4_K_mixed_kind =
     { DS4_METAL_TENSOR_Q4_K,   256, 144, 2, 2,  32, "kernel_mul_mv_q4_K_mixed_f32",
       NULL,                               "kernel_mul_mm_q4_K_f32", false, 8 };
 
+/* Highest MTLGPUFamilyAppleN the device supports: 7 is M1, 8 M2, 9 M3 and M4,
+ * 10 M5; 0 when unknown.  Kernel shapes tuned on one generation gate on it. */
+static int g_metal_apple_family;
+
+/* Largest batch a mixed type's multi-token kernels take; larger batches of
+ * at most 8 tokens run the one-token kernel over a grid of tokens.  On
+ * Apple9 (M3, M4) the K-quants' two- and three-token kernels run at a third
+ * to a half of their one-token speed, while the token grid reads the
+ * weights a second time from cache: a two-token batch of the IQ3_XXS
+ * file's Q4_K/Q5_K/Q6_K matvecs takes 6.5 ms instead of 11.7 on an M3 Max.
+ * DS4_METAL_MIXED_MV_NT_MAX=N caps every type at N (up to its own limit). */
+static uint16_t ds4_gpu_quant_kind_nt_max(const ds4_gpu_quant_kind *k) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_METAL_MIXED_MV_NT_MAX");
+        v = e && atoi(e) > 0 && atoi(e) <= 8 ? atoi(e) : 0;
+    }
+    if (v) return v < k->nt_max ? (uint16_t)v : k->nt_max;
+    const bool k_quant = k->type == DS4_METAL_TENSOR_Q3_K || k->type == DS4_METAL_TENSOR_Q4_K ||
+                         k->type == DS4_METAL_TENSOR_Q5_K || k->type == DS4_METAL_TENSOR_Q6_K;
+    return k_quant && g_metal_apple_family == 9 ? 1 : k->nt_max;
+}
+
 static const ds4_gpu_quant_kind *ds4_gpu_quant_kind_find(uint32_t type) {
     for (size_t i = 0; i < sizeof(ds4_gpu_quant_kinds) / sizeof(ds4_gpu_quant_kinds[0]); i++) {
         if (ds4_gpu_quant_kinds[i].type == type) return &ds4_gpu_quant_kinds[i];
@@ -985,14 +1008,23 @@ static uint64_t ds4_gpu_system_memory_bytes(void) {
     return len == sizeof(bytes) ? bytes : 0;
 }
 
+static void ds4_gpu_detect_apple_family(void) {
+    g_metal_apple_family = 0;
+    for (int f = 10; f >= 7 && g_device && !g_metal_apple_family; f--) {
+        if ([g_device supportsFamily:(MTLGPUFamily)(MTLGPUFamilyApple1 - 1 + f)]) g_metal_apple_family = f;
+    }
+}
+
 static void ds4_gpu_print_device_summary(void) {
     const char *name = g_device.name ? [g_device.name UTF8String] : "unknown Metal device";
+    char family[16] = "";
+    if (g_metal_apple_family) snprintf(family, sizeof(family), " (Apple%d)", g_metal_apple_family);
     uint64_t mem = ds4_gpu_system_memory_bytes();
     if (mem) {
         double gib = (double)mem / 1024.0 / 1024.0 / 1024.0;
-        fprintf(stderr, "ds4: Metal device %s, %.2f GiB RAM\n", name, gib);
+        fprintf(stderr, "ds4: Metal device %s%s, %.2f GiB RAM\n", name, family, gib);
     } else {
-        fprintf(stderr, "ds4: Metal device %s\n", name);
+        fprintf(stderr, "ds4: Metal device %s%s\n", name, family);
     }
 }
 
@@ -6940,6 +6972,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
         ds4_gpu_timeline_probe(g_device);
+        ds4_gpu_detect_apple_family();
         ds4_gpu_print_device_summary();
         ds4_gpu_detect_metal4_features();
 
@@ -20134,9 +20167,12 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             !ds4_gpu_device_is_m5_apple_silicon() && getenv("DS4_METAL_NO_Q4_K_MIXED") == NULL) {
             kind = &ds4_gpu_q4_K_mixed_kind;
         }
+        /* a type whose multi-token kernels are capped keeps the token grid
+         * rather than mv_ext, which is slower still for the K-quants */
+        const uint16_t nt_max = kind ? ds4_gpu_quant_kind_nt_max(kind) : 0;
         if (kind && (n_tok == 1u || (n_tok <= 8u && (n_tok <= kind->nt_max || !kind->mv_ext)))) {
             /* four tokens as two pairs: four-token kernels would spill */
-            const uint32_t nt = n_tok == 1u || n_tok > kind->nt_max ? 1u : n_tok == 2u || n_tok == 4u ? 2u : 3u;
+            const uint32_t nt = n_tok == 1u || n_tok > nt_max ? 1u : n_tok == 2u || n_tok == 4u ? 2u : 3u;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_ext_pipeline(ds4_gpu_quant_mv_name(kind, nt), (int16_t)kind->nsg, 8);
             if (!pipeline) return 0;
