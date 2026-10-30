@@ -105,6 +105,7 @@ QUANT_TAGS="Q2_0 IQ3_XXS IQ3_S IQ3_XXS_M64"
 # iq3m: IQ3_XXS with these routed down experts from Q2_0 (gguf_mix.py splice;
 # KL against IQ3_S unchanged, see docs/FLASH_NEXT_FORK.md).
 MIX_TENSORS='blk\.(29|30|31|35)\.ffn_down_exps\.weight'
+MIX_SHA256=9c533e0650a672b4856eccbbbfd9a39a277988ada982e00129e7f19c8a8d4d2d
 locate_files() {
     local tag t
     case $QUANT in
@@ -179,6 +180,7 @@ build_mix() {
     [ -f "$F_SHARD1" ] && { echo "have  $F_SHARD1"; return; }
     if [ -n "${DSTAR_MIX_REPO:-}" ]; then
         fetch "$DSTAR_MIX_REPO" "$SHARD1" "$F_SHARD1"
+        check_mix
         return
     fi
     local base donor
@@ -195,6 +197,13 @@ build_mix() {
         rm -f "$F_SHARD1.tmp"
         die "could not build $SHARD1"
     fi
+    check_mix
+}
+
+check_mix() {
+    echo "check $SHARD1"
+    [ "$(shasum -a 256 "$F_SHARD1" | cut -d' ' -f1)" = "$MIX_SHA256" ] ||
+        die "$F_SHARD1 does not have the expected SHA-256; delete it and pull again"
 }
 
 cmd_pull() {
