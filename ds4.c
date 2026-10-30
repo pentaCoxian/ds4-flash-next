@@ -42671,6 +42671,12 @@ struct ds4_engine {
     bool mtp_ready;
     bool vision_ready;
     bool vision_map_ready;
+    /* With the Qwen3.8 encoder mapped per image (vision_maps_transiently) on
+     * Metal, the routed expert tensors of the last QWEN4_EVICT_LAYERS trunk
+     * layers get views of their own: an encode the GPU budget cannot hold
+     * takes them out of residency, last layer first, and puts them back. */
+    uint64_t qwen4_evict_off[3 * 4], qwen4_evict_len[3 * 4];
+    uint32_t qwen4_evict_n;
     bool share_session_prefill_workspace;
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
@@ -42723,6 +42729,45 @@ static bool vision_maps_transiently(const ds4_engine *e) {
     (void)e;
     return false;
 #endif
+}
+
+#define QWEN4_EVICT_LAYERS 4u
+
+/* Model spans for the Metal views when an image encode may need the memory
+ * of some routed experts: each expert tensor of the last QWEN4_EVICT_LAYERS
+ * trunk layers alone, the rest of the tensor data around them.  Records the
+ * tensors in e->qwen4_evict_*, last layer first.  Returns the span count. */
+static uint32_t qwen4_evict_spans(ds4_engine *e, uint64_t *off, uint64_t *len, uint32_t cap) {
+    e->qwen4_evict_n = 0;
+    if (!vision_maps_transiently(e) || !ds4_model_is_qwen4()) return 0;
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t k = 0; k < QWEN4_EVICT_LAYERS && k < n_trunk; k++) {
+        const ds4_layer_weights *l = &e->weights.layer[n_trunk - 1u - k];
+        const ds4_tensor *t[3] = { l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps };
+        for (int i = 0; i < 3; i++) {
+            if (!t[i] || !t[i]->bytes) return 0;
+            e->qwen4_evict_off[e->qwen4_evict_n] = t[i]->abs_offset;
+            e->qwen4_evict_len[e->qwen4_evict_n++] = t[i]->bytes;
+        }
+    }
+    /* spans in file order: the gaps between the evictable tensors, and them */
+    uint64_t sorted[3 * QWEN4_EVICT_LAYERS];
+    const uint32_t n = e->qwen4_evict_n;
+    for (uint32_t i = 0; i < n; i++) sorted[i] = i;
+    for (uint32_t i = 1; i < n; i++)
+        for (uint32_t j = i; j > 0 && e->qwen4_evict_off[sorted[j]] < e->qwen4_evict_off[sorted[j - 1]]; j--) {
+            const uint64_t x = sorted[j]; sorted[j] = sorted[j - 1]; sorted[j - 1] = x;
+        }
+    uint32_t c = 0;
+    uint64_t at = e->model.tensor_data_pos;
+    for (uint32_t i = 0; i < n && c + 2u <= cap; i++) {
+        const uint64_t o = e->qwen4_evict_off[sorted[i]], b = e->qwen4_evict_len[sorted[i]];
+        if (o > at) { off[c] = at; len[c++] = o - at; }
+        off[c] = o; len[c++] = b;
+        at = o + b;
+    }
+    if (at < e->model.size && c < cap) { off[c] = at; len[c++] = e->model.size - at; }
+    return c;
 }
 
 static DS4_MAYBE_UNUSED uint64_t ds4_engine_glm_graph_budget(
@@ -73214,11 +73259,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
                 e->model.size - e->model.tensor_data_pos : 0;
-            model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
-                                                       e->model.size,
-                                                       e->model.tensor_data_pos,
-                                                       e->model.size - e->model.tensor_data_pos,
-                                                       e->model.max_tensor_bytes);
+            uint64_t eoff[6 * QWEN4_EVICT_LAYERS + 1], elen[6 * QWEN4_EVICT_LAYERS + 1];
+            const uint32_t espans = e->backend == DS4_BACKEND_METAL ?
+                qwen4_evict_spans(e, eoff, elen, 6 * QWEN4_EVICT_LAYERS + 1) : 0;
+            model_map_ok = espans ?
+                ds4_gpu_set_model_map_spans(e->model.map, e->model.size, eoff, elen, espans,
+                                            e->model.max_tensor_bytes) :
+                ds4_gpu_set_model_map_range(e->model.map,
+                                            e->model.size,
+                                            e->model.tensor_data_pos,
+                                            e->model.size - e->model.tensor_data_pos,
+                                            e->model.max_tensor_bytes);
         }
         if (!model_map_ok) {
             fprintf(stderr,
@@ -73837,6 +73888,45 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
+#if defined(__APPLE__) && defined(DS4_HAS_QWEN4_GPU)
+/* Near the wired limit a command buffer that needs more GPU memory fails
+ * outright, and the encoder's weights and transients are allocated per image:
+ * when they would not fit beside the language model, take routed experts of
+ * the last trunk layers out of residency (nothing runs the language model
+ * during an encode), last layer first, until they do.  Returns the bytes
+ * taken out; evict = false puts every one back.  DS4_QWEN4_VISION_EVICT_LAYERS
+ * = N takes N layers out regardless, to test the path. */
+static uint64_t qwen4_vision_make_room(ds4_engine *e, bool evict) {
+    if (!e->qwen4_evict_n) return 0;
+    if (!evict) {
+        for (uint32_t i = 0; i < e->qwen4_evict_n; i++)
+            ds4_gpu_model_range_set_resident(e->model.map, e->qwen4_evict_off[i], e->qwen4_evict_len[i], 1);
+        return 0;
+    }
+    const uint64_t wired = glm_graph_wired_limit_bytes();
+    const uint64_t limit = wired ? wired : ds4_gpu_recommended_working_set_size();
+    const uint64_t need = e->vision_model.size - e->vision_model.tensor_data_pos +
+        ds4_gpu_qwen4_vision_scratch_bytes(4u * qwen4_vision_max_tokens(), &e->qwen4_vision_weights) +
+        (256ull << 20);
+    const uint64_t used = ds4_gpu_resident_bytes();
+    const uint64_t short_by = used + need > limit ? used + need - limit : 0;
+    const char *force = getenv("DS4_QWEN4_VISION_EVICT_LAYERS");
+    const uint32_t forced = force ? 3u * (uint32_t)strtoul(force, NULL, 10) : 0u;
+    uint64_t freed = 0;
+    for (uint32_t i = 0; i < e->qwen4_evict_n && (freed < short_by || i < forced); i++)
+        freed += ds4_gpu_model_range_set_resident(e->model.map, e->qwen4_evict_off[i], e->qwen4_evict_len[i], 0);
+    if (freed) {
+        fprintf(stderr, "ds4: vision encode: %.2f GiB of routed experts out of residency (%.2f GiB short)\n",
+                (double)freed / 1073741824.0, (double)short_by / 1073741824.0);
+    }
+    if (freed < short_by) {
+        fprintf(stderr, "ds4: vision encode may not fit: %.2f GiB short of the GPU memory limit\n",
+                (double)(short_by - freed) / 1073741824.0);
+    }
+    return freed;
+}
+#endif
+
 static int ds4_engine_vision_encode_image(
         ds4_engine            *e,
         const ds4_image       *image,
@@ -73910,6 +74000,7 @@ static int ds4_engine_vision_encode_image(
         ds4_image_patches patches = {0};
         bool mapped = true;
 #if defined(__APPLE__)
+        const uint64_t evicted = qwen4_vision_make_room(e, true);
         mapped = ds4_gpu_map_transient_model(e->vision_model.map, e->vision_model.size,
                                              e->vision_model.tensor_data_pos,
                                              e->vision_model.size - e->vision_model.tensor_data_pos,
@@ -73921,6 +74012,7 @@ static int ds4_engine_vision_encode_image(
                                       qwen4_vision_max_tokens(), &embedding, &patches, error, error_cap);
 #if defined(__APPLE__)
         if (mapped) ds4_gpu_unmap_transient_model(e->vision_model.map);
+        if (evicted) qwen4_vision_make_room(e, false);
 #endif
         if (!encoded) {
             ds4_image_patches_free(&patches);

@@ -246,6 +246,11 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 int ds4_gpu_map_transient_model(const void *model_map, uint64_t model_size, uint64_t map_offset,
                                 uint64_t map_size, uint64_t max_tensor_bytes);
 void ds4_gpu_unmap_transient_model(const void *model_map);
+/* GPU memory held now: resident model views plus live tensors. */
+uint64_t ds4_gpu_resident_bytes(void);
+/* Take a model map's views in [offset, offset + bytes) out of the model
+ * residency set (resident 0) or put them back (1); returns their bytes. */
+uint64_t ds4_gpu_model_range_set_resident(const void *model_map, uint64_t offset, uint64_t bytes, int resident);
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
@@ -3561,6 +3566,7 @@ int ds4_gpu_qwen4_gdn_front_tensor(
 int ds4_gpu_qwen4_vis_attention_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
                                        const ds4_gpu_tensor *v, uint32_t rows, uint32_t n_head,
                                        uint32_t head_dim, float scale);
+uint64_t ds4_gpu_qwen4_vision_scratch_bytes(uint32_t n_patches, const ds4_qwen4_vision_weights *w);
 int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed, uint32_t n_patches,
                                 uint32_t grid_w, const void *model_map, uint64_t model_size,
                                 const ds4_qwen4_vision_weights *w);

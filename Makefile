@@ -733,8 +733,15 @@ test-qwen4-vision-lazy: tests/test_qwen4_vision tests/test_qwen4_vision_lazy
 	@test -n "$(DS4_QWEN4_MODEL)" -a -n "$(DS4_QWEN4_MMPROJ)" -a -n "$(DS4_QWEN4_IMAGE)" || \
 	  { echo "set DS4_QWEN4_MODEL, DS4_QWEN4_MMPROJ and DS4_QWEN4_IMAGE"; exit 1; }
 	./tests/test_qwen4_vision "$(DS4_QWEN4_MMPROJ)" "$(DS4_QWEN4_IMAGE)" /tmp/ds4_vision_eager.bin
-	./tests/test_qwen4_vision_lazy "$(DS4_QWEN4_MODEL)" "$(DS4_QWEN4_MMPROJ)" "$(DS4_QWEN4_IMAGE)" /tmp/ds4_vision_lazy.bin
+	./tests/test_qwen4_vision_lazy "$(DS4_QWEN4_MODEL)" "$(DS4_QWEN4_MMPROJ)" "$(DS4_QWEN4_IMAGE)" /tmp/ds4_vision_lazy.bin \
+	  | tee /tmp/ds4_vision_lazy.txt
 	cmp /tmp/ds4_vision_eager.bin /tmp/ds4_vision_lazy.bin && echo "PASS lazy and eager Qwen vision embeddings are identical"
+	DS4_QWEN4_VISION_EVICT_LAYERS=2 ./tests/test_qwen4_vision_lazy "$(DS4_QWEN4_MODEL)" "$(DS4_QWEN4_MMPROJ)" \
+	  "$(DS4_QWEN4_IMAGE)" /tmp/ds4_vision_evict.bin | tee /tmp/ds4_vision_evict.txt
+	grep '^tokens:' /tmp/ds4_vision_lazy.txt > /tmp/ds4_vision_lazy.tok
+	grep '^tokens:' /tmp/ds4_vision_evict.txt > /tmp/ds4_vision_evict.tok
+	cmp /tmp/ds4_vision_eager.bin /tmp/ds4_vision_evict.bin && cmp /tmp/ds4_vision_lazy.tok /tmp/ds4_vision_evict.tok && \
+	  echo "PASS encodes with routed experts out of residency match, and the text after them too"
 
 # DS4_QWEN4_SNAPSHOT=<HF checkpoint dir> DS4_QWEN4_MMPROJ=<mmproj.gguf> DS4_QWEN4_IMAGE=<image>
 test-qwen4-vision: tests/test_qwen4_vision

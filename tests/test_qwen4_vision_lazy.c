@@ -1,7 +1,10 @@
 /* The Qwen3.8 encoder maps its views only while it encodes: two encodes of one
  * image through an engine that holds the language model give the same bytes,
  * and the dump it writes must equal tests/test_qwen4_vision's, which maps the
- * encoder once up front (make test-qwen4-vision-lazy compares them). */
+ * encoder once up front (make test-qwen4-vision-lazy compares them).  A short
+ * greedy text continuation afterwards prints its tokens, which must not change
+ * when DS4_QWEN4_VISION_EVICT_LAYERS takes routed experts out of residency
+ * for the encodes: they are back for the language model. */
 #include "ds4.h"
 
 #include <stdio.h>
@@ -52,6 +55,24 @@ int main(int argc, char **argv) {
         if (fp) fclose(fp);
     }
     if (ok) printf("PASS Qwen vision encodes %u tokens the same twice through transient views\n", a.token_count);
+    ds4_session *s = NULL;
+    ds4_tokens p = {0};
+    if (ok && ds4_session_create(&s, e, 4096) == 0) {
+        ds4_encode_chat_prompt(e, "You are a careful assistant.",
+                               "List the first ten prime numbers and say why 1 is not one of them.",
+                               DS4_THINK_NONE, &p);
+        ok = ds4_session_sync(s, &p, err, sizeof(err)) == 0;
+        printf("tokens:");
+        for (int i = 0; ok && i < 16; i++) {
+            const int t = ds4_session_argmax(s);
+            printf(" %d", t);
+            ok = ds4_session_eval(s, t, err, sizeof(err)) == 0;
+        }
+        printf("\n");
+        if (!ok) fprintf(stderr, "text continuation failed: %s\n", err);
+        ds4_tokens_free(&p);
+        ds4_session_free(s);
+    }
     ds4_vision_embedding_free(&a);
     ds4_vision_embedding_free(&b);
     ds4_engine_close(e);

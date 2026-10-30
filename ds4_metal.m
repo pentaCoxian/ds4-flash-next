@@ -1007,6 +1007,7 @@ typedef struct {
     uint64_t model_size;
     uint64_t model_offset;
     uint64_t bytes;
+    bool evicted;   /* taken out of the model residency set (ds4_gpu_model_range_set_resident) */
 } ds4_gpu_model_view;
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
@@ -2376,6 +2377,7 @@ static int ds4_gpu_add_model_view_range(
         g_model_views[g_model_view_count].model_size = model_size;
         g_model_views[g_model_view_count].model_offset = page_model_offset + off;
         g_model_views[g_model_view_count].bytes = view_bytes;
+        g_model_views[g_model_view_count].evicted = false;
         g_model_view_count++;
 
         g_model_wrap_count++;
@@ -12839,6 +12841,58 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
         }
         return 1;
     }
+}
+
+/* The bytes the GPU keeps resident: the distinct ranges the model views in
+ * the residency set cover, plus every live tensor. */
+uint64_t ds4_gpu_resident_bytes(void) {
+    uint64_t total = g_tensor_alloc_live_bytes;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        const ds4_gpu_model_view *v = &g_model_views[i];
+        if (v->evicted) continue;
+        uint64_t lo = v->model_offset, hi = v->model_offset + v->bytes;
+        /* views of one map overlap: count only what no earlier view covers */
+        for (uint32_t j = 0; j < i && lo < hi; j++) {
+            const ds4_gpu_model_view *u = &g_model_views[j];
+            if (u->evicted || u->model_map != v->model_map) continue;
+            const uint64_t ulo = u->model_offset, uhi = u->model_offset + u->bytes;
+            if (ulo <= lo && uhi > lo) lo = uhi < hi ? uhi : hi;
+            if (ulo < hi && uhi >= hi) hi = ulo > lo ? ulo : lo;
+        }
+        if (hi > lo) total += hi - lo;
+    }
+    return total;
+}
+
+/* Take the views of model_map that lie in [offset, offset + bytes) out of
+ * the model residency set (resident = 0), so the driver may unwire their
+ * pages when other GPU memory needs them, or put them back (1).  Returns
+ * the bytes of the views changed.  Not while a command batch is open. */
+uint64_t ds4_gpu_model_range_set_resident(const void *model_map, uint64_t offset, uint64_t bytes, int resident) {
+    uint64_t changed = 0;
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (!g_model_residency_set || ds4_gpu_commands_active()) return 0;
+        const uint64_t page = (uint64_t)getpagesize();
+        const uint64_t lo = offset & ~(page - 1), hi = round_up_u64(offset + bytes, page);
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            ds4_gpu_model_view *v = &g_model_views[i];
+            if (v->model_map != model_map || v->model_offset < lo || v->model_offset + v->bytes > hi ||
+                v->evicted == !resident) continue;
+            if (resident) [g_model_residency_set addAllocation:v->buffer];
+            else [g_model_residency_set removeAllocation:v->buffer];
+            v->evicted = !resident;
+            changed += v->bytes;
+        }
+        if (changed) {
+            [g_model_residency_set commit];
+            if (resident) [g_model_residency_set requestResidency];
+        }
+    }
+#else
+    (void)model_map; (void)offset; (void)bytes; (void)resident;
+#endif
+    return changed;
 }
 
 /* Views over a model that is used only now and then, the Qwen3.8 vision
@@ -50885,6 +50939,13 @@ static bool qwen4_vis_w(qwen4_bind *b, const void *map, uint64_t size, uint64_t 
 
 static bool qwen4_vis_t(qwen4_bind *b, const ds4_gpu_tensor *t, uint64_t n, const char *what) {
     return qwen4_bind_tensor(b, t, n * sizeof(float), what);
+}
+
+/* The transients ds4_gpu_qwen4_vision_encode allocates for n_patches. */
+uint64_t ds4_gpu_qwen4_vision_scratch_bytes(uint32_t n_patches, const ds4_qwen4_vision_weights *w) {
+    const uint64_t N = n_patches, E = w->n_embd, mm = (uint64_t)w->n_merge * w->n_merge;
+    const uint64_t in_patch = 3ull * w->n_patch * w->n_patch, merged = mm ? N / mm : 0;
+    return (N * (in_patch + 12u * E + w->n_ff) + merged * (E * mm + w->n_out)) * sizeof(float);
 }
 
 int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed, uint32_t n_patches,
