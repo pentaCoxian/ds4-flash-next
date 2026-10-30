@@ -98,8 +98,16 @@ kernel void kernel_qwen4_vis_qkv_rope(
     for (uint i = tid; i < W; i += 256) v[o + i] = src[2 * W + i] + bias[2 * W + i];
 }
 
-/* Bidirectional attention over the image rows, one simdgroup per
- * (row, head); lanes hold dims lane, lane+32 and (head_dim > 64) lane+64. */
+/* Bidirectional attention over the image rows as flash attention.  A
+ * threadgroup takes 32 query rows of one head, eight per simdgroup, and walks
+ * the keys in blocks of 32 staged in threadgroup memory: S = Q K^T and
+ * O += P V run on 8x8 float simdgroup matrices, with an online softmax per
+ * row whose rescaling multiplies O by a diagonal matrix.  head_dim is 64 or
+ * 72, a multiple of the matrix size. */
+#define QWEN4_VIS_FA_ROWS 32
+#define QWEN4_VIS_FA_KEYS 32
+#define QWEN4_VIS_FA_DMAX 72
+
 kernel void kernel_qwen4_vis_attention(
         constant ds4_metal_args_qwen4_vis & args,
         device const float *q,
@@ -107,30 +115,110 @@ kernel void kernel_qwen4_vis_attention(
         device const float *v,
         device float       *out,
         uint2 tg [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]]) {
-    const uint row = tg.x, head = tg.y;
-    if (row >= args.rows) return;
-    const uint D = args.head_dim, W = args.n_head * D;
-    const bool has2 = D > 64 && lane < D - 64;
-    const uint64_t qb = (uint64_t)row * W + head * D;
-    const float q0 = q[qb + lane], q1 = q[qb + lane + 32], q2 = has2 ? q[qb + lane + 64] : 0.0f;
-    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, m = -INFINITY, denom = 0.0f;
-    for (uint key = 0; key < args.rows; key++) {
-        const uint64_t kb = (uint64_t)key * W + head * D;
-        const float k2 = has2 ? k[kb + lane + 64] : 0.0f;
-        const float score = simd_sum(q0 * k[kb + lane] + q1 * k[kb + lane + 32] + q2 * k2) * args.scale;
-        const float nm = max(m, score);
-        const float old = m == -INFINITY ? 0.0f : exp(m - nm);
-        const float p = exp(score - nm);
-        denom = denom * old + p;
-        acc0 = acc0 * old + p * v[kb + lane];
-        acc1 = acc1 * old + p * v[kb + lane + 32];
-        acc2 = acc2 * old + p * (has2 ? v[kb + lane + 64] : 0.0f);
-        m = nm;
+    const uint D = args.head_dim, W = args.n_head * D, N = args.rows;
+    const uint nd = D / 8;
+    const uint row0 = tg.x * QWEN4_VIS_FA_ROWS;
+    const uint64_t hoff = (uint64_t)tg.y * D;
+    threadgroup float Ks[QWEN4_VIS_FA_KEYS * QWEN4_VIS_FA_DMAX];   /* also the Q and O staging */
+    threadgroup float Vs[QWEN4_VIS_FA_KEYS * QWEN4_VIS_FA_DMAX];
+    threadgroup float Ss[4][8 * QWEN4_VIS_FA_KEYS];                /* scores, then probabilities */
+    threadgroup float Dg[4][64];                                   /* diagonal row scale */
+
+    /* this threadgroup's 32 query rows, zero past the last row */
+    for (uint i = tid; i < QWEN4_VIS_FA_ROWS * D; i += 128) {
+        const uint r = i / D, d = i % D;
+        Ks[i] = row0 + r < N ? q[(uint64_t)(row0 + r) * W + hoff + d] : 0.0f;
     }
-    out[qb + lane] = acc0 / denom;
-    out[qb + lane + 32] = acc1 / denom;
-    if (has2) out[qb + lane + 64] = acc2 / denom;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 Q[QWEN4_VIS_FA_DMAX / 8], O[QWEN4_VIS_FA_DMAX / 8];
+    for (uint j = 0; j < nd; j++) {
+        simdgroup_load(Q[j], Ks + (sg * 8) * D + j * 8, D, 0, false);
+        O[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    /* lanes own (row r, keys 8*part .. 8*part+7) of the block */
+    const uint r = lane / 4, part = lane % 4;
+    float m = -INFINITY, l = 0.0f;
+
+    for (uint key0 = 0; key0 < N; key0 += QWEN4_VIS_FA_KEYS) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < QWEN4_VIS_FA_KEYS * D; i += 128) {
+            const uint kr = i / D, d = i % D;
+            const bool live = key0 + kr < N;
+            const uint64_t src = (uint64_t)(key0 + kr) * W + hoff + d;
+            Ks[i] = live ? k[src] : 0.0f;
+            Vs[i] = live ? v[src] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint t = 0; t < QWEN4_VIS_FA_KEYS / 8; t++) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint j = 0; j < nd; j++) {
+                simdgroup_float8x8 kt;
+                simdgroup_load(kt, Ks + (t * 8) * D + j * 8, D, 0, true);
+                simdgroup_multiply_accumulate(s, Q[j], kt, s);
+            }
+            simdgroup_store(s, Ss[sg] + t * 8, QWEN4_VIS_FA_KEYS, 0, false);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float sv[8], mx = -INFINITY;
+        for (uint i = 0; i < 8; i++) {
+            const uint kc = part * 8 + i;
+            sv[i] = key0 + kc < N ? Ss[sg][r * QWEN4_VIS_FA_KEYS + kc] * args.scale : -INFINITY;
+            mx = max(mx, sv[i]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        const float nm = max(m, mx);
+        const float alpha = m == -INFINITY ? 0.0f : exp(m - nm);
+        float ps = 0.0f;
+        for (uint i = 0; i < 8; i++) {
+            const float p = sv[i] == -INFINITY ? 0.0f : exp(sv[i] - nm);
+            Ss[sg][r * QWEN4_VIS_FA_KEYS + part * 8 + i] = p;
+            ps += p;
+        }
+        ps += simd_shuffle_xor(ps, 1);
+        ps += simd_shuffle_xor(ps, 2);
+        l = l * alpha + ps;
+        m = nm;
+        Dg[sg][r * 8 + part * 2] = part * 2 == r ? alpha : 0.0f;
+        Dg[sg][r * 8 + part * 2 + 1] = part * 2 + 1 == r ? alpha : 0.0f;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 dg;
+        simdgroup_load(dg, Dg[sg], 8, 0, false);
+        for (uint j = 0; j < nd; j++) {
+            simdgroup_float8x8 o;
+            simdgroup_multiply(o, dg, O[j]);
+            O[j] = o;
+        }
+        for (uint t = 0; t < QWEN4_VIS_FA_KEYS / 8; t++) {
+            simdgroup_float8x8 p;
+            simdgroup_load(p, Ss[sg] + t * 8, QWEN4_VIS_FA_KEYS, 0, false);
+            for (uint j = 0; j < nd; j++) {
+                simdgroup_float8x8 vt;
+                simdgroup_load(vt, Vs + (t * 8) * D + j * 8, D, 0, false);
+                simdgroup_multiply_accumulate(O[j], p, vt, O[j]);
+            }
+        }
+    }
+
+    /* O / l, staged through Ks (its 32 x D floats hold the four 8-row tiles) */
+    Dg[sg][r * 8 + part * 2] = part * 2 == r ? 1.0f / l : 0.0f;
+    Dg[sg][r * 8 + part * 2 + 1] = part * 2 + 1 == r ? 1.0f / l : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dg;
+    simdgroup_load(dg, Dg[sg], 8, 0, false);
+    for (uint j = 0; j < nd; j++) {
+        simdgroup_float8x8 o;
+        simdgroup_multiply(o, dg, O[j]);
+        simdgroup_store(o, Ks + (sg * 8) * D + j * 8, D, 0, false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < QWEN4_VIS_FA_ROWS * D; i += 128) {
+        const uint orow = i / D, d = i % D;
+        if (row0 + orow < N) out[(uint64_t)(row0 + orow) * W + hoff + d] = Ks[i];
+    }
 }
 
 /* x += add + bias */

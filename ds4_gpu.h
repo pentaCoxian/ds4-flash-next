@@ -3556,6 +3556,11 @@ int ds4_gpu_qwen4_gdn_front_tensor(
 /* Encode one image: patches [n_patches][3*P*P] in 2x2 window order plus the
  * resampled position embedding [n_patches][n_embd]; out receives
  * [n_patches/4][n_out].  Weights are read from the mapped mmproj GGUF. */
+/* Bidirectional attention of the vision tower: q, k, v, out [rows][n_head * head_dim]
+ * f32, head_dim 64 or 72. */
+int ds4_gpu_qwen4_vis_attention_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
+                                       const ds4_gpu_tensor *v, uint32_t rows, uint32_t n_head,
+                                       uint32_t head_dim, float scale);
 int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed, uint32_t n_patches,
                                 uint32_t grid_w, const void *model_map, uint64_t model_size,
                                 const ds4_qwen4_vision_weights *w);

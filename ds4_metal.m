@@ -50835,8 +50835,27 @@ typedef struct { uint32_t rows, width, grid_w, n_head, head_dim, mode; float eps
 
 static int qwen4_vis_rows(int kernel, const qwen4_vis_args *a, qwen4_bind *b, int n_bind, uint32_t rows, uint32_t y) {
     const int ok = qwen4_dispatch(kernel, a, sizeof(*a), b, n_bind, MTLSizeMake(rows, y, 1),
-                                  MTLSizeMake(kernel == QWEN4_K_VIS_ATTENTION ? 32 : 256, 1, 1), 0);
+                                  MTLSizeMake(256, 1, 1), 0);
     if (!ok) fprintf(stderr, "ds4: Qwen3.8 vision kernel %s failed\n", qwen4_kernel_names[kernel]);
+    return ok;
+}
+
+/* q, k, v and out are [rows][n_head * head_dim]; 32 query rows of one head
+ * per threadgroup (metal/qwen4_vision.metal). */
+int ds4_gpu_qwen4_vis_attention_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
+                                       const ds4_gpu_tensor *v, uint32_t rows, uint32_t n_head,
+                                       uint32_t head_dim, float scale) {
+    if (rows == 0 || n_head == 0 || (head_dim != 64u && head_dim != 72u)) return 0;
+    const qwen4_vis_args a = { rows, n_head * head_dim, 0, n_head, head_dim, 0, 0.0f, scale };
+    const uint64_t bytes = (uint64_t)rows * n_head * head_dim * sizeof(float);
+    qwen4_bind b[4];
+    if (!qwen4_bind_tensor(&b[0], q, bytes, "vision q") || !qwen4_bind_tensor(&b[1], k, bytes, "vision k") ||
+        !qwen4_bind_tensor(&b[2], v, bytes, "vision v") || !qwen4_bind_tensor(&b[3], out, bytes, "vision attn")) {
+        return 0;
+    }
+    const int ok = qwen4_dispatch(QWEN4_K_VIS_ATTENTION, &a, sizeof(a), b, 4,
+                                  MTLSizeMake((rows + 31u) / 32u, n_head, 1), MTLSizeMake(128, 1, 1), 0);
+    if (!ok) fprintf(stderr, "ds4: Qwen3.8 vision attention failed\n");
     return ok;
 }
 
@@ -50921,11 +50940,7 @@ int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *p
              qwen4_vis_t(&b[3], k, N * E, "vision k") &&
              qwen4_vis_t(&b[4], v, N * E, "vision v") &&
              qwen4_vis_rows(QWEN4_K_VIS_QKV_ROPE, &a, b, 5, n_patches, 1) &&
-             qwen4_vis_t(&b[0], q, N * E, "vision q") &&
-             qwen4_vis_t(&b[1], k, N * E, "vision k") &&
-             qwen4_vis_t(&b[2], v, N * E, "vision v") &&
-             qwen4_vis_t(&b[3], attn, N * E, "vision attn") &&
-             qwen4_vis_rows(QWEN4_K_VIS_ATTENTION, &a, b, 4, n_patches, H) &&
+             ds4_gpu_qwen4_vis_attention_tensor(attn, q, k, v, n_patches, H, D, a.scale) &&
              ds4_gpu_qwen4_dense_mm_tensor(tmp, attn, map, size, l->out_w, l->out_type, n_patches, E, E) &&
              qwen4_vis_t(&b[0], x, N * E, "vision x") &&
              qwen4_vis_t(&b[1], tmp, N * E, "vision tmp") &&

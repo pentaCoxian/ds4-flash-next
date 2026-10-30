@@ -61,6 +61,7 @@
 /tests/test_metal_ane_prefill
 /tests/test_qwen4_vision
 /tests/test_qwen4_vision_lazy
+/tests/test_qwen4_vis_attention
 /tests/test_deepseek4_vision_image
 /tests/test_image_decode
 /tests/test_deepseek41_metal
