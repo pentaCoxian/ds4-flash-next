@@ -95,3 +95,4 @@ __pycache__/
 /speed-bench/long_context_probe
 /speed-bench/metal_residency_probe
 /dist
+/tests/test_qwen4_prompt_anchor
