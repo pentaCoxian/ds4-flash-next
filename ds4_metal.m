@@ -48627,6 +48627,7 @@ enum {
     QWEN4_K_MOE_MID_IQ3_S,
     QWEN4_K_MOE_MID_IQ4_XS,
     QWEN4_K_MOE_DOWN_IQ4_NL,
+    QWEN4_K_ROUTER_SG,
     QWEN4_K_COUNT,
 };
 
@@ -48760,6 +48761,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mid_iq3_s",
     "kernel_qwen4_moe_mid_iq4_xs",
     "kernel_qwen4_moe_down_iq4_nl",
+    "kernel_qwen4_router_topk_sg",
 };
 
 typedef struct {
@@ -49519,6 +49521,18 @@ int ds4_gpu_qwen4_router_topk_tensor(
         b[3] = b[0];
         b[4] = b[0];
         b[5] = b[2];
+    }
+    /* Decode batches: one simdgroup per token replays the 256-thread
+     * kernel's reductions without its barriers (bit-identical) while a
+     * second one takes the shared gate row; it needs 512 experts and a gate
+     * row the generic dot reads.  Apple9 default, DS4_QWEN4_ROUTER_SG=0/1
+     * overrides on any device. */
+    const int sg_override = ds4_gpu_env_bool("DS4_QWEN4_ROUTER_SG");
+    const bool sg = n_expert == 512u && n_tokens <= 8u && (in_dim == 0 || gate_type != 0u) &&
+        (sg_override >= 0 ? sg_override > 0 : g_metal_apple_family == 9);
+    if (sg) {
+        return qwen4_dispatch(QWEN4_K_ROUTER_SG, &args, sizeof(args), b, 6,
+                              MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(64, 1, 1), 0);
     }
     return qwen4_dispatch(QWEN4_K_ROUTER, &args, sizeof(args), b, 6,
                           MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(256, 1, 1), 0);

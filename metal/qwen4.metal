@@ -1320,6 +1320,86 @@ kernel void kernel_qwen4_router_topk(
     }
 }
 
+/* The same routing in one simdgroup per token, for 512 experts and a
+ * non-F32 shared gate row (the rows the generic dot takes): lane l holds the
+ * sixteen logits that lane l of the eight simdgroups above holds, e =
+ * g*32 + l + 256*k, and replays their reductions in the same order (simd
+ * max and sum per former simdgroup over the same lanes, then the partials
+ * from 0 upward), so the probabilities, the selection and the weights are
+ * bit-identical without the threadgroup barriers.  Ten simd argmax rounds
+ * pick the experts by (probability, lower index).  A second simdgroup
+ * computes the shared gate logit meanwhile. */
+kernel void kernel_qwen4_router_topk_sg(
+        constant ds4_metal_args_qwen4_router & args,
+        device const float *logits,     /* [T][512] */
+        device int32_t     *selected,   /* [T][n_used] */
+        device float       *weights,    /* [T][n_used] */
+        device const float *x,          /* [T][in_dim] */
+        device const char  *w_gate,     /* [in_dim] shared gate row */
+        device float       *shared_gate,/* [T] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr uint NSG = 8, NK = QWEN4_ROUTER_LANE_MAX;
+    const uint tok = tgpig.x;
+    if (tok >= args.n_tokens) return;
+    if (sgitg == 1) {
+        if (args.in_dim) {
+            const float gpart = qwen4_row_dot(w_gate, x + (uint64_t)tok * args.in_dim, args.gate_type, args.in_dim, tiisg);
+            if (tiisg == 0) shared_gate[tok] = 0.0f + gpart;
+        }
+        return;
+    }
+    device const float *lg = logits + (uint64_t)tok * QWEN4_ROUTER_MAX_EXPERT;
+    float v[NSG][NK];
+    float mx = -3.0e38f;
+    for (uint g = 0; g < NSG; g++) {
+        float m = -3.0e38f;
+        for (uint k = 0; k < NK; k++) {
+            v[g][k] = lg[g * 32 + tiisg + 32 * NSG * k];
+            m = max(m, v[g][k]);
+        }
+        mx = max(mx, simd_max(m));
+    }
+    float sum = 0.0f;
+    for (uint g = 0; g < NSG; g++) {
+        float s = 0.0f;
+        for (uint k = 0; k < NK; k++) {
+            v[g][k] = exp(v[g][k] - mx);
+            s += v[g][k];
+        }
+        sum += simd_sum(s);
+    }
+    const float inv = 1.0f / sum;
+    for (uint g = 0; g < NSG; g++) for (uint k = 0; k < NK; k++) v[g][k] *= inv;
+
+    float wsum = 0.0f, mine = 0.0f;
+    for (uint r = 0; r < args.n_used; r++) {
+        float bv = -1.0f;
+        int bi = 0x7fffffff;
+        for (uint k = 0; k < NK; k++) {
+            for (uint g = 0; g < NSG; g++) {
+                const int e = (int)(g * 32 + tiisg + 32 * NSG * k);
+                if (v[g][k] > bv) { bv = v[g][k]; bi = e; }
+            }
+        }
+        for (uint off = 16; off > 0; off >>= 1) {
+            const float ov = simd_shuffle_xor(bv, off);
+            const int oi = simd_shuffle_xor(bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        for (uint k = 0; k < NK; k++) {
+            for (uint g = 0; g < NSG; g++) {
+                if ((int)(g * 32 + tiisg + 32 * NSG * k) == bi) v[g][k] = -1.0f;
+            }
+        }
+        if (tiisg == 0) selected[(uint64_t)tok * args.n_used + r] = bi;
+        if (tiisg == r) mine = bv;
+        wsum += bv;
+    }
+    if (tiisg < args.n_used) weights[(uint64_t)tok * args.n_used + tiisg] = mine / wsum;
+}
+
 /* --- gated GQA attention + QSA indexer ---------------------------------- */
 
 struct ds4_metal_args_qwen4_attn_prep {

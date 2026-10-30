@@ -1173,6 +1173,46 @@ static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
     free(w); free(sel); ds4_gpu_tensor_free(gw); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gl); free(logits);
 }
 
+/* The one-simdgroup router (DS4_QWEN4_ROUTER_SG) replays the 256-thread
+ * kernel's reductions: experts, weights and the shared gate logit must be
+ * bit-identical, with a BF16 gate row and without one, and with logits on
+ * a coarse grid so equal probabilities exercise the lower-index tie rule. */
+static void test_router_sg_exact(arena_t *a, uint32_t T, bool gate, bool ties) {
+    const uint32_t E = 2560, NE = 512, k = 10;
+    double *gate_w = NULL;
+    const uint64_t gate_off = gate ? arena_bf16(a, E, &gate_w, 0.05f) : 0;
+    float *x = rand_vec((uint64_t)T * E, 1.0f);
+    float *logits = rand_vec((uint64_t)T * NE, 3.0f);
+    if (ties) for (uint64_t i = 0; i < (uint64_t)T * NE; i++) logits[i] = roundf(logits[i] * 2.0f) * 0.5f;
+    ds4_gpu_tensor *gl = upload(logits, (uint64_t)T * NE);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    int32_t *sel[2];
+    float *w[2], *sg[2];
+    for (int v = 0; v < 2; v++) {
+        setenv("DS4_QWEN4_ROUTER_SG", v ? "1" : "0", 1);
+        ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * k * 4);
+        ds4_gpu_tensor *gw = upload(NULL, (uint64_t)T * k);
+        ds4_gpu_tensor *gsg = upload(NULL, T);
+        require_ok(ds4_gpu_qwen4_router_topk_tensor(gsel, gw, gl, gate ? gx : NULL, gate ? a->base : NULL,
+                                                     gate ? a->size : 0, gate_off, gate ? 30u : 0u, gate ? E : 0u,
+                                                     gate ? gsg : NULL, T, NE, k), "router");
+        sel[v] = malloc((uint64_t)T * k * 4);
+        require_ok(ds4_gpu_tensor_read(gsel, 0, sel[v], (uint64_t)T * k * 4), "router read");
+        w[v] = download(gw, (uint64_t)T * k);
+        sg[v] = download(gsg, T);
+        ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gw); ds4_gpu_tensor_free(gsg);
+    }
+    unsetenv("DS4_QWEN4_ROUTER_SG");
+    if (memcmp(sel[0], sel[1], (uint64_t)T * k * 4) || memcmp(w[0], w[1], (uint64_t)T * k * 4) ||
+        (gate && memcmp(sg[0], sg[1], (uint64_t)T * 4))) {
+        fprintf(stderr, "router T=%u gate=%d ties=%d: the one-simdgroup kernel differs\n", T, gate, ties);
+        exit(1);
+    }
+    printf("  router one-simdgroup T=%u gate=%d ties=%d          ok  bit-identical\n", T, gate, ties);
+    for (int v = 0; v < 2; v++) { free(sel[v]); free(w[v]); free(sg[v]); }
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gl); free(x); free(logits); free(gate_w);
+}
+
 /* ---- attention + indexer ---- */
 
 static void rope_ref(double *x, uint32_t n_rot, uint32_t pos, double base) {
@@ -3100,6 +3140,11 @@ static int bench_router_topk(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_router_topk_tensor(c->t[16], c->t[18], c->t[17], c->t[0], c->a->base, c->a->size, c->off[2], 0u, 2560, c->t[18], 1, 512, 10);
 }
+/* the ISTA files' BF16 shared gate row (the f32 values read as BF16) */
+static int bench_router_topk_bf16(void *ud) {
+    bench_ctx *c = ud;
+    return ds4_gpu_qwen4_router_topk_tensor(c->t[16], c->t[18], c->t[17], c->t[0], c->a->base, c->a->size, c->off[2], 30u, 2560, c->t[18], 1, 512, 10);
+}
 static int bench_router_topk_nogate(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_router_topk_tensor(c->t[16], c->t[18], c->t[17], NULL, NULL, 0, 0, 0u, 0, NULL, 1, 512, 10);
@@ -3475,6 +3520,7 @@ static void bench_dispatch(arena_t *a) {
     c.n[2] = 1; bench_run("attn sparse T=1024 ctx=256k blocks in last 8k", bench_p_attn_sparse, &c, 5);
     bench_run("router gemv f32 512x2560", bench_router_gemv, &c, 100);
     bench_run("router_topk (+gate logit)", bench_router_topk, &c, 100);
+    bench_run("router_topk bf16 gate", bench_router_topk_bf16, &c, 100);
     bench_run("router_topk no gate", bench_router_topk_nogate, &c, 100);
     bench_run("router_topk no gate k=1", bench_router_topk_k1, &c, 100);
     bench_run("moe_mid q8 10+1 slots (37 MB)", bench_moe_mid, &c, 100);
@@ -3807,6 +3853,11 @@ int main(void) {
     test_ple(&arena, 64, 12);
     printf("router\n");
     test_router(&arena, 512, 10, 3);
+    for (uint32_t T = 1; T <= 7; T += 2) {
+        test_router_sg_exact(&arena, T, true, false);
+        test_router_sg_exact(&arena, T, true, true);
+        test_router_sg_exact(&arena, T, false, true);
+    }
     test_router(&arena, 32, 10, 5);
     printf("attention\n");
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
