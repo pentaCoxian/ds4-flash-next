@@ -20184,8 +20184,23 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             const uint32_t nt = n_tok == 1u || (n_tok > nt_max && !bf16_grid) ? 1u
                               : bf16_grid && n_tok > 3u ? 4u
                               : n_tok == 2u || n_tok == 4u ? 2u : 3u;
+            /* On Apple9 the generic-dequant IQ kernels (ds4q_mul_mv_grid)
+             * take one row per simdgroup at three tokens ("_nt3_r1"): with
+             * two rows' codebook decodes and three tokens' inputs, the
+             * IQ3_XXS file's IQ3_S matrices took 1.9-2.4 ms per 3-row
+             * verify on an M3 Max, with one row 1.45 (two tokens 0.95, one
+             * 0.86).  Each row's sums are those of the two-row kernel.
+             * DS4_METAL_NO_IQ_NT3_R1=1 keeps two rows. */
+            static int no_r1 = -1;
+            if (no_r1 < 0) no_r1 = getenv("DS4_METAL_NO_IQ_NT3_R1") != NULL;
+            const bool one_row3 = nt == 3u && g_metal_apple_family == 9 && !no_r1 &&
+                (kind->type == DS4_METAL_TENSOR_IQ2_XS || kind->type == DS4_METAL_TENSOR_IQ2_S ||
+                 kind->type == DS4_METAL_TENSOR_IQ3_XXS || kind->type == DS4_METAL_TENSOR_IQ3_S);
+            char r1_name[96];
+            if (one_row3) snprintf(r1_name, sizeof(r1_name), "%s_nt3_r1", kind->mv);
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_ext_pipeline(ds4_gpu_quant_mv_name(kind, nt), (int16_t)kind->nsg, 8);
+                ds4_gpu_get_mul_mv_ext_pipeline(one_row3 ? r1_name : ds4_gpu_quant_mv_name(kind, nt),
+                                                (int16_t)kind->nsg, 8);
             if (!pipeline) return 0;
             ds4_gpu_q8_0_matvec_args args = {
                 .ne00 = (int32_t)in_dim,
@@ -20209,7 +20224,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 .r3 = 1,
             };
             /* three or four tokens' inputs leave room for half of Q2_0's eight rows */
-            const uint32_t nr0 = nt > 2u && kind->nr0 > 4u ? kind->nr0 / 2u : kind->nr0;
+            const uint32_t nr0 = one_row3 ? 1u : nt > 2u && kind->nr0 > 4u ? kind->nr0 / 2u : kind->nr0;
             args.nr0 = (int32_t)nr0;
             const uint64_t rows_ptg = (uint64_t)nr0 * (kind->ksplit ? 1u : kind->nsg);
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);

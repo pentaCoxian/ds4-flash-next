@@ -1524,7 +1524,8 @@ DS4Q_MV(iq4_xs, ds4q_mul_mv_iq4_xs, 2, 2)
 #define DS4Q_MV_GRID(name, block_t, deq) \
 template [[host_name(DS4Q_STR(kernel_mul_mv_##name##_dense_f32))]]     kernel ds4q_mul_mv_t ds4q_mul_mv_grid<2, 1, block_t, deq>; \
 template [[host_name(DS4Q_STR(kernel_mul_mv_##name##_dense_f32_nt2))]] kernel ds4q_mul_mv_t ds4q_mul_mv_grid<2, 2, block_t, deq>; \
-template [[host_name(DS4Q_STR(kernel_mul_mv_##name##_dense_f32_nt3))]] kernel ds4q_mul_mv_t ds4q_mul_mv_grid<2, 3, block_t, deq>;
+template [[host_name(DS4Q_STR(kernel_mul_mv_##name##_dense_f32_nt3))]] kernel ds4q_mul_mv_t ds4q_mul_mv_grid<2, 3, block_t, deq>; \
+template [[host_name(DS4Q_STR(kernel_mul_mv_##name##_dense_f32_nt3_r1))]] kernel ds4q_mul_mv_t ds4q_mul_mv_grid<1, 3, block_t, deq>;
 DS4Q_MV_GRID(iq2_xs,  block_iq2_xs,  ds4q_dequantize_iq2_xs)
 DS4Q_MV_GRID(iq2_s,   block_iq2_s,   ds4q_dequantize_iq2_s)
 DS4Q_MV_GRID(iq3_xxs, block_iq3_xxs, ds4q_dequantize_iq3_xxs)

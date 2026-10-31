@@ -201,6 +201,7 @@ it rather than the chip name:
 |---|---|---|
 | MTP verifies the Q3_K/Q4_K/Q5_K/Q6_K weights with the one-token matvec over a grid of tokens: their two- and three-token kernels, which make MTP pay on the M1, run at a third to a half of the one-token speed here | MTP decode +7 to 11% on IQ3_XXS and Q2_0, outputs unchanged | `DS4_METAL_MIXED_MV_NT_MAX=8` |
 | The router's softmax and top-10 in one simdgroup per token, bit-identical | 0.3 ms per token | `DS4_QWEN4_ROUTER_SG=0` |
+| The IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S matvecs of a 3-row verify with one row per simdgroup instead of two | IQ3_S 1.8-2.4 -> 1.45 ms per 3-row verify, outputs unchanged | `DS4_METAL_NO_IQ_NT3_R1=1` |
 | The hyper-connection norm and its BF16 low-rank down projection in one dispatch, and on the FFN side the residual combine too (the gate mix copies the combined streams back), for decode and verify batches of 1 to 3 rows; the residual and xn keep their bits, the low-rank sums round differently in the last bit but the same in every batch | 1.2 ms of GPU time per token, 97 dispatches fewer, outputs unchanged | `DS4_QWEN4_HC_NORM_DOWN=0` |
 | The M5's 1024-thread GDN front and the MXFP4 expert rows of the MTP block (M3 Ultra and M5 settings) | 0.2 ms per MTP cycle | `DS4_QWEN4_GDN_FRONT_THREADS=256`, `DS4_QWEN4_MOE_MV_SPECIALIZE=0` |
 
