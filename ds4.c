@@ -58958,6 +58958,18 @@ static uint32_t qwen4_mtp_draft_rows(void) {
     const long long v = env && env[0] ? strtoll(env, NULL, 10) : 0;
     return v > 0 && v < (long long)DS4_N_VOCAB ? (uint32_t)v : DS4_N_VOCAB;
 }
+/* The chained second draft scores the first 98304 rows of the head, the
+ * frequent tokens: its chain then costs 0.044 of a 2-row cycle instead of
+ * 0.062 on the M3 Max, and its lower acceptance where the next token lies
+ * past the prefix is learned by the depth policy like any other.  The first
+ * draft and the verify rows keep the whole head.
+ * DS4_QWEN4_MTP_CHAIN_ROWS=N sets the prefix (the vocabulary size: all). */
+static uint32_t qwen4_mtp_chain_rows(void) {
+    const char *env = getenv("DS4_QWEN4_MTP_CHAIN_ROWS");
+    const long long v = env && env[0] ? strtoll(env, NULL, 10) : 98304;
+    return v > 0 && v < (long long)DS4_N_VOCAB ? (uint32_t)v : DS4_N_VOCAB;
+}
+
 /* top-k blocks per query: radix select (DS4_QWEN4_NO_IDX_SELECT=1 restores the argsort path) */
 static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, const ds4_gpu_tensor *tile_max,
                             uint32_t n_blocks, uint32_t n_tokens, uint32_t top_k) {
@@ -60793,7 +60805,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     /* the chained draft only needs its argmax; DS4_QWEN4_MTP_DRAFT_ROWS can
      * score the frequent-token prefix exactly like the first draft's head */
     const bool mapped = g_qwen_mtp_draft_ids != NULL;
-    const uint32_t chain_head_rows = mapped ? (uint32_t)g_qwen_mtp_draft_head.dim[1] : qwen4_mtp_draft_rows();
+    const uint32_t chain_head_rows = mapped ? (uint32_t)g_qwen_mtp_draft_head.dim[1] : qwen4_mtp_chain_rows();
     if (ok) {
         last = ds4_gpu_tensor_view(g->mtp_R, 0, hc * emb_bytes);
         g->R = last;
@@ -61879,6 +61891,12 @@ struct ds4_session {
     bool glm_mtp_have2;
     float qwen4_draft_p, qwen4_draft2_p;   /* the predictor's probabilities of the pending drafts */
     double qwen4_cycle_cost[4];   /* moving average wall time of 1-, 2- and 3-row cycles, 0 unmeasured */
+    double qwen4_chain_cost;      /* moving average wall time of a chained second draft, 0 unmeasured */
+    double qwen4_chain_dt;        /* chained-draft time inside the cycle that is running */
+    double qwen4_rate_tok, qwen4_rate_time;   /* moving averages of a cycle's tokens and seconds */
+    double qwen4_ratio3, qwen4_ratio_chain;   /* 3-row cycles and chained drafts over the 2-row cost of their time, 0 unmeasured */
+    float qwen4_p2_seen[5], qwen4_p2_hit[5];   /* chained drafts verified after an accepted first one, per p2 fifth, and accepted */
+    float qwen4_c2_seen[3], qwen4_c2_hit[3];   /* the same per band of the first draft's p1 (qwen4_spec_p1_band) */
     int qwen4_cycle_depth;        /* rows of the cycle that just ran */
     uint64_t qwen4_cycle_count, qwen4_cycle_last[4];   /* cycles run, and when each depth last ran */
     int glm_mtp_parent;
@@ -75911,12 +75929,79 @@ static int qwen4_spec_depth_forced(void) {
 /* Cycle costs; an unmeasured depth is estimated from a measured one by the
  * M3 Max ratios at 8K (a plain step with its draft 0.92, three rows 1.45 of
  * a 2-row cycle). */
+/* The cycle costs exclude the chained second draft a cycle may end with
+ * (qwen4_chain_cost): a 3-row cycle on the M3 Max is 1.37 times a 2-row
+ * one without it. */
 static void qwen4_spec_costs(const ds4_session *s, double *c1, double *c2, double *c3) {
     const double *c = s->qwen4_cycle_cost;
-    double two = c[2] > 0.0 ? c[2] : c[1] > 0.0 ? c[1] / 0.92 : c[3] > 0.0 ? c[3] / 1.45 : 1.0;
+    double two = c[2] > 0.0 ? c[2] : c[1] > 0.0 ? c[1] / 0.92 : c[3] > 0.0 ? c[3] / 1.37 : 1.0;
     *c1 = c[1] > 0.0 ? c[1] : two * 0.92;
     *c2 = two;
-    *c3 = c[3] > 0.0 ? c[3] : two * 1.45;
+    *c3 = c[3] > 0.0 ? c[3] : two * 1.37;
+}
+
+/* committed tokens per second of the session's recent cycles */
+static double qwen4_spec_rate(const ds4_session *s, double c2) {
+    return s->qwen4_rate_time > 0.0 ? s->qwen4_rate_tok / s->qwen4_rate_time : 1.85 / c2;
+}
+
+/* The chained draft's probability is not calibrated the way the first
+ * draft's is: over agent, Japanese and edit prompts at 8K a chained draft of
+ * p2 0.35 was accepted 13% of the time, 0.55 43%, 0.75 47%, 0.85 74% and
+ * 0.99 96% (after an accepted first draft), about p2^1.5.  Each session
+ * counts its own outcomes per fifth of p2, with eight p2^1.5 outcomes as the
+ * prior. */
+static double qwen4_spec_p2(const ds4_session *s, double p2) {
+    if (p2 <= 0.0) return 0.0;
+    const int b = p2 >= 1.0 ? 4 : (int)(p2 * 5.0);
+    const double prior = pow(p2, 1.5);
+    return (s->qwen4_p2_hit[b] + 8.0 * prior) / (s->qwen4_p2_seen[b] + 8.0);
+}
+
+/* Before chaining only p1 is known.  A chained draft after an accepted
+ * first one was accepted 65-78% of the time below p1 = 0.97 and 86% above
+ * it (agent, Japanese and edit prompts at 8K; on a copy-heavy edit nearly
+ * always), so each session learns it per band of p1, from four prior
+ * outcomes, with an optimism of 0.2 / sqrt(1 + n) so a band with few
+ * outcomes still gets chained where that is cheap. */
+static int qwen4_spec_p1_band(double p1) {
+    return p1 < 0.9 ? 0 : p1 < 0.97 ? 1 : 2;
+}
+
+static double qwen4_spec_p2_given_p1(const ds4_session *s, double p1) {
+    static const double prior[3] = { 0.68, 0.70, 0.86 };
+    const int b = qwen4_spec_p1_band(p1);
+    const double n = s->qwen4_c2_seen[b];
+    const double est = (s->qwen4_c2_hit[b] + 4.0 * prior[b]) / (n + 4.0);
+    const double v = est + 0.2 / sqrt(1.0 + n);
+    return v < 1.0 ? v : 1.0;
+}
+
+/* Decisions near break-even are worth nothing on average and cost when the
+ * estimates are off, so the wider cycle must clear the bar by 10%. */
+#define QWEN4_SPEC_MARGIN 1.1
+
+/* A 3-row cycle's extra time and a chained draft's time in 2-row cycles,
+ * each measured against the 2-row cost of its moment: the laptop's speed
+ * drifts by tens of percent within minutes, but both depths drift alike
+ * (1.37 and 0.044 on the M3 Max at 8K, run after run). */
+static double qwen4_spec_extra3(const ds4_session *s) {
+    return (s->qwen4_ratio3 > 0.0 ? s->qwen4_ratio3 : 1.37) - 1.0;
+}
+
+static double qwen4_spec_chain_ratio(const ds4_session *s) {
+    return s->qwen4_ratio_chain > 0.0 ? s->qwen4_ratio_chain : 0.044;
+}
+
+/* DS4_QWEN4_SPEC_POLICY=ratio keeps the earlier rules, which priced the
+ * chained draft into the 3-row cycle after it had already run */
+static bool qwen4_spec_policy_ratio(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_QWEN4_SPEC_POLICY");
+        v = e && !strcmp(e, "ratio");
+    }
+    return v != 0;
 }
 
 static int qwen4_spec_depth_window(ds4_session *s) {
@@ -75950,15 +76035,26 @@ static int qwen4_spec_depth(ds4_session *s) {
     /* every 32 cycles a candidate depth that has not run for 32 runs once,
      * so its cost stays measured rather than inferred */
     const uint64_t n = s->qwen4_cycle_count;
-    if (three && n - s->qwen4_cycle_last[3] >= 32u) return 3;
-    if (n - s->qwen4_cycle_last[2] >= 32u) return 2;
+    const uint64_t every = qwen4_spec_policy_ratio() ? 32u : 128u;
+    if (three && n - s->qwen4_cycle_last[3] >= every) return 3;
+    if (n - s->qwen4_cycle_last[2] >= every) return 2;
     /* A plain step pays for its own next draft, so on an M3 Max it beat a
      * 2-row cycle only below p1 = 0.09, and choosing it on noisy costs lost
      * more than it gained: the default never decodes plainly.  Three rows
      * must beat two by 5%, a margin for the cost estimates. */
     (void)c1;
-    const double two = (1.0 + p1) / c2;
-    return three && (1.0 + p1 + p1 * (double)s->qwen4_draft2_p) / c3 > 1.05 * two ? 3 : 2;
+    if (qwen4_spec_policy_ratio()) {
+        const double two = (1.0 + p1) / c2;
+        return three && (1.0 + p1 + p1 * (double)s->qwen4_draft2_p) / c3 > 1.05 * two ? 3 : 2;
+    }
+    /* Maximize committed tokens per second: an action pays when its
+     * expected tokens exceed what its time commits at the session's rate.
+     * The chained draft is already paid for here, so the third row pays
+     * when its expected token, p1 * p2, beats the rate times the extra
+     * verify time. */
+    (void)c3;
+    return three && p1 * qwen4_spec_p2(s, s->qwen4_draft2_p) >
+                    QWEN4_SPEC_MARGIN * qwen4_spec_rate(s, c2) * c2 * qwen4_spec_extra3(s) ? 3 : 2;
 }
 
 /* Chain a second draft after a first one of probability p1 (just drafted)?
@@ -75969,8 +76065,28 @@ static bool qwen4_spec_chain(ds4_session *s, int depth) {
     if (forced != 0 || s->qwen4_draft_p < 0.0f) return forced > 0 ? forced == 3 : depth == 3;
     double c1, c2, c3;
     qwen4_spec_costs(s, &c1, &c2, &c3);
-    const double r = c3 / c2;
-    return r < 2.0 && s->qwen4_draft_p > (r - 1.0) / (2.0 - r);
+    if (qwen4_spec_policy_ratio()) {
+        const double r = (c3 + (s->qwen4_chain_cost > 0.0 ? s->qwen4_chain_cost : 0.07 * c2)) / c2;
+        return r < 2.0 && s->qwen4_draft_p > (r - 1.0) / (2.0 - r);
+    }
+    /* the next 3-row cycle runs at least every 128 cycles, so chain for it */
+    if (s->qwen4_cycle_count - s->qwen4_cycle_last[3] >= 127u) return true;
+    /* Chain when the third row's expected token, taking the chained drafts'
+     * acceptance at this p1, beats what the chain and the extra verify time
+     * would commit at the session's rate (an unpromising p2 then still
+     * stops at 2 rows). */
+    (void)c3;
+    return (double)s->qwen4_draft_p * qwen4_spec_p2_given_p1(s, s->qwen4_draft_p) >
+           QWEN4_SPEC_MARGIN * qwen4_spec_rate(s, c2) * c2 * (qwen4_spec_extra3(s) + qwen4_spec_chain_ratio(s));
+}
+
+/* the chained second draft, timed apart from the cycle it ends */
+static bool qwen4_session_chain_step(ds4_session *s, const ds4_model *m, const ds4_weights *w,
+                                     int draft, uint32_t idx, int *draft2) {
+    const double t0 = now_sec();
+    const bool ok = qwen4_graph_mtp_chain_step(&s->qwen4_graph, m, w, draft, idx, draft2);
+    s->qwen4_chain_dt += now_sec() - t0;
+    return ok;
 }
 
 static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
@@ -75995,16 +76111,31 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
                                         float top_p, float min_p, uint64_t *rng, bool exact_sampling,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+    s->qwen4_chain_dt = 0.0;
     const double t0 = now_sec();
     const int rc = ds4_session_qwen4_spec_cycle_once(s, first_token, temperature, top_k, top_p, min_p, rng,
                                                     exact_sampling, accepted, accepted_cap, err, errlen);
     const int d = s->qwen4_cycle_depth;
     if (rc > 0 && d >= 1 && d <= 3) {
-        const double dt = now_sec() - t0;
+        const double all = now_sec() - t0, chain = s->qwen4_chain_dt, dt = all - chain;
+        const double two = s->qwen4_cycle_cost[2];
+        if (two > 0.0 && d == 3) {
+            s->qwen4_ratio3 = s->qwen4_ratio3 > 0.0 ? 0.9 * s->qwen4_ratio3 + 0.1 * dt / two : dt / two;
+        }
+        if (two > 0.0 && chain > 0.0) {
+            const double r = chain / two;
+            s->qwen4_ratio_chain = s->qwen4_ratio_chain > 0.0 ? 0.9 * s->qwen4_ratio_chain + 0.1 * r : r;
+        }
         double *c = &s->qwen4_cycle_cost[d];
         *c = *c > 0.0 ? 0.9 * *c + 0.1 * dt : dt;
+        if (chain > 0.0) {
+            s->qwen4_chain_cost = s->qwen4_chain_cost > 0.0 ? 0.9 * s->qwen4_chain_cost + 0.1 * chain : chain;
+        }
+        s->qwen4_rate_tok = s->qwen4_rate_time > 0.0 ? 0.97 * s->qwen4_rate_tok + 0.03 * rc : rc;
+        s->qwen4_rate_time = s->qwen4_rate_time > 0.0 ? 0.97 * s->qwen4_rate_time + 0.03 * all : all;
         s->qwen4_cycle_last[d] = ++s->qwen4_cycle_count;
-        if (qwen4_spec_trace()) fprintf(stderr, "ds4: spec cycle depth %d %.2f ms tokens %d costs %.2f %.2f %.2f\n", d, 1e3 * dt, rc,
+        if (qwen4_spec_trace()) fprintf(stderr, "ds4: spec cycle depth %d %.2f ms chain %.2f ms tokens %d costs %.2f %.2f %.2f\n", d,
+                                        1e3 * dt, 1e3 * chain, rc,
                                         1e3 * s->qwen4_cycle_cost[1], 1e3 * s->qwen4_cycle_cost[2], 1e3 * s->qwen4_cycle_cost[3]);
     }
     return rc;
@@ -76054,7 +76185,7 @@ static int ds4_session_qwen4_spec_cycle_once(ds4_session *s, int first_token, fl
             s->glm_mtp_have = 1;
             if (!pinned && qwen4_spec_chain(s, depth) && pos + 2u <= g->ctx_cap) {
                 int draft2 = -1;
-                if (qwen4_graph_mtp_chain_step(&s->qwen4_graph, m, w, draft, pos + 1u, &draft2)) {
+                if (qwen4_session_chain_step(s, m, w, draft, pos + 1u, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
                     s->qwen4_draft2_p = g->mtp_draft_p;
                     s->glm_mtp_have2 = true;
@@ -76140,6 +76271,17 @@ static int ds4_session_qwen4_spec_cycle_once(ds4_session *s, int first_token, fl
     if (deep) {
         if (accept2) s->qwen4_reject2_streak = 0u;
         else if (accept) s->qwen4_reject2_streak++;
+        if (accept && s->qwen4_draft2_p > 0.0f) {
+            /* recent outcomes weigh most: the counts decay by 2% a cycle */
+            const int b = s->qwen4_draft2_p >= 1.0f ? 4 : (int)(s->qwen4_draft2_p * 5.0f);
+            for (int i = 0; i < 5; i++) { s->qwen4_p2_seen[i] *= 0.98f; s->qwen4_p2_hit[i] *= 0.98f; }
+            s->qwen4_p2_seen[b] += 1.0f;
+            if (accept2) s->qwen4_p2_hit[b] += 1.0f;
+            const int c = qwen4_spec_p1_band(s->qwen4_draft_p);
+            for (int i = 0; i < 3; i++) { s->qwen4_c2_seen[i] *= 0.98f; s->qwen4_c2_hit[i] *= 0.98f; }
+            s->qwen4_c2_seen[c] += 1.0f;
+            if (accept2) s->qwen4_c2_hit[c] += 1.0f;
+        }
     }
     if (qwen4_spec_trace()) {
         fprintf(stderr, "ds4: spec pos %u token %d draft %d p %.4f %s%s p2 %.4f\n", pos, first_token, d,
@@ -76173,7 +76315,7 @@ static int ds4_session_qwen4_spec_cycle_once(ds4_session *s, int first_token, fl
             s->glm_mtp_have = 1;
             if (!pinned && qwen4_spec_chain(s, depth) && g->pos + 1u < g->ctx_cap) {
                 int draft2 = -1;
-                if (qwen4_graph_mtp_chain_step(g, m, w, draft, g->pos, &draft2)) {
+                if (qwen4_session_chain_step(s, m, w, draft, g->pos, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
                     s->qwen4_draft2_p = g->mtp_draft_p;
                     s->glm_mtp_have2 = true;
@@ -76206,7 +76348,7 @@ static int ds4_session_qwen4_spec_cycle_once(ds4_session *s, int first_token, fl
             s->glm_mtp_have = 1;
             if (!pinned && qwen4_spec_chain(s, depth) && g->pos + 1u < g->ctx_cap) {
                 int draft2 = -1;
-                if (qwen4_graph_mtp_chain_step(g, m, w, draft, g->pos, &draft2)) {
+                if (qwen4_session_chain_step(s, m, w, draft, g->pos, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
                     s->qwen4_draft2_p = g->mtp_draft_p;
                     s->glm_mtp_have2 = true;
@@ -76247,7 +76389,7 @@ static int ds4_session_qwen4_spec_cycle_once(ds4_session *s, int first_token, fl
             s->glm_mtp_have = 1;
             if (!pinned && qwen4_spec_chain(s, depth) && pos + 2u <= g->ctx_cap) {
                 int draft2 = -1;
-                if (qwen4_graph_mtp_chain_step(g, m, w, draft, pos + 1u, &draft2)) {
+                if (qwen4_session_chain_step(s, m, w, draft, pos + 1u, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
                     s->qwen4_draft2_p = g->mtp_draft_p;
                     s->glm_mtp_have2 = true;

@@ -72,17 +72,36 @@ distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for Metal and CUDA.
 
 The cycle drafts one token ahead and can verify a **second, chained draft**
 (one extra nextn-layer step conditioned on the predictor's own stream) in a
-3-row pass. The depth is chosen per cycle: each draft comes with the
-predictor's probability of it, which is calibrated (a draft of probability p
-is accepted about p of the time), so a 2-row cycle is worth 1 + p1 tokens and
-a 3-row one 1 + p1 + p1*p2. The session measures what each depth costs and
-takes three rows when they beat two by 5% in tokens per second; a second
-draft is chained only when p1 makes that possible. On an M3 Max a 3-row
-cycle costs about 1.43 times a 2-row one, so three rows pay only on very
-confident stretches. `DS4_QWEN4_MTP_DEPTH=1`, `=2` or `=3` fixes the depth
-(1 decodes without verifying drafts), `=window` keeps the earlier policy
-(three rows after eight accepted first drafts in a row), and
-`DS4_QWEN4_SPEC_TRACE=1` prints every cycle's probabilities and cost.
+3-row pass. The depth is chosen per cycle to maximize committed tokens per
+second: an action pays when its expected tokens beat what its time would
+commit at the session's recent rate. Each draft comes with the predictor's
+probability of it. The first draft's is calibrated (a draft of probability p
+is accepted about p of the time); the chained draft's is overconfident (about
+p2^1.5 after an accepted first draft), so each session calibrates it from its
+own outcomes.
+
+- The session measures a 3-row cycle and a chained draft against the 2-row
+  cost of the same moment (1.37 and 0.044 of a 2-row cycle on an M3 Max at
+  8K): the ratios hold while the absolute times drift.
+- After the first draft, a second is chained when p1 times the chained
+  drafts' acceptance at that p1 beats the rate times the extra verify time
+  plus the chain, by 10%.
+- Once chained, the cycle verifies three rows when p1 times the calibrated
+  p2 beats the rate times the extra verify time, by 10% (the chain is paid
+  for by then).
+- The chained draft scores the head's first 98304 rows, the frequent tokens
+  (`DS4_QWEN4_MTP_CHAIN_ROWS=N` changes it); the first draft and the verify
+  rows use the whole head.
+
+Greedy output is the same under every policy, so policies compare exactly by
+their cycle mix priced at those costs. Against depth 2 on an M3 Max at 8K:
+a copy-heavy edit +6.2%, a coding agent turn +0.5%, Japanese prose -0.1%
+(depth 3 throughout: +6.3%, -5.7%, -10.3%).
+`DS4_QWEN4_MTP_DEPTH=1`, `=2` or `=3` fixes the depth (1 decodes without
+verifying drafts), `=window` keeps the window policy (three rows after eight
+accepted first drafts in a row), `DS4_QWEN4_SPEC_POLICY=ratio` the previous
+probability rule, and `DS4_QWEN4_SPEC_TRACE=1` prints every cycle's
+probabilities and cost.
 
 ## Sampling and reproducibility
 
