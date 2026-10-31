@@ -95,5 +95,6 @@ __pycache__/
 /speed-bench/long_context_probe
 /speed-bench/metal_residency_probe
 /speed-bench/qwen4_mv_bench
+/speed-bench/ssd_expert_read_bench
 /dist
 /tests/test_qwen4_prompt_anchor
