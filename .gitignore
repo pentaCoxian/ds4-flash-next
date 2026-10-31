@@ -97,3 +97,4 @@ __pycache__/
 /speed-bench/qwen4_mv_bench
 /dist
 /tests/test_qwen4_prompt_anchor
+/tests/test_prompt_prefix
