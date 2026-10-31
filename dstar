@@ -169,9 +169,12 @@ fetch() {
 }
 
 other_models() {
-    [ -f "$HERE/download_model.sh" ] || die "download_model.sh is missing next to this script"
+    # next to this script in a release package, in scripts/ in the repository
+    local dl=download_model.sh
+    [ -f "$HERE/$dl" ] || dl=scripts/download_model.sh
+    [ -f "$HERE/$dl" ] || die "download_model.sh is missing next to this script"
     cd "$HERE"   # downloads land in ./gguf
-    exec sh ./download_model.sh "$@"
+    exec sh "./$dl" "$@"
 }
 
 # iq3m: from DSTAR_MIX_REPO when it is set, else spliced here from the iq3 and

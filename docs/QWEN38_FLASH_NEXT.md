@@ -10,7 +10,7 @@ hyper-connections, n-gram embeddings, MoE, and MTP.
 
 ```sh
 make
-./download_model.sh qwen38-q2
+./scripts/download_model.sh qwen38-q2
 ./ds4 --ctx 8192 --prefill-chunk 1024
 ```
 
@@ -98,7 +98,7 @@ Expanding an old quantized table to BF16 does not restore its lost precision.
 ## Vision
 
 Images go through the model's Qwen3-VL vision tower. Download the encoder
-with `./download_model.sh qwen38-vision`, then use
+with `./scripts/download_model.sh qwen38-vision`, then use
 `--vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf`. The CLI accepts
 `/read image.png`; the server accepts `image_url` parts. Each image is resized to
 multiples of 32 pixels within 64 to 1024 tokens (`DS4_QWEN4_IMAGE_MAX_TOKENS`

@@ -25,15 +25,15 @@ Examples:
 
 ```sh
 # Flash Q2 on a smaller Mac.
-./download_model.sh ds4f-q2
+./scripts/download_model.sh ds4f-q2
 ./ds4 --ssd-streaming --ctx 32768 --nothink
 
 # GLM 5.3 Flash Q4 on a 128 GB Mac.
-./download_model.sh glm53-q4
+./scripts/download_model.sh glm53-q4
 ./ds4 --ssd-streaming --ctx 4096
 
 # PRO Q2 on a 128 GB Mac: usable for inspection, but slow.
-./download_model.sh pro-q2-imatrix
+./scripts/download_model.sh pro-q2-imatrix
 ./ds4 --ssd-streaming --ctx 32768 --nothink
 ```
 
@@ -71,7 +71,7 @@ a remedy for insufficient RAM.
 
 Leave expert preloading enabled for normal use. `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` are mainly useful for controlled measurements.
-See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEASES.md).
+See [benchmarking](PERFORMANCE.md) and the [release QA guide](QA_BEFORE_RELEASES.md).
 
 ## M5 Max measurements
 

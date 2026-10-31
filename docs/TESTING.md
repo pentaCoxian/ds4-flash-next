@@ -3,7 +3,7 @@
 [README](../README.md)
 
 Read [CONTRIBUTING.md](../CONTRIBUTING.md) before proposing an inference change.
-The [release QA guide](../QA_BEFORE_RELEASES.md) defines the hardware matrix,
+The [release QA guide](QA_BEFORE_RELEASES.md) defines the hardware matrix,
 checkpoint-matched quality tests, long-context agent tasks, and speed checks.
 It also records which checks were not completed. A smoke test is not full QA.
 
@@ -56,7 +56,7 @@ contain real conversations.
   [calibration corpus](../gguf-tools/imatrix/dataset/README.md)
 - [Steering vectors](../dir-steering/README.md)
 - [Benchmark scripts and charts](../speed-bench/README.md)
-- [Evaluation data and licenses](../EVAL_DATA.md)
+- [Evaluation data and licenses](EVAL_DATA.md)
 - [Session payload implementation](../ds4.c) and
   [cache header definitions](../ds4_kvstore.h)
 - [Pipeline protocol](../ds4_distributed.c) and [TP protocol](../ds4_tp.c)

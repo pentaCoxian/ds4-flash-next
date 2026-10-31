@@ -28,7 +28,7 @@ GPUs. `--gpu-vram auto` uses reported free VRAM, reserving space for the graph
 and context. Explicit budgets are comma-separated GiB values, one per device.
 
 ```sh
-./download_model.sh ds4f-q2
+./scripts/download_model.sh ds4f-q2
 ./ds4 --cuda --gpu-devices 0,1,2,3 --gpu-vram auto --ctx 32768
 ```
 
@@ -57,7 +57,7 @@ are replicated within the pair; the output head is vocabulary-sharded.
 For the tested eight-L40S setup:
 
 ```sh
-./download_model.sh ds4f-q4
+./scripts/download_model.sh ds4f-q4
 ./ds4-agent --cuda --cuda-tensor-parallel \
   --gpu-devices 0,2,4,6,1,3,5,7 --gpu-vram auto --ctx 100000
 ```
@@ -78,13 +78,13 @@ device count alone does not guarantee memory fit.
 The supported eight-L40S Flash configuration has reached roughly 126 aggregate
 generation tokens/s with 16 decode rows. This is total throughput, not the
 speed of one user. The recorded conditions and regression requirements are in
-[the QA guide](../QA_BEFORE_RELEASES.md).
+[the QA guide](QA_BEFORE_RELEASES.md).
 
 CUDA TP defaults to 2048-token prefill chunks. Keep that default for the
 16-session, 100k-context setup; larger chunks need more scratch memory.
 Reduce session count or context if all KV states do not fit.
 
-The repository's [server launcher](../run-nvidia-tp-server.sh) is an example
+The repository's [server launcher](../scripts/run-nvidia-tp-server.sh) is an example
 from the L40S deployment, not a portable default: it uses host-specific model
 and cache paths and defaults to MXFP4. The commands above need no launcher or
 environment tuning. See [serving](SERVER.md) for disk caches and API access.

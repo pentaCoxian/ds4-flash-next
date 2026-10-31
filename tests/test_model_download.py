@@ -41,7 +41,7 @@ class DownloadTests(unittest.TestCase):
         self.bin.mkdir()
         self.out = self.root / "gguf files"
         self.script = self.root / "download_model.sh"
-        text = (ROOT / "download_model.sh").read_text()
+        text = (ROOT / "scripts" / "download_model.sh").read_text()
         for name, (size, sha) in ARTIFACTS.items():
             data = payload(name)
             self.assertIn("expected_bytes=" + str(size), text)

@@ -62,7 +62,7 @@ raising a limit on your machine.
 Download the same model on both machines. For GLM 5.3 Flash Q4:
 
 ```sh
-./download_model.sh glm53-q4
+./scripts/download_model.sh glm53-q4
 ```
 
 Start the worker first; it retries while the coordinator loads:
@@ -167,12 +167,12 @@ For two 512 GB Mac Studios, use the split artifacts:
 
 ```sh
 # Machine A.
-./download_model.sh pro-q4-layers00-30
+./scripts/download_model.sh pro-q4-layers00-30
 ./ds4 -m gguf/DeepSeek-V4-Pro-Q4K-Layers00-30.gguf \
   --role coordinator --layers 0:30 --listen 10.99.0.2 9911
 
 # Machine B.
-./download_model.sh pro-q4-layers31-output
+./scripts/download_model.sh pro-q4-layers31-output
 ./ds4 -m gguf/DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf \
   --role worker --layers 31:output --coordinator 10.99.0.2 9911
 ```

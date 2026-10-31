@@ -41,6 +41,8 @@ QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
 QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# in the repository this script lives in scripts/; models go next to the binaries
+case $ROOT in */scripts) [ -f "$ROOT/../Makefile" ] && ROOT=$(CDPATH= cd -- "$ROOT/.." && pwd) ;; esac
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
 case "$OUT_DIR" in
     /*) ;;

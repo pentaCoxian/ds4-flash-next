@@ -53,7 +53,7 @@ configuration; doing so changes device isolation.
 
 ```sh
 make strix-halo
-./download_model.sh ds4f-q2
+./scripts/download_model.sh ds4f-q2
 ./ds4 --rocm
 ```
 
@@ -68,7 +68,7 @@ The reference Q2 setup uses SSD streaming to leave room for its graph and KV
 state. Begin with automatic cache sizing and a small context:
 
 ```sh
-./download_model.sh glm53-q2
+./scripts/download_model.sh glm53-q2
 ./ds4 --rocm -m gguf/GLM-5.3-Flash-Q2.gguf \
   --ssd-streaming --ctx 4096
 ```

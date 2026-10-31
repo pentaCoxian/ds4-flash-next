@@ -10,7 +10,7 @@ Check that `nvidia-smi` sees the GPU before building.
 
 ```sh
 make cuda-spark
-./download_model.sh ds4f-q2
+./scripts/download_model.sh ds4f-q2
 ./ds4 --cuda
 ```
 
@@ -24,7 +24,7 @@ for memory. Restore any services you stopped when finished.
 Q2 needs SSD streaming on one 128 GB Spark:
 
 ```sh
-./download_model.sh ds41f-q2
+./scripts/download_model.sh ds41f-q2
 ./ds4 --cuda -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
   --ssd-streaming --ctx 32768
 ```
@@ -48,7 +48,7 @@ run with 64K allocated context reached 384 t/s for a 32K initial prefill and
 V4 Flash numbers; speed depends on prompt length and the expert cache.
 The automatic-cache 256-token reply test decoded about 5% slower, but
 prefill plus the reply fell from about 87 to 59 seconds.
-See the [QA record](../QA_BEFORE_RELEASES.md#cuda-ssd-streaming) for conditions
+See the [QA record](QA_BEFORE_RELEASES.md#cuda-ssd-streaming) for conditions
 and longer-context measurements.
 
 On two Sparks over RoCE, September 13 measurements averaged **21.9 t/s** for
@@ -57,7 +57,7 @@ decode tokens. This does not use speculative decoding. Separately, eight
 ready sessions reached about **28 aggregate t/s**, not 28 t/s per client. Decode batching
 starts at five ready sessions; smaller groups run in order. Separate long
 runs measured about 400 t/s for a 32K prefill and 290 t/s for an 8K append. The
-[network TP QA record](../QA_BEFORE_RELEASES.md#cuda-network-tensor-parallelism)
+[network TP QA record](QA_BEFORE_RELEASES.md#cuda-network-tensor-parallelism)
 has the timing controls and memory limits.
 
 ## Qwen3.8 Flash Next
@@ -65,7 +65,7 @@ has the timing controls and memory limits.
 Both Q2 and Q4 fit on one Spark. After building:
 
 ```sh
-./download_model.sh qwen38-q2
+./scripts/download_model.sh qwen38-q2
 ./ds4 --mtp --ctx 32768
 ```
 
@@ -86,7 +86,7 @@ its benefit depends on the prompt.
 Q2 is the resident target for one Spark:
 
 ```sh
-./download_model.sh glm53-q2
+./scripts/download_model.sh glm53-q2
 ./ds4 --cuda -m gguf/GLM-5.3-Flash-Q2.gguf --ctx 16384
 ```
 
@@ -98,7 +98,7 @@ implemented; the two-Mac RDMA instructions do not apply to GLM on CUDA.
 DeepSeek Vision Experimental needs its matching text model and encoder:
 
 ```sh
-./download_model.sh ds4f-vision-q2
+./scripts/download_model.sh ds4f-vision-q2
 ./ds4 --cuda --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
 ```
 
@@ -135,7 +135,7 @@ To reproduce the greedy coding case after downloading `ds4f-q2` and
 ```
 
 For the temperature-1 rows, use `--temp 1 --top-p 0.95 --min-p 0.05`.
-The [QA record](../QA_BEFORE_RELEASES.md#16-speed-regression) includes the previous
+The [QA record](QA_BEFORE_RELEASES.md#16-speed-regression) includes the previous
 implementation, continued-context checks and quality comparisons.
 
 ## Larger models and serving

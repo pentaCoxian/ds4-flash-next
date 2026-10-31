@@ -98,3 +98,4 @@ __pycache__/
 /dist
 /tests/test_qwen4_prompt_anchor
 /tests/test_prompt_prefix
+/build/

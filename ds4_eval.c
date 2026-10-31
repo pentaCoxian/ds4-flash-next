@@ -14,7 +14,7 @@
  *
  * The original core suite contains fixed subsets of GPQA Diamond, SuperGPQA,
  * AIME 2025, and COMPSEC. The separate hard suite adds MMLU-Pro,
- * OlympiadBench, LiveBench, and NIST Juliet-derived cases. See EVAL_DATA.md for
+ * OlympiadBench, LiveBench, and NIST Juliet-derived cases. See docs/EVAL_DATA.md for
  * source revisions, licenses, and transformations.
  */
 

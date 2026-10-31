@@ -313,7 +313,7 @@ All model work and model execution in this runbook remains on
 2. Compare metadata, tensor names, dimensions, and tensor-type counts with the
    provisional file and published preview Q2. Expected weight changes are not
    byte differences in tensor layout.
-3. Run malformed-file and loader sanity checks from `QA_BEFORE_RELEASES.md`.
+3. Run malformed-file and loader sanity checks from `docs/QA_BEFORE_RELEASES.md`.
 4. Run short thinking and non-thinking prompts with
    `--ssd-streaming --ssd-streaming-cache-experts 48GB`; require coherent
    output and no missing tensors, cache failures, or Metal errors.

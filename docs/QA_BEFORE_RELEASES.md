@@ -336,7 +336,7 @@ or backend fallback selection changes.
   the output head per session. Treat flat aggregate scaling as unfinished
   implementation work, not evidence that Metal cannot benefit from batching.
 - Before physical Metal TP, check both hosts against the link and memory setup
-  in [the distributed guide](docs/DISTRIBUTED.md). Reboots can reset
+  in [the distributed guide](DISTRIBUTED.md). Reboots can reset
   member-interface IPv4 aliases and `iogpu.wired_limit_mb`. An active port is not
   enough, and a shard above the effective GPU residency limit may page heavily.
   Preserve OS headroom; do not bypass the memory guard to make a test fit.

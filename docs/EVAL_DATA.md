@@ -44,7 +44,7 @@ grading type and, where needed, a small list of equivalent surface forms. The
 12-case `hard-smoke` suite is a fixed subset of `hard`.
 
 Apache-2.0 terms for redistributed benchmark material are included in
-[`licenses/Apache-2.0.txt`](licenses/Apache-2.0.txt). DwarfStar's own source
+[`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt). DwarfStar's own source
 remains under the repository's top-level MIT license.
 
 ## Core suite

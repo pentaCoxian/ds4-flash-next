@@ -68,5 +68,5 @@ Historical PRO Q2 measurements on the M3 Ultra are retained in this chart:
   machines with streamed Q4 on one measures capacity benefits as well as parallelism.
 
 Recent focused TP and DSpark comparisons, including their limitations, live in
-[QA_BEFORE_RELEASES.md](../QA_BEFORE_RELEASES.md). Use its speed-regression
+[QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md). Use its speed-regression
 procedure rather than accumulating one-off timings in the main README.

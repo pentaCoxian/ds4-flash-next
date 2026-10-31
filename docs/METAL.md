@@ -14,7 +14,7 @@ From the repository root:
 
 ```sh
 make
-./download_model.sh ds4f-q2
+./scripts/download_model.sh ds4f-q2
 ./ds4
 ```
 
@@ -40,7 +40,7 @@ will fit. GLM 5.3 Flash Q2 is about 90 GiB before runtime allocations.
 Stop other memory-heavy workloads before loading it resident.
 
 ```sh
-./download_model.sh glm53-q2
+./scripts/download_model.sh glm53-q2
 ./ds4 -m gguf/GLM-5.3-Flash-Q2.gguf --ctx 32768
 ```
 
