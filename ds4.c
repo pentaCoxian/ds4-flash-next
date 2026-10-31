@@ -59730,6 +59730,20 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
+/* DS4_QWEN4_LAYER_SYNC=1, a diagnostic for SSD expert streaming: decode-sized
+ * forwards wait for every router and read its ids on the host before the
+ * experts are encoded, the round trip a streamed layer needs to learn its
+ * misses.  Tokens are unchanged; only the time per token shows the cost. */
+static bool qwen4_layer_sync(const ds4_qwen4_gpu_graph *g, uint32_t T) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_QWEN4_LAYER_SYNC") != NULL;
+    if (!on || T > 3u) return true;
+    int32_t ids[3 * DS4_MAX_EXPERT_USED];
+    return ds4_gpu_end_commands() != 0 &&
+           ds4_gpu_tensor_read(g->selected, 0, ids, (uint64_t)T * DS4_N_EXPERT_USED * sizeof(ids[0])) != 0 &&
+           glm_graph_begin_commands_if_needed();
+}
+
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
@@ -59740,7 +59754,8 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
               ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
-              qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
+              qwen4_moe_profile_boundary(profile, &last, &elapsed[0]) &&
+              qwen4_layer_sync(g, T);
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
