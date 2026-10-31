@@ -20059,8 +20059,8 @@ static const char *ds4_gpu_q4_mm_name(uint32_t weight_type) {
 
 /* The matvec of a mixed-precision type for nt tokens, e.g. "..._nt2". */
 static const char *ds4_gpu_quant_mv_name(const ds4_gpu_quant_kind *k, uint32_t nt) {
-    static char names[sizeof(ds4_gpu_quant_kinds) / sizeof(ds4_gpu_quant_kinds[0]) + 1][2][64];
-    if (nt <= 1u || nt > 3u) return k->mv;
+    static char names[sizeof(ds4_gpu_quant_kinds) / sizeof(ds4_gpu_quant_kinds[0]) + 1][7][64];
+    if (nt <= 1u || nt > 8u) return k->mv;
     const size_t ki = k == &ds4_gpu_q4_K_mixed_kind ? sizeof(ds4_gpu_quant_kinds) / sizeof(ds4_gpu_quant_kinds[0])
                                                      : (size_t)(k - ds4_gpu_quant_kinds);
     char *name = names[ki][nt - 2u];
@@ -20170,9 +20170,20 @@ static int ds4_gpu_matmul_quant_impl_tensor(
         /* a type whose multi-token kernels are capped keeps the token grid
          * rather than mv_ext, which is slower still for the K-quants */
         const uint16_t nt_max = kind ? ds4_gpu_quant_kind_nt_max(kind) : 0;
-        if (kind && (n_tok == 1u || (n_tok <= 8u && (n_tok <= kind->nt_max || !kind->mv_ext)))) {
+        /* BF16's K-split matvec reads its weights once per three or four
+         * tokens, so batches up to 16 (MTP and wide verifies; the hc and
+         * router rows) take it four tokens at a time rather than mv_ext or
+         * the GEMM, whose 64-row tiles leave the 320-row hc down projection
+         * five threadgroups.  The IQ3_XXS file's BF16 rows on an M3 Max:
+         * 8 tokens in 4.8 ms, 16 in 8.4 (2.5 for one); six or eight-token
+         * groups fall off the register budget. */
+        const bool bf16_grid = kind && kind->type == DS4_METAL_TENSOR_BF16 && n_tok <= 16u &&
+                               getenv("DS4_METAL_NO_BF16_GRID") == NULL;
+        if (kind && (n_tok == 1u || bf16_grid || (n_tok <= 8u && (n_tok <= kind->nt_max || !kind->mv_ext)))) {
             /* four tokens as two pairs: four-token kernels would spill */
-            const uint32_t nt = n_tok == 1u || n_tok > nt_max ? 1u : n_tok == 2u || n_tok == 4u ? 2u : 3u;
+            const uint32_t nt = n_tok == 1u || (n_tok > nt_max && !bf16_grid) ? 1u
+                              : bf16_grid && n_tok > 3u ? 4u
+                              : n_tok == 2u || n_tok == 4u ? 2u : 3u;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_ext_pipeline(ds4_gpu_quant_mv_name(kind, nt), (int16_t)kind->nsg, 8);
             if (!pipeline) return 0;

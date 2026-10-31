@@ -1538,6 +1538,7 @@ template [[host_name("kernel_mul_mv_q5_K_dense_f32_nt3")]] kernel ds4q_mul_mv_t 
 template [[host_name("kernel_mul_mv_bf16_dense_f32")]]     kernel ds4q_mul_mv_t ds4q_mul_mv_bf16<2, 1>;
 template [[host_name("kernel_mul_mv_bf16_dense_f32_nt2")]] kernel ds4q_mul_mv_t ds4q_mul_mv_bf16<2, 2>;
 template [[host_name("kernel_mul_mv_bf16_dense_f32_nt3")]] kernel ds4q_mul_mv_t ds4q_mul_mv_bf16<2, 3>;
+template [[host_name("kernel_mul_mv_bf16_dense_f32_nt4")]] kernel ds4q_mul_mv_t ds4q_mul_mv_bf16<2, 4>;
 
 /* --- 2..5 token matvec (mul_mv_ext template of dense.metal) -------------- */
 
