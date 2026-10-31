@@ -1519,6 +1519,16 @@ static double now_sec(void) {
  * it reads the tiny selected-expert and route-weight tensors after router
  * selection, records histograms, and simulates per-layer latest-N unique expert
  * caches without changing normal inference when disabled.
+ *
+ * DS4_EXPERT_TRACE=file also writes every routed forward in order, so cache
+ * policies, budgets and prefetch predictors can be replayed offline
+ * (speed-bench/qwen38_stream_sim.py).  Little-endian: the header "DS4XTRC1"
+ * and u32 n_layer, n_expert, n_expert_used, n_embd; then per layer of a
+ * forward u32 pos0, u16 layer, u16 rows, u8 has_input, 3 pad bytes, the
+ * rows x n_expert_used ids as i16 and weights as f32, and with has_input the
+ * rows x n_embd router inputs as f16.  DS4_EXPERT_TRACE_INPUT=1 adds the
+ * router inputs of decode-sized forwards (at most 3 rows), where a model
+ * passes them.
  */
 
 enum { DS4_EXPERT_PROFILE_MAX_CAPS = 10 };
@@ -1537,6 +1547,8 @@ typedef struct {
     bool active;
     char *path;
     char *hotlist_path;
+    FILE *trace;
+    bool trace_input;
     char model_name[64];
     uint32_t n_layer;
     uint32_t n_expert;
@@ -1618,11 +1630,12 @@ static void ds4_json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
 }
 
-static void ds4_expert_profile_init(const char *path, const char *hotlist_path) {
-    if ((!path || !path[0]) && (!hotlist_path || !hotlist_path[0])) return;
+static void ds4_expert_profile_init(const char *path, const char *hotlist_path, const char *trace_path) {
+    if ((!path || !path[0]) && (!hotlist_path || !hotlist_path[0]) && (!trace_path || !trace_path[0])) return;
     if (g_expert_profile.active) {
         free(g_expert_profile.path);
         free(g_expert_profile.hotlist_path);
+        if (g_expert_profile.trace) fclose(g_expert_profile.trace);
         memset(&g_expert_profile, 0, sizeof(g_expert_profile));
     }
 
@@ -1630,6 +1643,18 @@ static void ds4_expert_profile_init(const char *path, const char *hotlist_path) 
     if (path && path[0]) g_expert_profile.path = ds4_strdup(path);
     if (hotlist_path && hotlist_path[0]) {
         g_expert_profile.hotlist_path = ds4_strdup(hotlist_path);
+    }
+    if (trace_path && trace_path[0]) {
+        g_expert_profile.trace = fopen(trace_path, "wb");
+        if (!g_expert_profile.trace) {
+            fprintf(stderr, "ds4: failed to open expert trace %s: %s\n", trace_path, strerror(errno));
+        } else {
+            const uint32_t head[4] = { DS4_N_LAYER, DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_N_EMBD };
+            fwrite("DS4XTRC1", 1, 8, g_expert_profile.trace);
+            fwrite(head, sizeof(head), 1, g_expert_profile.trace);
+            const char *input = getenv("DS4_EXPERT_TRACE_INPUT");
+            g_expert_profile.trace_input = input && input[0] && strcmp(input, "0") != 0;
+        }
     }
     snprintf(g_expert_profile.model_name,
              sizeof(g_expert_profile.model_name),
@@ -1963,6 +1988,10 @@ static void ds4_expert_profile_close(void) {
         }
     }
     ds4_expert_profile_write_hotlist_file(p);
+    if (p->trace) {
+        if (fclose(p->trace) != 0) fprintf(stderr, "ds4: failed to write the expert trace\n");
+        else fprintf(stderr, "ds4: wrote the expert trace (%" PRIu64 " layer rows)\n", p->total_records);
+    }
 
     free(p->path);
     free(p->hotlist_path);
@@ -48873,10 +48902,13 @@ static bool glm_graph_profile_stage(
 }
 
 /* Expert profile of one layer: reads the router ids and weights of n_tokens
- * rows at pos0 back from the GPU, ending and resuming the command batch. */
+ * rows at pos0 back from the GPU, ending and resuming the command batch.
+ * input_t, when the model passes it, is the router's input rows for the
+ * trace (DS4_EXPERT_TRACE_INPUT). */
 static bool graph_profile_router_rows(
         ds4_gpu_tensor *selected_t,
         ds4_gpu_tensor *weights_t,
+        ds4_gpu_tensor *input_t,
         uint32_t        il,
         uint32_t        pos0,
         uint32_t        n_tokens,
@@ -48899,6 +48931,10 @@ static bool graph_profile_router_rows(
 
     int32_t *selected = xmalloc(selected_count * sizeof(selected[0]));
     float *weights = xmalloc(selected_count * sizeof(weights[0]));
+    FILE *trace = g_expert_profile.trace;
+    const bool trace_input = trace && g_expert_profile.trace_input && input_t && n_tokens <= 3u;
+    const size_t input_count = trace_input ? (size_t)n_tokens * DS4_N_EMBD : 0;
+    float *input = input_count ? xmalloc(input_count * sizeof(input[0])) : NULL;
     const bool read_ok =
         ds4_gpu_tensor_read(selected_t,
                             0,
@@ -48907,9 +48943,11 @@ static bool graph_profile_router_rows(
         ds4_gpu_tensor_read(weights_t,
                             0,
                             weights,
-                            (uint64_t)selected_count * sizeof(weights[0])) != 0;
+                            (uint64_t)selected_count * sizeof(weights[0])) != 0 &&
+        (!input || ds4_gpu_tensor_read(input_t, 0, input, (uint64_t)input_count * sizeof(input[0])) != 0);
 
     if (ds4_gpu_begin_commands() == 0) {
+        free(input);
         free(weights);
         free(selected);
         fprintf(stderr,
@@ -48917,6 +48955,7 @@ static bool graph_profile_router_rows(
         return false;
     }
     if (!read_ok) {
+        free(input);
         free(weights);
         free(selected);
         fprintf(stderr, "ds4: failed to read Metal router tensors for expert profile\n");
@@ -48927,7 +48966,28 @@ static bool graph_profile_router_rows(
         const size_t off = (size_t)t * DS4_N_EXPERT_USED;
         ds4_expert_profile_record(il, pos0 + t, selected + off, weights + off, is_hash);
     }
+    if (trace) {
+        const uint32_t pos = pos0;
+        const uint16_t layer = (uint16_t)il, rows = (uint16_t)n_tokens;
+        const uint8_t flags[4] = { input ? 1u : 0u, 0, 0, 0 };
+        int16_t *ids = xmalloc(selected_count * sizeof(ids[0]));
+        for (size_t i = 0; i < selected_count; i++) ids[i] = (int16_t)selected[i];
+        fwrite(&pos, sizeof(pos), 1, trace);
+        fwrite(&layer, sizeof(layer), 1, trace);
+        fwrite(&rows, sizeof(rows), 1, trace);
+        fwrite(flags, sizeof(flags), 1, trace);
+        fwrite(ids, sizeof(ids[0]), selected_count, trace);
+        fwrite(weights, sizeof(weights[0]), selected_count, trace);
+        if (input) {
+            uint16_t *half = xmalloc(input_count * sizeof(half[0]));
+            for (size_t i = 0; i < input_count; i++) half[i] = f32_to_f16(input[i]);
+            fwrite(half, sizeof(half[0]), input_count, trace);
+            free(half);
+        }
+        free(ids);
+    }
 
+    free(input);
     free(weights);
     free(selected);
     return true;
@@ -48940,7 +49000,7 @@ static bool glm_graph_profile_router_selection(
         uint32_t                 pos) {
     if (!g_expert_profile.active) return true;
     if (!g || !layer) return false;
-    return graph_profile_router_rows(g->router_selected, g->router_weights, il, pos, 1,
+    return graph_profile_router_rows(g->router_selected, g->router_weights, NULL, il, pos, 1,
                                      layer->ffn_gate_tid2eid != NULL);
 }
 
@@ -48952,7 +49012,7 @@ static bool glm_graph_profile_router_selection_batch(
         uint32_t                 n_tokens) {
     if (!g_expert_profile.active) return true;
     if (!g || !layer) return false;
-    return graph_profile_router_rows(g->batch_router_selected, g->batch_router_weights, il, pos0,
+    return graph_profile_router_rows(g->batch_router_selected, g->batch_router_weights, NULL, il, pos0,
                                      n_tokens, layer->ffn_gate_tid2eid != NULL);
 }
 
@@ -59920,7 +59980,7 @@ static bool qwen4_layer_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     qwen4_ane_set_moe_layer((int)il);
     bool ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
     qwen4_ane_set_moe_layer(-1);
-    if (ok) ok = graph_profile_router_rows(g->selected, g->weights, il, pos0, T, false);
+    if (ok) ok = graph_profile_router_rows(g->selected, g->weights, g->mixed, il, pos0, T, false);
     if (ok && g->dump_prompt_rows)
         metal_graph_debug_dump_tensor("qwen_router", g->router, (uint64_t)T * DS4_N_EXPERT, il, pos0);
     if (ok && g->dump_prompt_rows) qwen4_graph_dump_last_ffn(g, il, T);
@@ -72536,10 +72596,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
         expert_profile_path = getenv("DS4_EXPERT_PROFILE");
     }
     const char *expert_hotlist_path = getenv("DS4_EXPERT_HOTLIST");
+    const char *expert_trace_path = getenv("DS4_EXPERT_TRACE");
     if ((expert_profile_path && expert_profile_path[0]) ||
-        (expert_hotlist_path && expert_hotlist_path[0])) {
+        (expert_hotlist_path && expert_hotlist_path[0]) ||
+        (expert_trace_path && expert_trace_path[0])) {
         if (e->backend == DS4_BACKEND_METAL) {
-            ds4_expert_profile_init(expert_profile_path, expert_hotlist_path);
+            ds4_expert_profile_init(expert_profile_path, expert_hotlist_path, expert_trace_path);
         } else {
             fprintf(stderr,
                     "ds4: expert profile/hotlist is Metal-only for now; ignoring for %s backend\n",
@@ -80780,6 +80842,7 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
                                                 l->hc_ffn_up, l->hc_ffn_inject, T);
         QWEN4_BATCH_PROF(5);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);
+        if (ok) ok = graph_profile_router_rows(g->selected, g->weights, g->mixed, il, rowg[0].pos, T, false);
         QWEN4_BATCH_PROF(6);
     }
     /* The output matrix is the single largest weight read of a decode step,
@@ -80986,6 +81049,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
         }
         if (ok) ok = qwen4_graph_hc_combine_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);
+        if (ok) ok = graph_profile_router_rows(g->selected, g->weights, g->mixed, il, rowg[0].pos, T, false);
     }
     if (ok) ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
                  qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
