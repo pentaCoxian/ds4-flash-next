@@ -59764,10 +59764,13 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     /* A decode batch runs the shared expert as dense projections over its
      * rows, as the prefill path does: as a slot of the per-token kernels it
      * is read once per row, 5 MB of Q8 per row and layer.  Single tokens and
-     * verify rows keep the slot, which has one weight type for gate and up;
-     * mixed-precision files that quantize them differently go dense. */
+     * verify rows keep the slot.  Its gate and up rows may differ in type
+     * (31 of iq3m's 48 layers); the slot takes them for single tokens
+     * (ds4_gpu_qwen4_shexp_slot_mixed), other rows go dense, four
+     * dispatches more per layer. */
 #ifdef DS4_HAS_QWEN4_METAL
-    const bool shared_dense = (T > 8u || l->ffn_gate_shexp->type != l->ffn_up_shexp->type) &&
+    const bool mixed_dense = l->ffn_gate_shexp->type != l->ffn_up_shexp->type && !ds4_gpu_qwen4_shexp_slot_mixed(T);
+    const bool shared_dense = (T > 8u || mixed_dense) &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
 #else
@@ -59801,12 +59804,23 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     } else
 #endif
     if (ok) {
+#ifdef DS4_HAS_QWEN4_METAL
+        ok = ds4_gpu_qwen4_moe_mid2_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
+                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
+                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
+                                           shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
+                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
+                                           shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type,
+                                           shared_dense ? UINT32_MAX : l->ffn_up_shexp->type) != 0;
+#else
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
                                           shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
-                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0 &&
+                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0;
+#endif
+        ok = ok &&
              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,

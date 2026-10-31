@@ -1966,6 +1966,9 @@ static void test_idx_prefilter(void) {
 
 /* Routed gate/up and down types can differ; shared experts stay Q8_0
  * for quantized cases and F32 for the F32 case. */
+/* shared expert weight types of test_moe_types (Q8_0 unless a test sets them) */
+static uint32_t g_moe_sh_gate = 8u, g_moe_sh_up = 8u, g_moe_sh_down = 8u;
+
 static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F,
                            uint32_t T, uint32_t wtype, uint32_t dtype) {
     /* Nonzero random padding ensures kernels ignore the physical tail. */
@@ -1979,9 +1982,9 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         gate_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &gate_w);
         up_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &up_w);
         down_off = arena_tier(a, dtype, (uint64_t)NE * E, DF, &down_w);
-        sg_off = arena_q8_0(a, F, E, &sg_w, 0.05f);
-        su_off = arena_q8_0(a, F, E, &su_w, 0.05f);
-        sd_off = arena_q8_0(a, E, F, &sd_w, 0.05f);
+        sg_off = arena_tier(a, g_moe_sh_gate, F, E, &sg_w);
+        su_off = arena_tier(a, g_moe_sh_up, F, E, &su_w);
+        sd_off = arena_tier(a, g_moe_sh_down, E, F, &sd_w);
     } else {
         gate_off = arena_f32(a, (uint64_t)NE * F * E, &gate_w, -0.05f, 0.05f);
         up_off = arena_f32(a, (uint64_t)NE * F * E, &up_w, -0.05f, 0.05f);
@@ -2038,11 +2041,11 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * n_out * E);
     ds4_gpu_tensor *gsg = upload(sgate, T);
     ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * E);
-    const uint32_t shared_type = q8 ? 8u : 0u;
-    require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T, slots, E, F,
-                                            sg_off, su_off, shared_type), "moe mid");
+    const uint32_t shared_type = q8 ? g_moe_sh_gate : 0u;
+    require_ok(ds4_gpu_qwen4_moe_mid2_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T, slots, E, F,
+                                             sg_off, su_off, shared_type, q8 ? g_moe_sh_up : 0u), "moe mid");
     require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
-                                             sd_off, shared_type), "moe down");
+                                             sd_off, q8 ? g_moe_sh_down : 0u), "moe down");
     if ((dtype == 10u || dtype == 39u) && getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         /* Specialized decode row kernels must match the generic dispatch bit
          * for bit across every NR/NSG geometry; Q4_K gate/up keep their own
@@ -4348,6 +4351,25 @@ int main(void) {
         test_moe_types(&arena, 16, 10, 2560, 640, 100, grid_types[i], 20u);
     }
     test_moe_types(&arena, 16, 10, 2560, 640, 100, 16u, 20u);
+    {
+        /* the shared expert's gate and up rows in different types, as 31 of
+         * iq3m's 48 layers quantize them, in every mid kernel's shared slot */
+        const uint64_t used0 = arena.used;
+        g_moe_sh_gate = 23u; g_moe_sh_up = 21u; g_moe_sh_down = 20u;
+        test_moe_types(&arena, 16, 10, 2560, 640, 1, 21u, 20u);
+        test_moe_types(&arena, 16, 10, 2560, 640, 3, 21u, 42u);
+        test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 20u);
+        setenv("DS4_QWEN4_MOE_IQ2XXS_GRID", "0", 1);
+        test_moe_types(&arena, 16, 10, 2560, 640, 2, 16u, 20u);
+        unsetenv("DS4_QWEN4_MOE_IQ2XXS_GRID");
+        test_moe_types(&arena, 16, 10, 2560, 640, 1, 12u, 20u);
+        g_moe_sh_gate = 42u; g_moe_sh_up = 21u; g_moe_sh_down = 42u;
+        test_moe_types(&arena, 16, 10, 2560, 640, 2, 42u, 42u);
+        g_moe_sh_gate = 21u; g_moe_sh_up = 42u;
+        test_moe_types(&arena, 16, 10, 2560, 640, 1, 42u, 42u);
+        g_moe_sh_gate = g_moe_sh_up = g_moe_sh_down = 8u;
+        arena.used = used0;
+    }
     {
         /* IQ2_XXS decode rows through the codebook kernel and the generic
          * row dots, with the shared expert slot */

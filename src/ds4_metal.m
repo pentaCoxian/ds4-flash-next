@@ -48865,7 +48865,7 @@ typedef struct {
     uint32_t n_tokens, n_slots, in_dim, out_rows, weight_type, row_bytes;
     uint64_t expert_bytes;
     uint32_t has_shared, shared_type, shared_row_bytes, n_total_expert;
-    uint32_t list_cap, pad0;
+    uint32_t list_cap, shared_up_type, shared_up_row_bytes, pad1;
 } qwen4_moe_args;
 
 static bool qwen4_moe_mv_specialize(uint32_t type) {
@@ -49030,6 +49030,19 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
         return k && (in_dim % k->block) == 0 ? (in_dim / k->block) * k->block_bytes : 0u;
     }
     }
+}
+
+/* Single-token decode keeps the shared expert in the routed kernels' extra
+ * slot even when its gate and up rows have different types, instead of four
+ * dense dispatches per layer (31 of iq3m's 48 layers).  Verify rows stay
+ * dense: the slot reads the shared rows once per row, the dense
+ * projections once per batch, and 2-3 row cycles measured 1.8% more GPU
+ * time in the slot.  Apple9 default; DS4_QWEN4_SHEXP_SLOT_MIXED=0/1
+ * overrides on any device, DS4_QWEN4_SHEXP_SLOT_MIXED_ROWS=N up to N rows. */
+int ds4_gpu_qwen4_shexp_slot_mixed(uint32_t n_tokens) {
+    const int override = ds4_gpu_env_bool("DS4_QWEN4_SHEXP_SLOT_MIXED");
+    const uint64_t rows = ds4_gpu_env_u64("DS4_QWEN4_SHEXP_SLOT_MIXED_ROWS", 1u, 1u, 8u);
+    return (override >= 0 ? override > 0 : g_metal_apple_family == 9) && n_tokens <= rows;
 }
 
 int ds4_gpu_qwen4_decode_fusions_enabled(void) {
@@ -50217,17 +50230,34 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t in_dim, uint32_t ff_dim,
         uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type) {
+    return ds4_gpu_qwen4_moe_mid2_tensor(mid, x, selected, model_map, model_size, gate_offset, up_offset, weight_type,
+                                         n_total_expert, n_tokens, n_slots, in_dim, ff_dim, shared_gate_offset,
+                                         shared_up_offset, shared_type, shared_type);
+}
+
+/* The shared expert in the slot past the routed ones, its up rows in their
+ * own type (shared_up_type) when the file quantizes them differently from
+ * the gate rows. */
+int ds4_gpu_qwen4_moe_mid2_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type, uint32_t shared_up_type) {
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
     const bool has_shared = shared_type != UINT32_MAX;
     const uint32_t sh_row_bytes = has_shared ? qwen4_expert_row_bytes(shared_type, in_dim) : 0u;
+    const uint32_t sh_up_row_bytes = has_shared ? qwen4_expert_row_bytes(shared_up_type, in_dim) : 0u;
     const uint32_t n_out = n_slots + (has_shared ? 1u : 0u);
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * ff_dim;
+    const uint64_t shared_up_bytes = (uint64_t)sh_up_row_bytes * ff_dim;
     qwen4_moe_args args = { n_tokens, n_slots, in_dim, ff_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert, 0u, 0u };
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert, 0u,
+                            has_shared ? shared_up_type : 0u, sh_up_row_bytes, 0u };
     qwen4_bind b[7];
-    if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || (has_shared && sh_row_bytes == 0) ||
+    if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || (has_shared && (sh_row_bytes == 0 || sh_up_row_bytes == 0)) ||
         !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, experts_bytes, "moe gate experts") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, experts_bytes, "moe up experts") ||
         !qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
@@ -50237,7 +50267,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     }
     if (has_shared) {
         if (!qwen4_bind_weight(&b[5], model_map, model_size, shared_gate_offset, shared_bytes, "shared gate") ||
-            !qwen4_bind_weight(&b[6], model_map, model_size, shared_up_offset, shared_bytes, "shared up")) {
+            !qwen4_bind_weight(&b[6], model_map, model_size, shared_up_offset, shared_up_bytes, "shared up")) {
             return 0;
         }
     } else {
@@ -50268,7 +50298,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     if (weight_type == 42u && (in_dim % 64u) == 0 && getenv("DS4_QWEN4_NO_Q2_0_MOE") == NULL) {
         /* Q2_0 experts: four gate and four up rows per SIMD group */
         /* a non-Q2_0 shared expert spreads over one extra slot (metal/qwen4.metal) */
-        const uint32_t split = has_shared && shared_type != 42u ? 2u : 1u;
+        const uint32_t split = has_shared && (shared_type != 42u || shared_up_type != 42u) ? 2u : 1u;
         return qwen4_dispatch(QWEN4_K_MOE_MID_Q2_0, &args, sizeof(args), b, 7,
                               MTLSizeMake((ff_dim + 7u) / 8u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
     }
@@ -50311,7 +50341,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * out_dim;
     qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0u, 0u, 0u };
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0u, 0u, 0u, 0u, 0u };
     qwen4_bind b[5];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || (ff_dim % 32u) != 0 ||
         out_dim == 0 || (has_shared && sh_row_bytes == 0) ||
@@ -50365,7 +50395,7 @@ int ds4_gpu_qwen4_moe_mid_grouped_tensor(
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
     qwen4_moe_args args = { n_tokens, n_slots, in_dim, ff_dim, weight_type, row_bytes, expert_bytes,
-                            0u, 0u, 0u, n_total_expert, list_cap, 0u };
+                            0u, 0u, 0u, n_total_expert, list_cap, 0u, 0u, 0u };
     qwen4_bind b[7];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || list_cap == 0 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert_bytes * n_total_expert, "moe gate experts") ||
@@ -50394,7 +50424,7 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, ff_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
-                            0u, 0u, 0u, n_total_expert, list_cap, 0u };
+                            0u, 0u, 0u, n_total_expert, list_cap, 0u, 0u, 0u };
     qwen4_bind b[6];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || out_dim == 0 || list_cap == 0 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_total_expert, "moe down experts") ||

@@ -3145,7 +3145,9 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t shared_row_bytes;
     uint32_t n_total_expert;
     uint32_t list_cap;     /* grouped kernels: row stride of the per-expert pair lists */
-    uint32_t pad0;
+    uint32_t shared_up_type;       /* the shared expert's up rows: their own type, */
+    uint32_t shared_up_row_bytes;  /* which the gate rows' may differ from */
+    uint32_t pad1;
 };
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
@@ -3344,6 +3346,9 @@ kernel void kernel_qwen4_moe_mid(
     const bool shared = slot == args.n_slots;
     const uint type = shared ? st : wt;
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
+    const bool mixed = shared && args.shared_up_type != args.shared_type;
+    const uint utype = mixed ? args.shared_up_type : type;
+    const uint urow_bytes = mixed ? args.shared_up_row_bytes : row_bytes;
     device const char *gb = shared ? sh_gate : gate_base;
     device const char *ub = shared ? sh_up : up_base;
     const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
@@ -3351,7 +3356,7 @@ kernel void kernel_qwen4_moe_mid(
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         const uint64_t off = ebase + (uint64_t)r * row_bytes;
         const float g = qwen4_row_dot(gb + off, xt, type, dim, tiisg);
-        const float u = qwen4_row_dot(ub + off, xt, type, dim, tiisg);
+        const float u = qwen4_row_dot(ub + ebase + (uint64_t)r * urow_bytes, xt, utype, dim, tiisg);
         if (tiisg == 0) {
             mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
         }
@@ -3384,9 +3389,10 @@ kernel void kernel_qwen4_moe_mid_q4k(
     const uint64_t mid_base = ((uint64_t)tok * n_out + slot) * args.out_rows;
     if (slot == args.n_slots) {
         for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
-            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
-            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
-            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+            const float g = qwen4_row_dot(sh_gate + (uint64_t)r * args.shared_row_bytes, xt, args.shared_type,
+                                          args.in_dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + (uint64_t)r * args.shared_up_row_bytes, xt, args.shared_up_type,
+                                          args.in_dim, tiisg);
             if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
         }
         return;
@@ -3665,14 +3671,15 @@ kernel void kernel_qwen4_moe_mid_q2_0(
     if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
     device const float *xt = x + (uint64_t)tok * args.in_dim;
     device float *out = mid + ((uint64_t)tok * n_out + slot) * args.out_rows;
-    if (shared && args.shared_type != 42u) {
+    if (shared && (args.shared_type != 42u || args.shared_up_type != 42u)) {
         /* the host adds QWEN4_Q2_0_SHARED_SPLIT_MID - 1 grid slots: one row each */
         static_assert(QWEN4_Q2_0_SHARED_SPLIT_MID == QWEN4_Q2_0_MID_NR, "one shared row per slot");
         const uint r = row0 + (tgpig.y - args.n_slots);
         if (r < args.out_rows) {
-            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
-            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
-            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+            const float g = qwen4_row_dot(sh_gate + (uint64_t)r * args.shared_row_bytes, xt, args.shared_type,
+                                          args.in_dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + (uint64_t)r * args.shared_up_row_bytes, xt, args.shared_up_type,
+                                          args.in_dim, tiisg);
             if (tiisg == 0) out[r] = qwen4_silu(g) * u;
         }
         return;
@@ -3803,9 +3810,10 @@ kernel void kernel_qwen4_moe_mid_grid(
         /* the host adds QWEN4_GRID_MID_NR - 1 grid slots: one row each */
         const uint r = row0 + (tgpig.y - args.n_slots);
         if (r < args.out_rows) {
-            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
-            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
-            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+            const float g = qwen4_row_dot(sh_gate + (uint64_t)r * args.shared_row_bytes, xt, args.shared_type,
+                                          args.in_dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + (uint64_t)r * args.shared_up_row_bytes, xt, args.shared_up_type,
+                                          args.in_dim, tiisg);
             if (tiisg == 0) out[r] = qwen4_silu(g) * u;
         }
         return;
