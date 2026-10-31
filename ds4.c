@@ -59516,6 +59516,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     if (n_dense >= cT) return true;
     const uint32_t n_sparse = cT - n_dense;
     const uint32_t sp0 = cpos0 + n_dense;
+    const bool exact3 = n_sparse == 3u && g->verify_rows_exact;
     ds4_gpu_tensor *q = ds4_gpu_tensor_view(q_rows, (uint64_t)n_dense * q_dim * sizeof(float),
                                             (uint64_t)n_sparse * q_dim * sizeof(float));
     ds4_gpu_tensor *gate = ds4_gpu_tensor_view(gate_rows, (uint64_t)n_dense * q_dim * sizeof(float),
@@ -59526,10 +59527,10 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
             (uint64_t)n_dense * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
             (uint64_t)n_sparse * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
     const bool ok = q && gate && o && iqn &&
-        ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u ? g->tile_max : NULL, iqn,
+        ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u || exact3 ? g->tile_max : NULL, iqn,
                                        g->layer_block_key[il], n_sparse, n_blocks_after,
                                        DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio) &&
-        qwen4_idx_select(g->sel_blocks, g->score, n_sparse <= 2u ? g->tile_max : NULL,
+        qwen4_idx_select(g->sel_blocks, g->score, n_sparse <= 2u || exact3 ? g->tile_max : NULL,
                          n_blocks_after, n_sparse, g->k_blocks) &&
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
                                         sp0, g->sel_stride) &&
@@ -59580,7 +59581,17 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
     if (!qwen4_graph_attention_cache(g, m, l, il, pos0, T)) return false;
     const uint32_t n_blocks_after = (pos0 + T) / ratio;
-    if (T == 3u && g->verify_rows_exact) {
+    /* All-sparse rows whose 2/1-row sub-batches would see the same block
+     * universe (three cycles in four) take one 3-row pass: the scorer, the
+     * selection, the expansion and the split-key attention all work per row
+     * with a split count fixed by the selection stride, so each row gets
+     * its sub-batch's bits. */
+    const uint32_t sparse_pos = (g->k_blocks + 1u) * ratio - 1u;
+    static int keep_split = -1;
+    if (keep_split < 0) keep_split = getenv("DS4_QWEN4_EXACT_ATTN_SPLIT") != NULL;
+    const bool one_pass = T == 3u && g->verify_rows_exact && !keep_split && pos0 >= sparse_pos &&
+                          (pos0 + 2u) / ratio == (pos0 + 3u) / ratio;
+    if (T == 3u && g->verify_rows_exact && !one_pass) {
         /* 3-row speculative verify: run the attention core as 2/1-row
          * sub-batches so every dispatch keeps the exact T <= 2 kernel paths
          * (prefill T = 3 tails keep their own kernel selection). */

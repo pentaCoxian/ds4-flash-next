@@ -49797,7 +49797,8 @@ int ds4_gpu_qwen4_idx_score_tensor(
         !qwen4_bind_tensor(&b[2], score, (uint64_t)n_tokens * n_blocks * sizeof(float), "indexer scores")) {
         return 0;
     }
-    if (n_tokens > 2u && n_idx_head == 4u && idx_dim == 128u) {
+    /* a 3-row MTP verify keeps the per-row scorer of its 2/1-row rows */
+    if (n_tokens > 2u && !(n_tokens == 3u && g_qwen4_verify_rows_exact) && n_idx_head == 4u && idx_dim == 128u) {
         return qwen4_dispatch(QWEN4_K_IDX_SCORE_MM, &args, sizeof(args), b, 3,
                               MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
