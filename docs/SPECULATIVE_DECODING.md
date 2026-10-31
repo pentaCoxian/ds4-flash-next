@@ -70,12 +70,19 @@ Ordinary decode uses the same file with `--mtp` omitted. For non-zero
 temperature, add `--mtp-exact-sampling` to preserve the target sampling
 distribution. See [Qwen setup](QWEN38_FLASH_NEXT.md) for Metal and CUDA.
 
-The cycle drafts one token ahead by default and engages a **second, chained
-draft** (one extra nextn-layer step conditioned on the predictor's own
-stream, verified in a 3-row pass) while recent first-draft acceptance is
-perfect, disengaging after repeated second-draft rejections.
-`DS4_QWEN4_MTP_DEPTH=2` or `=3` fixes the depth;
-`0` (default) is the adaptive policy.
+The cycle drafts one token ahead and can verify a **second, chained draft**
+(one extra nextn-layer step conditioned on the predictor's own stream) in a
+3-row pass. The depth is chosen per cycle: each draft comes with the
+predictor's probability of it, which is calibrated (a draft of probability p
+is accepted about p of the time), so a 2-row cycle is worth 1 + p1 tokens and
+a 3-row one 1 + p1 + p1*p2. The session measures what each depth costs and
+takes three rows when they beat two by 5% in tokens per second; a second
+draft is chained only when p1 makes that possible. On an M3 Max a 3-row
+cycle costs about 1.43 times a 2-row one, so three rows pay only on very
+confident stretches. `DS4_QWEN4_MTP_DEPTH=1`, `=2` or `=3` fixes the depth
+(1 decodes without verifying drafts), `=window` keeps the earlier policy
+(three rows after eight accepted first drafts in a row), and
+`DS4_QWEN4_SPEC_TRACE=1` prints every cycle's probabilities and cost.
 
 ## Sampling and reproducibility
 
