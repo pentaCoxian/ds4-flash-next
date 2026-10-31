@@ -3611,6 +3611,144 @@ static void bench_cold(arena_t *a) {
     }
 }
 
+/* QWEN4_MOE_COLD_BENCH=1: the routed-expert decode kernels at the
+ * Flash-Next shapes (2560 -> 640 -> 2560, ten slots, no shared slot) over
+ * MOE_COLD_NE experts of random codes with a fresh random selection per
+ * dispatch, so the codebook lookups diverge across lanes as in the model
+ * and the experts stream from DRAM.  Reports effective GB/s of the routed
+ * weights each dispatch reads. */
+#define MOE_COLD_NE 192u
+typedef struct {
+    arena_t *a;
+    uint64_t gate_off, up_off, down_off;
+    uint32_t type, T, i, nsel;
+    int down;   /* 0 mid, 1 down, 2 reduce */
+    ds4_gpu_tensor *x, *mid, *part, **sel, *wts, *sgate, *out, *R, *inj;
+} moe_cold_ctx;
+
+static int bench_moe_cold_fn(void *ud) {
+    moe_cold_ctx *c = ud;
+    ds4_gpu_tensor *sel = c->sel[c->i++ % c->nsel];
+    if (c->down == 2)
+        return ds4_gpu_qwen4_moe_reduce_tensor(c->out, c->part, c->wts, c->sgate, NULL, c->R, c->inj, c->T, 10, 11,
+                                               2560, 4);
+    if (c->down)
+        return ds4_gpu_qwen4_moe_down_tensor(c->part, c->mid, sel, c->a->base, c->a->size, c->down_off, c->type,
+                                             MOE_COLD_NE, c->T, 10, 640, 2560, 0, UINT32_MAX);
+    return ds4_gpu_qwen4_moe_mid_tensor(c->mid, c->x, sel, c->a->base, c->a->size, c->gate_off, c->up_off, c->type,
+                                        MOE_COLD_NE, c->T, 10, 2560, 640, 0, 0, UINT32_MAX);
+}
+
+static uint64_t arena_random(arena_t *a, uint64_t bytes, uint64_t *state) {
+    const uint64_t off = arena_alloc(a, (bytes + 7u) & ~7ull);
+    uint64_t *w = (uint64_t *)(a->base + off), s = *state;
+    for (uint64_t i = 0; i < (bytes + 7u) / 8u; i++) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        w[i] = s;
+    }
+    *state = s;
+    return off;
+}
+
+static void bench_moe_cold(arena_t *a) {
+    static const struct { const char *name; uint32_t type; int down; } cases[] = {
+        { "mid iq2_xxs", 16u, 0 }, { "mid iq2_xs", 17u, 0 }, { "mid iq2_s", 22u, 0 },
+        { "mid iq3_xxs", 18u, 0 }, { "mid iq3_s", 21u, 0 },
+        { "down q2_0", 42u, 1 }, { "down iq4_nl", 20u, 1 }, { "reduce", 0u, 2 },
+    };
+    const uint32_t nsel = 64;
+    const char *only = getenv("QWEN4_BENCH_ONLY");
+    uint64_t rng = 0x9e3779b97f4a7c15ull;
+    for (uint32_t T = 1; T <= 3; T++) {
+        moe_cold_ctx c = { .a = a, .T = T, .nsel = nsel };
+        c.sel = malloc(nsel * sizeof(*c.sel));
+        int32_t sel[30];
+        for (uint32_t k = 0; k < nsel; k++) {
+            for (uint32_t t = 0; t < T; t++) {
+                for (uint32_t s = 0; s < 10; s++) {
+                    bool dup;
+                    do {
+                        sel[t * 10 + s] = (int32_t)(frand() * 0.5f * MOE_COLD_NE + 0.5f * MOE_COLD_NE) % (int32_t)MOE_COLD_NE;
+                        dup = false;
+                        for (uint32_t j = 0; j < s; j++) dup |= sel[t * 10 + j] == sel[t * 10 + s];
+                    } while (dup);
+                }
+            }
+            c.sel[k] = ds4_gpu_tensor_alloc((uint64_t)T * 10 * 4);
+            require_ok(ds4_gpu_tensor_write(c.sel[k], 0, sel, (uint64_t)T * 10 * 4), "moe cold selection");
+        }
+        c.x = upload(rand_vec((uint64_t)T * 2560, 1.0f), (uint64_t)T * 2560);
+        c.mid = upload(rand_vec((uint64_t)T * 10 * 640, 0.1f), (uint64_t)T * 10 * 640);
+        c.part = upload(rand_vec((uint64_t)T * 11 * 2560, 0.1f), (uint64_t)T * 11 * 2560);
+        c.wts = upload(rand_vec((uint64_t)T * 10, 1.0f), (uint64_t)T * 10);
+        c.sgate = upload(rand_vec(T, 1.0f), T);
+        c.out = upload(NULL, (uint64_t)T * 2560);
+        c.R = upload(rand_vec((uint64_t)T * 4 * 2560, 1.0f), (uint64_t)T * 4 * 2560);
+        c.inj = upload(rand_vec((uint64_t)T * 4 * DS4_QWEN4_HC_CHUNKS * 4, 0.1f), (uint64_t)T * 4 * DS4_QWEN4_HC_CHUNKS * 4);
+        for (uint32_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+            if (only && only[0] && !strstr(cases[k].name, only)) continue;
+            const uint64_t used0 = a->used;
+            const uint32_t in = cases[k].down ? 640u : 2560u, rows = cases[k].down ? 2560u : 640u;
+            /* bytes per 256-weight block (IQ), 64-weight block (Q2_0) or 32-weight block (IQ4_NL) */
+            const uint32_t t = cases[k].type;
+            const uint64_t rb = cases[k].down == 2 ? 0u : t == 16u ? in / 256u * 66u : t == 17u ? in / 256u * 74u : t == 22u ? in / 256u * 82u :
+                                t == 18u ? in / 256u * 98u : t == 21u ? in / 256u * 110u :
+                                t == 42u ? in / 64u * 18u : in / 32u * 18u;
+            const uint64_t ebytes = rb * rows;
+            c.type = cases[k].type;
+            c.down = cases[k].down;
+            if (c.down == 2) {
+            } else if (c.down) {
+                c.down_off = arena_random(a, ebytes * MOE_COLD_NE, &rng);
+            } else {
+                c.gate_off = arena_random(a, ebytes * MOE_COLD_NE, &rng);
+                c.up_off = arena_random(a, ebytes * MOE_COLD_NE, &rng);
+            }
+            /* QWEN4_MOE_COLD_VAR=NAME QWEN4_MOE_COLD_VALS=a,b,...: the
+             * variants alternate in this process, best of 5 rounds each */
+            const char *var = getenv("QWEN4_MOE_COLD_VAR"), *vals_env = getenv("QWEN4_MOE_COLD_VALS");
+            char vals[8][32];
+            uint32_t n_vals = 0;
+            if (var && vals_env) {
+                for (const char *p = vals_env; *p && n_vals < 8; n_vals++) {
+                    const char *e = strchr(p, ',');
+                    const size_t len = e ? (size_t)(e - p) : strlen(p);
+                    snprintf(vals[n_vals], sizeof(vals[0]), "%.*s", (int)(len < 31 ? len : 31), p);
+                    p = e ? e + 1 : p + len;
+                }
+            }
+            const uint32_t n_var = n_vals ? n_vals : 1u;
+            double best[8];
+            for (uint32_t v = 0; v < n_var; v++) best[v] = 1e30;
+            for (int rep = 0; rep < (n_vals ? 5 : 3); rep++) {
+                for (uint32_t v = 0; v < n_var; v++) {
+                    if (n_vals) setenv(var, vals[v], 1);
+                    const double t_warm = bench_now();
+                    while (bench_now() - t_warm < (rep ? 0.05 : 0.3)) {
+                        require_ok(ds4_gpu_begin_commands(), "begin");
+                        for (uint32_t r = 0; r < nsel; r++) require_ok(bench_moe_cold_fn(&c), "warm");
+                        require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "warm sync");
+                    }
+                    const double t0 = bench_now();
+                    require_ok(ds4_gpu_begin_commands(), "begin");
+                    for (uint32_t r = 0; r < 4 * nsel; r++) require_ok(bench_moe_cold_fn(&c), cases[k].name);
+                    require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "sync");
+                    const double us = 1e6 * (bench_now() - t0) / (4 * nsel);
+                    if (us < best[v]) best[v] = us;
+                }
+            }
+            const double bytes = c.down == 2 ? (double)T * 4 * (10 + 1 + 4 + 4) * 2560 :
+                                 (double)T * 10 * ebytes * (c.down ? 1 : 2);
+            for (uint32_t v = 0; v < n_var; v++) {
+                printf("  cold moe %-12s T=%u %-12s %7.1f us %6.1f GB/s (%.2f MB)\n", cases[k].name, T,
+                       n_vals ? vals[v] : "", best[v], bytes / best[v] / 1e3, bytes / 1e6);
+            }
+            if (n_vals) unsetenv(var);
+            a->used = used0;
+        }
+    }
+}
+
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {
     bench_ctx c = { .a = a };
@@ -4096,6 +4234,10 @@ int main(void) {
     }
     if (getenv("QWEN4_COLD_BENCH")) {
         bench_cold(&arena);
+        return 0;
+    }
+    if (getenv("QWEN4_MOE_COLD_BENCH")) {
+        bench_moe_cold(&arena);
         return 0;
     }
     if (getenv("QWEN4_BENCH")) {
