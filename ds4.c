@@ -58259,6 +58259,7 @@ typedef struct ds4_qwen4_gpu_graph {
     int32_t snap_mrope_delta;
     const ds4_vision_span *vis_spans;
     uint32_t mtp_last_rows;  /* rows of the last predictor pass resident in mtp_R */
+    float mtp_draft_p;       /* the predictor's probability of its last draft, -1 unknown */
     size_t vis_span_count;
     float *host_row;
     float *host_logits;
@@ -58639,8 +58640,8 @@ private_state:
         QWEN4_ALLOC(mtp_cat, 3u * (hc + 1u) * 2u * E);
         QWEN4_ALLOC(mtp_proj, 3u * (hc + 1u) * E);
         QWEN4_ALLOC(mtp_R, 3u * hc_dim);
-        QWEN4_ALLOC(mtp_argmax, 1u);
-        QWEN4_ALLOC(mtp_argmax_tmp, ((DS4_N_VOCAB + 4095u) / 4096u) * 2u);
+        QWEN4_ALLOC(mtp_argmax, 2u);
+        QWEN4_ALLOC(mtp_argmax_tmp, ((DS4_N_VOCAB + 4095u) / 4096u) * 4u);
         QWEN4_ALLOC(snap_ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
     }
 #undef QWEN4_ALLOC
@@ -60559,9 +60560,12 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     if (qwen4_spec_timing() >= 2) qwen4_mtp_time(QWEN4_MTP_T_HEAD, g_qwen4_mtp_mark);
     const double read_t0 = now_sec();
     ds4_gpu_tensor_free(last);
+    g->mtp_draft_p = -1.0f;
     if (ok && gpu_argmax) {
-        int32_t token = -1;
-        ok = ds4_gpu_tensor_read(g->mtp_argmax, 0, &token, sizeof(token)) != 0;
+        int32_t pick[2] = {-1, 0};
+        ok = ds4_gpu_tensor_read(g->mtp_argmax, 0, pick, sizeof(pick)) != 0;
+        int32_t token = pick[0];
+        if (ok) memcpy(&g->mtp_draft_p, &pick[1], sizeof(float));
         if (ok && (gathered || mapped)) {
             if (token < 0 || (uint32_t)token >= head_rows) ok = false;
             else token = gathered ? g->draft_ids[token] : g_qwen_mtp_draft_ids[token];
@@ -60755,9 +60759,12 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (ok) ok = ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp, g->logits, chain_head_rows) != 0;
     if (!ds4_gpu_end_commands()) ok = false;
     ds4_gpu_tensor_free(last);
+    g->mtp_draft_p = -1.0f;
     if (ok) {
-        int32_t token = -1;
-        ok = ds4_gpu_tensor_read(g->mtp_argmax, 0, &token, sizeof(token)) != 0;
+        int32_t pick[2] = {-1, 0};
+        ok = ds4_gpu_tensor_read(g->mtp_argmax, 0, pick, sizeof(pick)) != 0;
+        int32_t token = pick[0];
+        if (ok) memcpy(&g->mtp_draft_p, &pick[1], sizeof(float));
         if (ok && (token < 0 || (uint32_t)token >= chain_head_rows)) ok = false;
         if (ok && mapped) token = g_qwen_mtp_draft_ids[token];
         if (ok) *draft_out = token;
@@ -61824,6 +61831,10 @@ struct ds4_session {
     int glm_mtp_draft;
     int glm_mtp_draft2;    /* second pending draft (depth-3 cycles) */
     bool glm_mtp_have2;
+    float qwen4_draft_p, qwen4_draft2_p;   /* the predictor's probabilities of the pending drafts */
+    double qwen4_cycle_cost[4];   /* moving average wall time of 1-, 2- and 3-row cycles, 0 unmeasured */
+    int qwen4_cycle_depth;        /* rows of the cycle that just ran */
+    uint64_t qwen4_cycle_count, qwen4_cycle_last[4];   /* cycles run, and when each depth last ran */
     int glm_mtp_parent;
     int glm_mtp_have;
     /* rolling first-draft acceptance window for the adaptive draft depth */
@@ -75826,21 +75837,43 @@ static void qwen4_session_draft(ds4_session *s, uint32_t row, int parent, uint32
     if (qwen4_graph_mtp_step(&s->qwen4_graph, &s->engine->model, &s->engine->weights,
                              row, parent, idx, true, NULL, &d)) {
         s->glm_mtp_draft = d;
+        s->qwen4_draft_p = s->qwen4_graph.mtp_draft_p;
         s->glm_mtp_parent = parent;
         s->glm_mtp_have = 1;
     }
 }
 
-/* Draft depth policy for the Qwen3.8 cycle: DS4_QWEN4_MTP_DEPTH=2 or =3
- * forces a fixed depth (read per cycle so the A/B harnesses can switch it
- * per step); 0/auto, the default, drafts two tokens while the rolling
- * window of first-draft acceptances is strong and falls back to one.  The
- * first draft is identical at both depths, so the window is a comparable
- * signal across modes. */
-static int qwen4_spec_depth(ds4_session *s) {
+/* Draft depth policy for the Qwen3.8 cycle.  DS4_QWEN4_MTP_DEPTH=1, 2 or 3
+ * forces a depth (read per cycle so the A/B harnesses can switch it per
+ * step; 1 decodes plainly), =window keeps the earlier policy (two drafts
+ * only after eight first drafts in a row were accepted).  The default
+ * picks, per cycle, the depth with the most expected tokens per second:
+ * the predictor's probability of a draft is calibrated (on agent,
+ * Japanese and edit prompts a draft of probability p was accepted about p
+ * of the time, the chained second draft about p2), so a 2-row cycle
+ * commits 1 + p1 tokens and a 3-row one 1 + p1 + p1*p2, against the
+ * session's measured cost of each depth.  Without a probability (the
+ * batched predictor) the window policy decides. */
+static int qwen4_spec_depth_forced(void) {
     const char *env = getenv("DS4_QWEN4_MTP_DEPTH");
-    const int v = env && env[0] ? atoi(env) : 0;
-    if (v == 2 || v == 3) return v;
+    if (!env || !env[0]) return 0;
+    if (!strcmp(env, "window")) return -1;
+    const int v = atoi(env);
+    return v >= 1 && v <= 3 ? v : 0;
+}
+
+/* Cycle costs; an unmeasured depth is estimated from a measured one by the
+ * M3 Max ratios at 8K (a plain step with its draft 0.92, three rows 1.45 of
+ * a 2-row cycle). */
+static void qwen4_spec_costs(const ds4_session *s, double *c1, double *c2, double *c3) {
+    const double *c = s->qwen4_cycle_cost;
+    double two = c[2] > 0.0 ? c[2] : c[1] > 0.0 ? c[1] / 0.92 : c[3] > 0.0 ? c[3] / 1.45 : 1.0;
+    *c1 = c[1] > 0.0 ? c[1] : two * 0.92;
+    *c2 = two;
+    *c3 = c[3] > 0.0 ? c[3] : two * 1.45;
+}
+
+static int qwen4_spec_depth_window(ds4_session *s) {
     const uint32_t window = s->qwen4_depth_window & 255u;
     uint32_t bits = 0;
     for (uint32_t i = 0; i < 8u; i++) bits += (window >> i) & 1u;
@@ -75859,6 +75892,41 @@ static int qwen4_spec_depth(ds4_session *s) {
     return s->qwen4_depth3_engaged ? 3 : 2;
 }
 
+static int qwen4_spec_depth(ds4_session *s) {
+    const int forced = qwen4_spec_depth_forced();
+    if (forced > 0) return forced;
+    const int window = qwen4_spec_depth_window(s);
+    if (forced < 0 || !s->glm_mtp_have || s->qwen4_draft_p < 0.0f) return window;
+    double c1, c2, c3;
+    qwen4_spec_costs(s, &c1, &c2, &c3);
+    const double p1 = s->qwen4_draft_p;
+    const bool three = s->glm_mtp_have2 && s->qwen4_draft2_p >= 0.0f;
+    /* every 32 cycles a candidate depth that has not run for 32 runs once,
+     * so its cost stays measured rather than inferred */
+    const uint64_t n = s->qwen4_cycle_count;
+    if (three && n - s->qwen4_cycle_last[3] >= 32u) return 3;
+    if (n - s->qwen4_cycle_last[2] >= 32u) return 2;
+    /* A plain step pays for its own next draft, so on an M3 Max it beat a
+     * 2-row cycle only below p1 = 0.09, and choosing it on noisy costs lost
+     * more than it gained: the default never decodes plainly.  Three rows
+     * must beat two by 5%, a margin for the cost estimates. */
+    (void)c1;
+    const double two = (1.0 + p1) / c2;
+    return three && (1.0 + p1 + p1 * (double)s->qwen4_draft2_p) / c3 > 1.05 * two ? 3 : 2;
+}
+
+/* Chain a second draft after a first one of probability p1 (just drafted)?
+ * Only when a 3-row cycle could beat a 2-row one: p1*p2 > (1+p1)(r-1) with
+ * r the 3-row to 2-row cost ratio, so at best p1 > (r-1)/(2-r). */
+static bool qwen4_spec_chain(ds4_session *s, int depth) {
+    const int forced = qwen4_spec_depth_forced();
+    if (forced != 0 || s->qwen4_draft_p < 0.0f) return forced > 0 ? forced == 3 : depth == 3;
+    double c1, c2, c3;
+    qwen4_spec_costs(s, &c1, &c2, &c3);
+    const double r = c3 / c2;
+    return r < 2.0 && s->qwen4_draft_p > (r - 1.0) / (2.0 - r);
+}
+
 static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
     s->qwen4_depth_window = (s->qwen4_depth_window << 1u) | (accepted_first ? 1u : 0u);
     s->qwen4_depth_cycles++;
@@ -75871,10 +75939,35 @@ static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
  * it is the target argmax; exact sampling treats it as a point-mass proposal
  * (accept with p(draft), else replay a residual sample) and always runs at
  * depth 2. */
+static int ds4_session_qwen4_spec_cycle_once(ds4_session *s, int first_token, float temperature, int top_k,
+                                             float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+                                             int *accepted, int accepted_cap,
+                                             char *err, size_t errlen);
+
+/* times each cycle by its depth for the depth policy */
 static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float temperature, int top_k,
                                         float top_p, float min_p, uint64_t *rng, bool exact_sampling,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+    const double t0 = now_sec();
+    const int rc = ds4_session_qwen4_spec_cycle_once(s, first_token, temperature, top_k, top_p, min_p, rng,
+                                                    exact_sampling, accepted, accepted_cap, err, errlen);
+    const int d = s->qwen4_cycle_depth;
+    if (rc > 0 && d >= 1 && d <= 3) {
+        const double dt = now_sec() - t0;
+        double *c = &s->qwen4_cycle_cost[d];
+        *c = *c > 0.0 ? 0.9 * *c + 0.1 * dt : dt;
+        s->qwen4_cycle_last[d] = ++s->qwen4_cycle_count;
+        if (qwen4_spec_trace()) fprintf(stderr, "ds4: spec cycle depth %d %.2f ms tokens %d costs %.2f %.2f %.2f\n", d, 1e3 * dt, rc,
+                                        1e3 * s->qwen4_cycle_cost[1], 1e3 * s->qwen4_cycle_cost[2], 1e3 * s->qwen4_cycle_cost[3]);
+    }
+    return rc;
+}
+
+static int ds4_session_qwen4_spec_cycle_once(ds4_session *s, int first_token, float temperature, int top_k,
+                                             float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+                                             int *accepted, int accepted_cap,
+                                             char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     const ds4_model *m = &e->model;
@@ -75882,8 +75975,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     if (qwen4_session_replay_if_stale(s, err, errlen) != 0) return -1;
     const uint32_t pos = g->pos;
     const uint32_t V = DS4_N_VOCAB;
-    const int depth = (exact_sampling && temperature > 0.0f) || getenv("DS4_QWEN4_NO_MTP_BATCH") != NULL
-        ? 2 : qwen4_spec_depth(s);
+    const bool pinned = (exact_sampling && temperature > 0.0f) || getenv("DS4_QWEN4_NO_MTP_BATCH") != NULL;
+    const int depth = pinned ? 2 : qwen4_spec_depth(s);
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
     if (depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 && !g->snap2_ple_hist &&
         accepted_cap >= 3 && pos + 3u <= g->ctx_cap && g->cap_tokens >= 3u) {
@@ -75892,8 +75985,10 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     const bool deep = depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 &&
         accepted_cap >= 3 && pos + 3u <= g->ctx_cap && g->cap_tokens >= 3u &&
         g->mtp_R && g->snap2_ple_hist != NULL;
-    if (!s->glm_mtp_have || accepted_cap < 2 || pos + 2u > g->ctx_cap ||
+    s->qwen4_cycle_depth = 0;
+    if (depth == 1 || !s->glm_mtp_have || accepted_cap < 2 || pos + 2u > g->ctx_cap ||
         g->cap_tokens < 2u || !g->mtp_R || !qwen4_graph_fused(g, 2u)) {
+        s->qwen4_cycle_depth = 1;
         /* the prompt's last nextn row, now that its next token is known */
         if (qwen4_mtp_fill_on() && !qwen4_graph_mtp_fill_tail(g, m, w, pos, first_token)) {
             snprintf(err, errlen, "Qwen3.8 MTP fill failed at token %u", pos);
@@ -75908,12 +76003,14 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         s->glm_mtp_have2 = false;
         if (qwen4_graph_mtp_step(&s->qwen4_graph, m, w, 0, parent, pos, true, NULL, &draft)) {
             s->glm_mtp_draft = draft;
+            s->qwen4_draft_p = g->mtp_draft_p;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
-            if (depth == 3 && pos + 2u <= g->ctx_cap) {
+            if (!pinned && qwen4_spec_chain(s, depth) && pos + 2u <= g->ctx_cap) {
                 int draft2 = -1;
                 if (qwen4_graph_mtp_chain_step(&s->qwen4_graph, m, w, draft, pos + 1u, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
+                    s->qwen4_draft2_p = g->mtp_draft_p;
                     s->glm_mtp_have2 = true;
                 }
             }
@@ -75930,6 +76027,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     const int d2 = deep ? s->glm_mtp_draft2 : -1;
     const int toks[3] = { first_token, d, d2 };
     const uint32_t T = deep ? 3u : 2u;
+    s->qwen4_cycle_depth = (int)T;
     /* Three verifier rows plus the logits before the block, for exact rewinds. */
     if (!s->qwen4_verify_logits) s->qwen4_verify_logits = xmalloc(4u * (size_t)V * sizeof(float));
     float *rows = s->qwen4_verify_logits;
@@ -75998,8 +76096,9 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         else if (accept) s->qwen4_reject2_streak++;
     }
     if (qwen4_spec_trace()) {
-        fprintf(stderr, "ds4: spec pos %u token %d draft %d %s%s\n", pos, first_token, d,
-                accept ? "accept" : "reject", deep ? (accept2 ? " +accept2" : " +reject2") : "");
+        fprintf(stderr, "ds4: spec pos %u token %d draft %d p %.4f %s%s p2 %.4f\n", pos, first_token, d,
+                s->qwen4_draft_p, accept ? "accept" : "reject",
+                deep ? (accept2 ? " +accept2" : " +reject2") : "", deep ? s->qwen4_draft2_p : -1.0f);
     }
     if (accept && (!deep || accept2)) {
         token_vec_push(&s->checkpoint, d);
@@ -76023,12 +76122,14 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         }
         if (have_next) {
             s->glm_mtp_draft = draft;
+            s->qwen4_draft_p = g->mtp_draft_p;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
-            if (depth == 3 && g->pos + 1u < g->ctx_cap) {
+            if (!pinned && qwen4_spec_chain(s, depth) && g->pos + 1u < g->ctx_cap) {
                 int draft2 = -1;
                 if (qwen4_graph_mtp_chain_step(g, m, w, draft, g->pos, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
+                    s->qwen4_draft2_p = g->mtp_draft_p;
                     s->glm_mtp_have2 = true;
                 }
             }
@@ -76054,12 +76155,14 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         int draft = -1;
         if (qwen4_graph_mtp_steps(g, m, w, 0, next_tokens, 2u, pos, true, NULL, &draft)) {
             s->glm_mtp_draft = draft;
+            s->qwen4_draft_p = g->mtp_draft_p;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
-            if (depth == 3 && g->pos + 1u < g->ctx_cap) {
+            if (!pinned && qwen4_spec_chain(s, depth) && g->pos + 1u < g->ctx_cap) {
                 int draft2 = -1;
                 if (qwen4_graph_mtp_chain_step(g, m, w, draft, g->pos, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
+                    s->qwen4_draft2_p = g->mtp_draft_p;
                     s->glm_mtp_have2 = true;
                 }
             }
@@ -76093,12 +76196,14 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         int draft = -1;
         if (qwen4_graph_mtp_step(g, m, w, 0, parent, pos, true, NULL, &draft)) {
             s->glm_mtp_draft = draft;
+            s->qwen4_draft_p = g->mtp_draft_p;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
-            if (depth == 3 && pos + 2u <= g->ctx_cap) {
+            if (!pinned && qwen4_spec_chain(s, depth) && pos + 2u <= g->ctx_cap) {
                 int draft2 = -1;
                 if (qwen4_graph_mtp_chain_step(g, m, w, draft, pos + 1u, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
+                    s->qwen4_draft2_p = g->mtp_draft_p;
                     s->glm_mtp_have2 = true;
                 }
             }
@@ -81882,6 +81987,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             for (int i = 0; i < count; i++) {
                 ds4_session *s = items[i].session;
                 s->glm_mtp_draft = drafts[i];
+                s->qwen4_draft_p = -1.0f;
                 s->glm_mtp_parent = parents[i];
                 s->glm_mtp_have = 1;
             }

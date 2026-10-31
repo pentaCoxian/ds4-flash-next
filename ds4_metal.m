@@ -50694,8 +50694,8 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
     struct { uint32_t n, finish; } args = {n_vocab, 0};
     qwen4_bind b[3];
     if (!qwen4_bind_tensor(&b[0], logits, (uint64_t)n_vocab * sizeof(float), "argmax logits") ||
-        !qwen4_bind_tensor(&b[1], scratch, (uint64_t)chunks * 8u, "argmax partials") ||
-        !qwen4_bind_tensor(&b[2], out_idx, sizeof(int32_t), "argmax index")) return 0;
+        !qwen4_bind_tensor(&b[1], scratch, (uint64_t)chunks * 16u, "argmax partials") ||
+        !qwen4_bind_tensor(&b[2], out_idx, 2u * sizeof(int32_t), "argmax index and probability")) return 0;
     if (!qwen4_dispatch(QWEN4_K_ARGMAX, &args, sizeof(args), b, 3,
                        MTLSizeMake(chunks, 1, 1), MTLSizeMake(256, 1, 1), 0)) return 0;
     args.n = chunks;

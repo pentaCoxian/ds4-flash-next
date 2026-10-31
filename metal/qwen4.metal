@@ -5479,12 +5479,22 @@ kernel void kernel_qwen4_gdn_front(
 
 /* The predictor needs a token ID, not a CPU copy of the entire vocabulary.
  * First reduce independent 4096-value chunks; then merge their winners.
- * The -1e30 initial score and index-zero fallback match sample_argmax. */
+ * The -1e30 initial score and index-zero fallback match sample_argmax.
+ * Alongside, an online softmax keeps each chunk's maximum and sum of
+ * exp(v - max), so the merge also gives the winner's probability
+ * 1 / sum(exp(v - top)), which the MTP depth policy reads (out[1]). */
 struct qwen4_argmax_args { uint n, finish; };
+
+static inline void qwen4_lse_merge(thread float &m, thread float &s, float m2, float s2) {
+    const float mm = max(m, m2);
+    s = (m == -INFINITY ? 0.0f : s * exp(m - mm)) + (m2 == -INFINITY ? 0.0f : s2 * exp(m2 - mm));
+    m = mm;
+}
+
 kernel void kernel_qwen4_argmax(
         constant qwen4_argmax_args &args,
         device const float *logits,
-        device uint2 *partials,
+        device uint4 *partials,
         device int *out_idx,
         uint group [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
@@ -5494,26 +5504,40 @@ kernel void kernel_qwen4_argmax(
     const uint end = args.finish ? args.n : min(begin + 4096u, args.n);
     float best = -1.0e30f;
     uint index = 0;
+    float lm = -INFINITY, ls = 0.0f;
     for (uint i = begin + tid; i < end; i += 256u) {
-        const uint2 p = args.finish ? partials[i] : uint2(as_type<uint>(logits[i]), i);
+        const uint4 p = args.finish ? partials[i] : uint4(as_type<uint>(logits[i]), i, 0u, 0u);
         if ((p.x & 0x7fffffffu) > 0x7f800000u) continue;
         const float v = as_type<float>(p.x);
         if (v > best || (v == best && p.y < index)) { best = v; index = p.y; }
+        if (args.finish) qwen4_lse_merge(lm, ls, as_type<float>(p.z), as_type<float>(p.w));
+        else qwen4_lse_merge(lm, ls, v, 1.0f);
     }
     float top = simd_max(best);
     uint winner = simd_min(best == top ? index : 0xffffffffu);
+    float gm = simd_max(lm);
+    float gs = simd_sum(lm == -INFINITY ? 0.0f : ls * exp(lm - gm));
     threadgroup float scores[8];
     threadgroup uint indices[8];
-    if (!lane) { scores[sg] = top; indices[sg] = winner; }
+    threadgroup float lmax[8], lsum[8];
+    if (!lane) { scores[sg] = top; indices[sg] = winner; lmax[sg] = gm; lsum[sg] = gs; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!sg) {
         best = lane < 8u ? scores[lane] : -1.0e30f;
         index = lane < 8u ? indices[lane] : 0u;
+        lm = lane < 8u ? lmax[lane] : -INFINITY;
+        ls = lane < 8u ? lsum[lane] : 0.0f;
         top = simd_max(best);
         winner = simd_min(best == top ? index : 0xffffffffu);
+        gm = simd_max(lm);
+        gs = simd_sum(lm == -INFINITY ? 0.0f : ls * exp(lm - gm));
         if (!lane) {
-            if (args.finish) out_idx[0] = (int)winner;
-            else partials[group] = uint2(as_type<uint>(top), winner);
+            if (args.finish) {
+                out_idx[0] = (int)winner;
+                out_idx[1] = as_type<int>(gs > 0.0f ? exp(top - gm) / gs : 0.0f);
+            } else {
+                partials[group] = uint4(as_type<uint>(top), winner, as_type<uint>(gm), as_type<uint>(gs));
+            }
         }
     }
 }

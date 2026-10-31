@@ -2019,14 +2019,16 @@ static void test_decode_fusions(arena_t *a) {
     printf("Qwen decode fusions: exact residual/injection and Q8 checks passed\n");
 }
 
-/* Match host greedy selection at SIMD/chunk boundaries and on exceptional values. */
+/* Match host greedy selection at SIMD/chunk boundaries and on exceptional
+ * values; the winner's softmax probability (out[1]) matches the CPU's for
+ * finite logits. */
 static void test_qwen4_argmax(void) {
     const uint32_t sizes[] = {1u, 31u, 32u, 33u, 255u, 256u, 257u, 4095u, 4096u, 4097u, 248320u};
     for (uint32_t shape = 0; shape < sizeof(sizes) / sizeof(sizes[0]); shape++) {
         const uint32_t n = sizes[shape], chunks = (n + 4095u) / 4096u, guard = 7u;
         float *v = rand_vec(n, 10.0f);
-        ds4_gpu_tensor *x = upload(NULL, n), *tmp = upload(NULL, chunks * 2u + guard);
-        ds4_gpu_tensor *out = upload(NULL, 1u + guard);
+        ds4_gpu_tensor *x = upload(NULL, n), *tmp = upload(NULL, chunks * 4u + guard);
+        ds4_gpu_tensor *out = upload(NULL, 2u + guard);
         for (uint32_t mode = 0; mode < 8u; mode++) {
             if (mode == 1u) { for (uint32_t j = 0; j < n; j++) v[j] = -3.0f; v[n / 2u] = v[n - 1u] = 11.0f; }
             if (mode == 2u) {
@@ -2053,16 +2055,26 @@ static void test_qwen4_argmax(void) {
                 if (v[j] > best) { best = v[j]; expected = j; }
             }
             require_ok(ds4_gpu_tensor_write(x, 0, v, n * sizeof(float)) &&
-                ds4_gpu_tensor_fill_f32(tmp, 17.25f, chunks * 2u + guard) &&
-                ds4_gpu_tensor_fill_f32(out, 17.25f, 1u + guard) &&
+                ds4_gpu_tensor_fill_f32(tmp, 17.25f, chunks * 4u + guard) &&
+                ds4_gpu_tensor_fill_f32(out, 17.25f, 2u + guard) &&
                 ds4_gpu_begin_commands() && ds4_gpu_qwen4_argmax_tensor(out, tmp, x, n) &&
                 ds4_gpu_end_commands(), "Qwen argmax dispatch");
             uint32_t got;
             require_ok(ds4_gpu_tensor_read(out, 0, &got, sizeof(got)) && got == expected, "Qwen argmax index");
+            if (mode == 0u || mode == 1u || mode == 3u || mode == 4u || mode == 6u) {
+                double sum = 0.0;
+                for (uint32_t j = 0; j < n; j++) sum += exp((double)v[j] - (double)best);
+                float prob;
+                require_ok(ds4_gpu_tensor_read(out, sizeof(uint32_t), &prob, sizeof(prob)), "argmax probability read");
+                if (fabs(prob - 1.0 / sum) > 1e-4 * (1.0 / sum) + 1e-6) {
+                    fprintf(stderr, "argmax n=%u mode=%u: probability %.7g, CPU %.7g\n", n, mode, prob, 1.0 / sum);
+                    exit(1);
+                }
+            }
             float tail[7];
-            require_ok(ds4_gpu_tensor_read(out, sizeof(uint32_t), tail, sizeof(tail)), "argmax output guard read");
+            require_ok(ds4_gpu_tensor_read(out, 2u * sizeof(uint32_t), tail, sizeof(tail)), "argmax output guard read");
             for (uint32_t j = 0; j < guard; j++) require_ok(tail[j] == 17.25f, "argmax output guard");
-            require_ok(ds4_gpu_tensor_read(tmp, chunks * 8u, tail, sizeof(tail)), "argmax scratch guard read");
+            require_ok(ds4_gpu_tensor_read(tmp, chunks * 16u, tail, sizeof(tail)), "argmax scratch guard read");
             for (uint32_t j = 0; j < guard; j++) require_ok(tail[j] == 17.25f, "argmax scratch guard");
         }
         require_ok(!ds4_gpu_qwen4_argmax_tensor(out, tmp, x, 0u) &&
