@@ -58981,7 +58981,10 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
     }
-    if (T == 3u && g->verify_rows_exact) {
+    /* BF16 up rows take the same rows kernel at one, two and three tokens,
+     * and each token's sums there do not depend on the batch (fixed lane
+     * walk, per-token accumulators), so they need no split. */
+    if (T == 3u && g->verify_rows_exact && (up->type != DS4_TENSOR_BF16 || getenv("DS4_QWEN4_EXACT_HC_SPLIT"))) {
         /* Split the 3-row gate/mix into the exact 2-row pair kernel plus the
          * 1-row generic kernel, so every row matches its T <= 2 rounding. */
         const uint64_t dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
