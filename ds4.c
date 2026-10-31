@@ -40054,6 +40054,12 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx);
  * absolute position.  DS4_QWEN4_IK_FULL=1 does so on Metal too, as the
  * reference to check the ring against. */
 #define QWEN4_IK_TAIL 4u
+#define QWEN4_SPLIT_ATTN_ROWS 16u
+
+/* rows of the split-attention partials: the graph's chunk, 3 to 16 */
+static uint32_t qwen4_split_attn_rows(uint32_t cap_tokens) {
+    return cap_tokens < 3u ? 3u : cap_tokens > QWEN4_SPLIT_ATTN_ROWS ? QWEN4_SPLIT_ATTN_ROWS : cap_tokens;
+}
 static uint32_t qwen4_ik_cache_rows(uint32_t ctx_cap, uint32_t cap_tokens) {
 #if defined(__APPLE__)
     const uint64_t ring = (uint64_t)cap_tokens + 8u;
@@ -58597,7 +58603,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(vp, T * kv_dim);
     QWEN4_ALLOC(iq, T * iq_dim);
     QWEN4_ALLOC(ik, T * DS4_N_INDEXER_HEAD_DIM);
-    QWEN4_ALLOC(attn_part, ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM));
+    QWEN4_ALLOC(attn_part, ds4_gpu_qwen4_attn_part_floats(qwen4_split_attn_rows(T), DS4_N_HEAD, DS4_N_HEAD_DIM));
     QWEN4_ALLOC(q, T * q_dim);
     QWEN4_ALLOC(gate, T * q_dim);
     QWEN4_ALLOC(iqn, T * iq_dim);
@@ -59411,6 +59417,17 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
  * complete blocks than the budget attend densely; the rest score the pooled
  * block keys and attend their top-k blocks plus the incomplete tail.  The
  * chunk is split at that boundary so every selection list stays bounded. */
+/* Chunks of up to QWEN4_SPLIT_ATTN_ROWS rows (decode, MTP and wide
+ * verifies) split each row's keys across threadgroups and merge the
+ * partial softmaxes; larger chunks keep the per-row and matrix kernels.
+ * Unsplit, a three-row chunk at 8K took 16 ms of attention against 7 for
+ * two rows on an M3 Max. */
+static ds4_gpu_tensor *qwen4_split_attn_part(ds4_qwen4_gpu_graph *g, uint32_t cT) {
+    static int rows = -1;
+    if (rows < 0) rows = getenv("DS4_QWEN4_NO_SPLIT_ATTN_ROWS") ? 2 : (int)qwen4_split_attn_rows(g->cap_tokens);
+    return cT <= (uint32_t)rows ? g->attn_part : NULL;
+}
+
 /* Dense-prefix + sparse-tail attention core for rows [0,T) of the given row
  * views at absolute position cpos0.  n_blocks_after covers the whole chunk
  * (the caller writes the pooled block keys once). */
@@ -59426,7 +59443,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     const uint32_t n_dense = clast < sparse_pos ? cT : (sparse_pos > cpos0 ? sparse_pos - cpos0 : 0u);
     if (n_dense > 0 &&
         !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il], g->layer_v_cache[il],
-                                          g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_dense,
+                                          g->sel_tokens, g->n_sel, qwen4_split_attn_part(g, cT), n_dense,
                                           DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, cpos0, false, g->sel_stride,
                                           scale)) {
         return false;
@@ -59452,7 +59469,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
                                         sp0, g->sel_stride) &&
         ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
-                                         g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_sparse,
+                                         g->sel_tokens, g->n_sel, qwen4_split_attn_part(g, cT), n_sparse,
                                          DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, sp0, true, g->sel_stride,
                                          scale);
     ds4_gpu_tensor_free(iqn);
