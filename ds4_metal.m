@@ -48639,6 +48639,15 @@ enum {
     QWEN4_K_MOE_MID_IQ4_XS,
     QWEN4_K_MOE_DOWN_IQ4_NL,
     QWEN4_K_ROUTER_SG,
+    QWEN4_K_HC_NORM_DOWN_NT1,
+    QWEN4_K_HC_NORM_DOWN_NT2,
+    QWEN4_K_HC_NORM_DOWN_NT3,
+    QWEN4_K_HC_COMBINE_NORM_DOWN_NT1,
+    QWEN4_K_HC_COMBINE_NORM_DOWN_NT2,
+    QWEN4_K_HC_COMBINE_NORM_DOWN_NT3,
+    QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE,
+    QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE_NT2,
+    QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE_NT3,
     QWEN4_K_COUNT,
 };
 
@@ -48773,6 +48782,15 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mid_iq4_xs",
     "kernel_qwen4_moe_down_iq4_nl",
     "kernel_qwen4_router_topk_sg",
+    "kernel_qwen4_hc_norm_down_nt1",
+    "kernel_qwen4_hc_norm_down_nt2",
+    "kernel_qwen4_hc_norm_down_nt3",
+    "kernel_qwen4_hc_combine_norm_down_nt1",
+    "kernel_qwen4_hc_combine_norm_down_nt2",
+    "kernel_qwen4_hc_combine_norm_down_nt3",
+    "kernel_qwen4_hc_gate_mix_bf16_rows_store",
+    "kernel_qwen4_hc_gate_mix_bf16_rows_store_nt2",
+    "kernel_qwen4_hc_gate_mix_bf16_rows_store_nt3",
 };
 
 typedef struct {
@@ -49013,6 +49031,72 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
         MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
+/* The hc norm and its BF16 low-rank down projection in one dispatch
+ * (kernel_qwen4_hc_norm_down): xn and the inject partials come out as from
+ * ds4_gpu_qwen4_hc_norm_tensor and lo within rounding of the BF16 matvec.
+ * With blk the combine of ds4_gpu_qwen4_hc_combine_tensor comes first, its
+ * streams left in next_R (see ds4_gpu.h).  1 to 3 tokens, four streams,
+ * BF16 inject and down rows; 0 otherwise, and the caller runs the separate
+ * kernels.  Apple9 default; DS4_QWEN4_HC_NORM_DOWN=0/1 overrides on any
+ * device. */
+/* low-rank rows per matvec group: QWEN4_HC_DOWN_ROWS in metal/qwen4.metal */
+#define DS4_QWEN4_HC_DOWN_ROWS 2u
+
+int ds4_gpu_qwen4_hc_norm_down_tensor(
+        ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, ds4_gpu_tensor *lo, const ds4_gpu_tensor *R,
+        const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
+        uint32_t inject_type, uint64_t down_offset, uint32_t down_type, uint32_t n_tokens, uint32_t n_embd,
+        uint32_t n_hc, uint32_t n_inject, uint32_t n_rank, float eps,
+        const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj, ds4_gpu_tensor *next_R) {
+    const int override = ds4_gpu_env_bool("DS4_QWEN4_HC_NORM_DOWN");
+    if (!(override >= 0 ? override > 0 : g_metal_apple_family == 9)) return 0;
+    const uint64_t dim = (uint64_t)n_embd * n_hc;
+    const bool combine = blk != NULL;
+    if (n_tokens == 0 || n_tokens > 3u || n_hc != 4u || n_inject > 4u || (n_inject && inject_type != 30u) ||
+        down_type != 30u || (n_embd % 8u) != 0 || n_rank == 0 || (n_rank % DS4_QWEN4_HC_DOWN_ROWS) != 0) return 0;
+    /* the combine reads R and old_inj while other groups write next_R and inj_part */
+    if (combine && (!old_inj || !next_R || n_inject != n_hc ||
+                    ds4_gpu_tensor_buffer(next_R) == ds4_gpu_tensor_buffer(R) ||
+                    ds4_gpu_tensor_buffer(inj_part) == ds4_gpu_tensor_buffer(old_inj))) return 0;
+    struct { uint32_t n_tokens, n_embd, n_hc, n_inject; float eps; uint32_t n_rank, n_down_tgs, pad0; } args =
+        { n_tokens, n_embd, n_hc, n_inject, eps, n_rank, n_rank / DS4_QWEN4_HC_DOWN_ROWS, 0 };
+    qwen4_bind b[10];
+    if (!qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "hc norm input") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, dim * sizeof(float), "hc norm gamma") ||
+        !qwen4_bind_tensor(&b[3], xn, n_tokens * dim * sizeof(float), "hc norm output") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, down_offset, (uint64_t)n_rank * dim * 2u, "hc down rows") ||
+        !qwen4_bind_tensor(&b[6], lo, (uint64_t)n_tokens * n_rank * sizeof(float), "hc low-rank output")) {
+        return 0;
+    }
+    if (n_inject) {
+        if (!qwen4_bind_weight(&b[2], model_map, model_size, inject_offset, (uint64_t)n_inject * dim * 2u, "hc inject") ||
+            !qwen4_bind_tensor(&b[4], inj_part,
+                               (uint64_t)n_tokens * n_hc * DS4_QWEN4_HC_CHUNKS * n_inject * sizeof(float),
+                               "hc inject partials")) {
+            return 0;
+        }
+    } else {
+        b[2] = b[1];
+        b[4] = b[3];
+    }
+    if (combine) {
+        if (!qwen4_bind_tensor(&b[7], blk, (uint64_t)n_tokens * n_embd * sizeof(float), "hc combine block output") ||
+            !qwen4_bind_tensor(&b[8], old_inj, (uint64_t)n_tokens * n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float),
+                               "hc combine inject") ||
+            !qwen4_bind_tensor(&b[9], next_R, n_tokens * dim * sizeof(float), "hc combined residual")) {
+            return 0;
+        }
+    } else {
+        b[7] = b[0];
+        b[8] = b[0];
+        b[9] = b[3];
+    }
+    const int kernel = (combine ? QWEN4_K_HC_COMBINE_NORM_DOWN_NT1 : QWEN4_K_HC_NORM_DOWN_NT1) + (int)n_tokens - 1;
+    return qwen4_dispatch(kernel, &args, sizeof(args), b, 10,
+                          MTLSizeMake(n_rank / DS4_QWEN4_HC_DOWN_ROWS + n_tokens * n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1),
+                          MTLSizeMake(128, 1, 1), 0);
+}
+
 int ds4_gpu_qwen4_hc_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
@@ -49067,7 +49151,7 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     const uint64_t dim = (uint64_t)n_embd * n_hc;
     const uint64_t wrow = qwen4_hc_row_bytes(weight_type, n_rank);
     struct { uint32_t n_tokens, n_embd, n_hc, n_rank; } args = { n_tokens, n_embd, n_hc, n_rank };
-    qwen4_bind b[4];
+    qwen4_bind b[8];
     if (n_tokens == 0 || n_hc != 4 || (n_rank % 4) != 0 || wrow == 0 || (weight_type == 8u && (n_rank % 32) != 0) ||
         !qwen4_bind_tensor(&b[0], xn, n_tokens * dim * sizeof(float), "hc gate input") ||
         !qwen4_bind_tensor(&b[1], lo, (uint64_t)n_tokens * n_rank * sizeof(float), "hc gate lowrank") ||
@@ -49096,7 +49180,8 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         const uint32_t nt = n_tokens == 2u || n_tokens == 4u ? 2u : n_tokens >= 3u ? 3u : 1u;
         const int rows_kernel = nt == 3u ? QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT3 :
                                 nt == 2u ? QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT2 : QWEN4_K_HC_GATE_MIX_BF16_ROWS;
-        return qwen4_dispatch(rows_kernel, &args, sizeof(args), b, 4,
+        b[4] = b[5] = b[6] = b[7] = b[3];   /* the store buffers, unused */
+        return qwen4_dispatch(rows_kernel, &args, sizeof(args), b, 8,
                               MTLSizeMake((n_embd + rows_ptg - 1u) / rows_ptg, (n_tokens + nt - 1u) / nt, 1),
                               MTLSizeMake(128, 1, 1), (NSUInteger)nt * n_rank * sizeof(float));
     }
@@ -49109,6 +49194,37 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 4,
                           MTLSizeMake((n_embd + nsg - 1u) / nsg, pair ? 1u : n_tokens, 1), MTLSizeMake(nsg * 32u, 1, 1),
                           pair ? (NSUInteger)n_rank * 2u * sizeof(float) : 0u);
+}
+
+/* The BF16 rows gate mix of 1 to 3 tokens after a combining norm + down
+ * (ds4_gpu_qwen4_hc_norm_down_tensor with blk): the same mix, whose threads
+ * also copy the combined streams and inject partials over R and inj.
+ * Returns 0, having encoded nothing, where the rows kernel does not apply. */
+int ds4_gpu_qwen4_hc_gate_mix_store_tensor(
+        ds4_gpu_tensor *mixed, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *lo,
+        const void *model_map, uint64_t model_size, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_rank,
+        ds4_gpu_tensor *R, const ds4_gpu_tensor *R_next, ds4_gpu_tensor *inj, const ds4_gpu_tensor *inj_next) {
+    const uint64_t dim = (uint64_t)n_embd * n_hc;
+    const uint64_t n_inj = (uint64_t)n_tokens * n_hc * DS4_QWEN4_HC_CHUNKS * n_hc;
+    struct { uint32_t n_tokens, n_embd, n_hc, n_rank; } args = { n_tokens, n_embd, n_hc, n_rank };
+    qwen4_bind b[8];
+    if (weight_type != 30u || getenv("DS4_QWEN4_NO_HC_MIX_ROWS") != NULL ||
+        n_tokens == 0 || n_tokens > 3u || n_hc != 4 || (n_rank % 4) != 0 || (dim % 4) != 0 ||
+        !qwen4_bind_tensor(&b[0], xn, n_tokens * dim * sizeof(float), "hc gate input") ||
+        !qwen4_bind_tensor(&b[1], lo, (uint64_t)n_tokens * n_rank * sizeof(float), "hc gate lowrank") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, up_offset, dim * n_rank * 2u, "hc up") ||
+        !qwen4_bind_tensor(&b[3], mixed, (uint64_t)n_tokens * n_embd * sizeof(float), "hc mixed") ||
+        !qwen4_bind_tensor(&b[4], R, n_tokens * dim * sizeof(float), "hc residual") ||
+        !qwen4_bind_tensor(&b[5], R_next, n_tokens * dim * sizeof(float), "hc combined residual") ||
+        !qwen4_bind_tensor(&b[6], inj, n_inj * sizeof(float), "hc inject partials") ||
+        !qwen4_bind_tensor(&b[7], inj_next, n_inj * sizeof(float), "hc combined inject partials")) {
+        return 0;
+    }
+    const uint32_t rows_ptg = 4u * 4u;
+    return qwen4_dispatch(QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE + (int)n_tokens - 1, &args, sizeof(args), b, 8,
+                          MTLSizeMake((n_embd + rows_ptg - 1u) / rows_ptg, 1, 1),
+                          MTLSizeMake(128, 1, 1), (NSUInteger)n_tokens * n_rank * sizeof(float));
 }
 
 int ds4_gpu_qwen4_hc_combine_tensor(

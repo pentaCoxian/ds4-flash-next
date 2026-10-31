@@ -1173,6 +1173,197 @@ static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
     free(w); free(sel); ds4_gpu_tensor_free(gw); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gl); free(logits);
 }
 
+/* The fused hc norm + BF16 down projection (DS4_QWEN4_HC_NORM_DOWN) gives
+ * xn and the inject partials bit-identical to the norm kernel, and lo within
+ * rounding of the BF16 matvec (its sums are pinned, the matvec's are not). */
+static void test_hc_norm_down_exact(arena_t *a, uint32_t T, bool inject) {
+    const uint32_t E = 2560, hc = 4, dim = E * hc, rank = 320, chunks = 8;
+    double *sh;
+    const uint64_t gamma_off = arena_f32(a, dim, &sh, 0.5f, 1.5f); free(sh);
+    const uint64_t inj_off = arena_bf16(a, (uint64_t)hc * dim, &sh, 0.05f); free(sh);
+    const uint64_t down_off = arena_bf16(a, (uint64_t)rank * dim, &sh, 0.05f); free(sh);
+    float *r = rand_vec((uint64_t)T * dim, 2.0f);
+    ds4_gpu_tensor *gR = upload(r, (uint64_t)T * dim);
+    float *out[2][3];
+    for (int v = 0; v < 2; v++) {
+        setenv("DS4_QWEN4_HC_NORM_DOWN", v ? "1" : "0", 1);
+        ds4_gpu_tensor *gxn = upload(NULL, (uint64_t)T * dim), *ginj = upload(NULL, (uint64_t)T * hc * chunks * hc);
+        ds4_gpu_tensor *glo = upload(NULL, (uint64_t)T * rank);
+        const uint32_t ni = inject ? hc : 0u;
+        int ok = ds4_gpu_begin_commands();
+        if (v) ok = ok && ds4_gpu_qwen4_hc_norm_down_tensor(gxn, ginj, glo, gR, a->base, a->size, gamma_off, inj_off, 30u,
+                                                            down_off, 30u, T, E, hc, ni, rank, 1e-6f,
+                                                            NULL, NULL, NULL);
+        else ok = ok && ds4_gpu_qwen4_hc_norm_tensor(gxn, ginj, gR, a->base, a->size, gamma_off, inj_off, 30u, T, E, hc, ni, 1e-6f) &&
+                  ds4_gpu_matmul_quant_tensor(glo, a->base, a->size, down_off, 30u, dim, rank, gxn, T);
+        require_ok(ok && ds4_gpu_end_commands(), "hc norm down");
+        out[v][0] = download(gxn, (uint64_t)T * dim);
+        out[v][1] = download(ginj, (uint64_t)T * hc * chunks * hc);
+        out[v][2] = download(glo, (uint64_t)T * rank);
+        ds4_gpu_tensor_free(gxn); ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(glo);
+    }
+    unsetenv("DS4_QWEN4_HC_NORM_DOWN");
+    const uint64_t n[3] = { (uint64_t)T * dim, inject ? (uint64_t)T * hc * chunks * hc : 0u, (uint64_t)T * rank };
+    const char *what[3] = { "xn", "inject partials", "lo" };
+    for (int k = 0; k < 3; k++) {
+        uint64_t diff = 0;
+        double scale = 0.0, worst = 0.0;
+        for (uint64_t i = 0; i < n[k]; i++) {
+            if (fabs(out[0][k][i]) > scale) scale = fabs(out[0][k][i]);
+            if (fabs(out[0][k][i] - out[1][k][i]) > worst) worst = fabs(out[0][k][i] - out[1][k][i]);
+            diff += memcmp(&out[0][k][i], &out[1][k][i], 4) != 0;
+        }
+        if (k == 2) {
+            if (worst > 1e-5 * scale) {
+                fprintf(stderr, "hc norm down T=%u: lo max|d| %.3g of %.3g\n", T, worst, scale);
+                exit(1);
+            }
+            continue;
+        }
+        if (diff) {
+            fprintf(stderr, "hc norm down T=%u inject=%d: %s differs in %llu of %llu\n", T, inject, what[k],
+                    (unsigned long long)diff, (unsigned long long)n[k]);
+            exit(1);
+        }
+    }
+    printf("  hc norm + down fused T=%u inject=%d              ok  xn and inject partials bit-identical\n", T, inject);
+    for (int v = 0; v < 2; v++) for (int k = 0; k < 3; k++) free(out[v][k]);
+    ds4_gpu_tensor_free(gR); free(r);
+}
+
+/* The fused kernel's 2- and 3-token variants give every token the bits of
+ * the 1-token variant, so MTP verify rows round as decode rows. */
+static void test_hc_norm_down_rows(arena_t *a) {
+    const uint32_t E = 2560, hc = 4, dim = E * hc, rank = 320;
+    double *sh;
+    const uint64_t gamma_off = arena_f32(a, dim, &sh, 0.5f, 1.5f); free(sh);
+    const uint64_t inj_off = arena_bf16(a, (uint64_t)hc * dim, &sh, 0.05f); free(sh);
+    const uint64_t down_off = arena_bf16(a, (uint64_t)rank * dim, &sh, 0.05f); free(sh);
+    float *r = rand_vec(3u * dim, 2.0f);
+    setenv("DS4_QWEN4_HC_NORM_DOWN", "1", 1);
+    float *one[3], *many[2];
+    for (uint32_t T = 0; T < 5u; T++) {
+        const uint32_t n = T < 3u ? 1u : T - 1u;          /* three single rows, then 2 and 3 rows */
+        ds4_gpu_tensor *gR = upload(r + (T < 3u ? T * dim : 0u), (uint64_t)n * dim);
+        ds4_gpu_tensor *gxn = upload(NULL, (uint64_t)n * dim), *ginj = upload(NULL, (uint64_t)n * hc * 8u * hc);
+        ds4_gpu_tensor *glo = upload(NULL, (uint64_t)n * rank);
+        require_ok(ds4_gpu_begin_commands() &&
+                   ds4_gpu_qwen4_hc_norm_down_tensor(gxn, ginj, glo, gR, a->base, a->size, gamma_off, inj_off, 30u,
+                                                     down_off, 30u, n, E, hc, hc, rank, 1e-6f, NULL, NULL, NULL) &&
+                   ds4_gpu_end_commands(), "hc norm down rows");
+        if (T < 3u) one[T] = download(glo, rank); else many[T - 3u] = download(glo, (uint64_t)n * rank);
+        ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(gxn); ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(glo);
+    }
+    unsetenv("DS4_QWEN4_HC_NORM_DOWN");
+    for (uint32_t k = 0; k < 2u; k++) {
+        for (uint32_t t = 0; t < k + 2u; t++) {
+            if (memcmp(many[k] + (uint64_t)t * rank, one[t], rank * sizeof(float))) {
+                fprintf(stderr, "hc norm down: row %u of a %u-token batch differs from the 1-token kernel\n", t, k + 2u);
+                exit(1);
+            }
+        }
+    }
+    printf("  hc norm + down fused rows                    ok  2- and 3-token rows equal 1-token\n");
+    for (int i = 0; i < 3; i++) free(one[i]);
+    free(many[0]); free(many[1]); free(r);
+}
+
+/* The FFN side's combine folded into the fused norm + down, its streams and
+ * partials copied back by the gate mix: against the separate combine, norm,
+ * BF16 matvec and gate mix, the residual, the inject partials and xn are
+ * bit-identical, lo and the mix are within rounding, and the storing gate
+ * mix mixes as the plain one.  2- and 3-token batches give each token the
+ * 1-token bits of everything it writes. */
+static void test_hc_combine_norm_down(arena_t *a) {
+    const uint32_t E = 2560, hc = 4, dim = E * hc, rank = 320, ni = hc * 8u * hc;
+    double *sh;
+    const uint64_t gamma_off = arena_f32(a, dim, &sh, 0.5f, 1.5f); free(sh);
+    const uint64_t inj_off = arena_bf16(a, (uint64_t)hc * dim, &sh, 0.05f); free(sh);
+    const uint64_t down_off = arena_bf16(a, (uint64_t)rank * dim, &sh, 0.05f); free(sh);
+    const uint64_t up_off = arena_bf16(a, (uint64_t)dim * rank, &sh, 0.05f); free(sh);
+    float *r = rand_vec(3u * dim, 2.0f), *blk = rand_vec(3u * E, 1.0f), *old = rand_vec(3u * ni, 0.5f);
+    const char *what[5] = { "residual", "inject partials", "xn", "lo", "mixed" };
+    setenv("DS4_QWEN4_HC_NORM_DOWN", "1", 1);
+    /* single[k]: token t's outputs from 1-token dispatches, for the batch check */
+    float *single[5];
+    for (int k = 0; k < 5; k++) single[k] = malloc(3u * dim * sizeof(float));
+    for (uint32_t T = 1; T <= 3u; T++) {
+        const uint64_t n[5] = { (uint64_t)T * dim, (uint64_t)T * ni, (uint64_t)T * dim, (uint64_t)T * rank, (uint64_t)T * E };
+        /* v 0: separate; 1: fused; 2+t (T == 1 only): fused, token t */
+        for (int v = 0; v < (T == 1u ? 5 : 2); v++) {
+            const uint32_t t0 = v >= 2 ? (uint32_t)v - 2u : 0u;
+            ds4_gpu_tensor *gR = upload(r + t0 * dim, (uint64_t)T * dim), *gB = upload(blk + t0 * E, (uint64_t)T * E);
+            ds4_gpu_tensor *gI = upload(old + t0 * ni, (uint64_t)T * ni), *gIalt = upload(NULL, (uint64_t)T * ni);
+            ds4_gpu_tensor *gRn = upload(NULL, (uint64_t)T * dim), *gxn = upload(NULL, (uint64_t)T * dim);
+            ds4_gpu_tensor *glo = upload(NULL, (uint64_t)T * rank);
+            ds4_gpu_tensor *gm = upload(NULL, (uint64_t)T * E), *gm2 = upload(NULL, (uint64_t)T * E);
+            int ok = ds4_gpu_begin_commands();
+            if (v) {
+                ok = ok && ds4_gpu_qwen4_hc_norm_down_tensor(gxn, gIalt, glo, gR, a->base, a->size, gamma_off, inj_off, 30u,
+                                                             down_off, 30u, T, E, hc, hc, rank, 1e-6f, gB, gI, gRn) &&
+                     ds4_gpu_qwen4_hc_gate_mix_tensor(gm2, gxn, glo, a->base, a->size, up_off, 30u, T, E, hc, rank) &&
+                     ds4_gpu_qwen4_hc_gate_mix_store_tensor(gm, gxn, glo, a->base, a->size, up_off, 30u, T, E, hc, rank,
+                                                            gR, gRn, gI, gIalt);
+            } else {
+                ok = ok && ds4_gpu_qwen4_hc_combine_tensor(gR, gB, gI, T, E, hc) &&
+                     ds4_gpu_qwen4_hc_norm_tensor(gxn, gI, gR, a->base, a->size, gamma_off, inj_off, 30u, T, E, hc, hc, 1e-6f) &&
+                     ds4_gpu_matmul_quant_tensor(glo, a->base, a->size, down_off, 30u, dim, rank, gxn, T) &&
+                     ds4_gpu_qwen4_hc_gate_mix_tensor(gm, gxn, glo, a->base, a->size, up_off, 30u, T, E, hc, rank);
+            }
+            require_ok(ok && ds4_gpu_end_commands(), "hc combine norm down");
+            float *out[5] = { download(gR, n[0]), download(gI, n[1]), download(gxn, n[2]), download(glo, n[3]), download(gm, n[4]) };
+            static float *ref[5];
+            if (v == 0) {
+                for (int k = 0; k < 5; k++) ref[k] = out[k];
+            } else if (v == 1) {
+                float *plain = download(gm2, n[4]);
+                if (memcmp(plain, out[4], n[4] * sizeof(float))) {
+                    fprintf(stderr, "hc combine norm down T=%u: the storing gate mix mixes differently\n", T);
+                    exit(1);
+                }
+                free(plain);
+                for (int k = 0; k < 5; k++) {
+                    uint64_t diff = 0;
+                    double scale = 0.0, worst = 0.0;
+                    for (uint64_t i = 0; i < n[k]; i++) {
+                        if (fabs(ref[k][i]) > scale) scale = fabs(ref[k][i]);
+                        if (fabs(ref[k][i] - out[k][i]) > worst) worst = fabs(ref[k][i] - out[k][i]);
+                        diff += memcmp(&ref[k][i], &out[k][i], 4) != 0;
+                    }
+                    if (k >= 3 ? worst > 1e-5 * scale : diff != 0) {
+                        fprintf(stderr, "hc combine norm down T=%u: %s differs in %llu of %llu (max|d| %.3g of %.3g)\n",
+                                T, what[k], (unsigned long long)diff, (unsigned long long)n[k], worst, scale);
+                        exit(1);
+                    }
+                    free(ref[k]);
+                }
+                if (T > 1u) {
+                    for (int k = 0; k < 5; k++) {
+                        const uint64_t per = n[k] / T;
+                        for (uint32_t t = 0; t < T; t++) {
+                            if (memcmp(out[k] + t * per, single[k] + t * per, per * sizeof(float))) {
+                                fprintf(stderr, "hc combine norm down: %s of row %u in a %u-token batch differs from 1 token\n",
+                                        what[k], t, T);
+                                exit(1);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (int k = 0; k < 5; k++) memcpy(single[k] + t0 * n[k], out[k], n[k] * sizeof(float));
+            }
+            if (v) for (int k = 0; k < 5; k++) free(out[k]);
+            ds4_gpu_tensor *all[] = { gR, gB, gI, gIalt, gRn, gxn, glo, gm, gm2 };
+            for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) ds4_gpu_tensor_free(all[i]);
+        }
+        printf("  hc combine + norm + down fused T=%u          ok  residual, partials, xn bit-identical%s\n", T,
+               T > 1u ? "; rows equal 1-token" : "");
+    }
+    unsetenv("DS4_QWEN4_HC_NORM_DOWN");
+    for (int k = 0; k < 5; k++) free(single[k]);
+    free(r); free(blk); free(old);
+}
+
 /* The one-simdgroup router (DS4_QWEN4_ROUTER_SG) replays the 256-thread
  * kernel's reductions: experts, weights and the shared gate logit must be
  * bit-identical, with a BF16 gate row and without one, and with logits on
@@ -3114,6 +3305,17 @@ static int bench_hc_mix(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_g
 static int bench_hc_mix2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_gate_mix_tensor(c->t[0], c->t[4], c->t[5], c->a->base, c->a->size, c->off[5], 1u, 2, 2560, 4, 320); }
 static int bench_hc_mix_bf16(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_gate_mix_tensor(c->t[0], c->t[4], c->t[5], c->a->base, c->a->size, c->off[5], 30u, 1, 2560, 4, 320); }
 static int bench_hc_mix_bf16_2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_gate_mix_tensor(c->t[0], c->t[4], c->t[5], c->a->base, c->a->size, c->off[5], 30u, 2, 2560, 4, 320); }
+/* the same streams as BF16 (the f16 test rows read as bf16): norm then down, or both at once */
+static int bench_hc_norm_down_split(void *ud) {
+    bench_ctx *c = ud;
+    return ds4_gpu_qwen4_hc_norm_tensor(c->t[4], c->t[3], c->t[2], c->a->base, c->a->size, c->off[2], c->off[4], 30u, 1, 2560, 4, 4, 1e-6f) &&
+           ds4_gpu_matmul_quant_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 30u, 10240, 320, c->t[4], 1);
+}
+static int bench_hc_norm_down_fused(void *ud) {
+    bench_ctx *c = ud;
+    return ds4_gpu_qwen4_hc_norm_down_tensor(c->t[4], c->t[3], c->t[5], c->t[2], c->a->base, c->a->size, c->off[2], c->off[4], 30u,
+                                             c->off[3], 30u, 1, 2560, 4, 4, 320, 1e-6f, NULL, NULL, NULL);
+}
 static int bench_hc_down_bf16_2(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_quant_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 30u, 10240, 320, c->t[4], 2); }
 static int bench_hc_down_bf16(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_quant_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 30u, 10240, 320, c->t[4], 1); }
 static int bench_attn(void *ud) {
@@ -3268,33 +3470,68 @@ static int bench_gdn_scan2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_g
 typedef struct {
     arena_t *a;
     uint64_t off0, stride;
-    uint32_t copies, i, type, in_dim, out_dim;
-    ds4_gpu_tensor *x, *y, *lo;
+    uint32_t copies, i, type, in_dim, out_dim, nt;
+    ds4_gpu_tensor *x, *y, *lo, *inj, *inj2, *blk, *rn, *mixed;
     int mix;
 } cold_ctx;
 
 static int bench_cold_fn(void *ud) {
     cold_ctx *c = ud;
     const uint64_t off = c->off0 + (uint64_t)(c->i++ % c->copies) * c->stride;
-    if (c->mix) return ds4_gpu_qwen4_hc_gate_mix_tensor(c->y, c->x, c->lo, c->a->base, c->a->size, off, c->type,
-                                                        1, 2560, 4, 320);
+    if (c->mix == 1) return ds4_gpu_qwen4_hc_gate_mix_tensor(c->y, c->x, c->lo, c->a->base, c->a->size, off, c->type,
+                                                             1, 2560, 4, 320);
+    if (c->mix >= 2) {
+        /* one hc side at nt tokens, gamma and inject read from the copy's
+         * start: 2 norm + down, 3 fused; 4 combine + norm + down + gate mix,
+         * 5 the same with the combine fused and the storing gate mix */
+        const uint32_t T = c->nt;
+        const uint64_t up = off + 10240ull * 320 * 2;
+        void *b = c->a->base;
+        const uint64_t n = c->a->size;
+        switch (c->mix) {
+        case 2: return ds4_gpu_qwen4_hc_norm_tensor(c->y, c->inj, c->x, b, n, off, off, 30u, T, 2560, 4, 4, 1e-6f) &&
+                       ds4_gpu_matmul_quant_tensor(c->lo, b, n, off, 30u, 10240, 320, c->y, T);
+        case 3: return ds4_gpu_qwen4_hc_norm_down_tensor(c->y, c->inj, c->lo, c->x, b, n, off, off, 30u, off, 30u, T, 2560, 4,
+                                                         4, 320, 1e-6f, NULL, NULL, NULL);
+        case 4: return ds4_gpu_qwen4_hc_combine_tensor(c->x, c->blk, c->inj, T, 2560, 4) &&
+                       ds4_gpu_qwen4_hc_norm_tensor(c->y, c->inj, c->x, b, n, off, off, 30u, T, 2560, 4, 4, 1e-6f) &&
+                       ds4_gpu_matmul_quant_tensor(c->lo, b, n, off, 30u, 10240, 320, c->y, T) &&
+                       ds4_gpu_qwen4_hc_gate_mix_tensor(c->mixed, c->y, c->lo, b, n, up, 30u, T, 2560, 4, 320);
+        default: return ds4_gpu_qwen4_hc_norm_down_tensor(c->y, c->inj2, c->lo, c->x, b, n, off, off, 30u, off, 30u, T,
+                                                          2560, 4, 4, 320, 1e-6f, c->blk, c->inj, c->rn) &&
+                        ds4_gpu_qwen4_hc_gate_mix_store_tensor(c->mixed, c->y, c->lo, b, n, up, 30u, T, 2560, 4, 320,
+                                                               c->x, c->rn, c->inj, c->inj2);
+        }
+    }
     return ds4_gpu_matmul_quant_tensor(c->y, c->a->base, c->a->size, off, c->type, c->in_dim, c->out_dim, c->x, 1);
 }
 
 static void bench_cold(arena_t *a) {
-    static const struct { const char *name; uint32_t type, in_dim, out_dim; double bpw; int mix; } cases[] = {
-        { "bf16 hc down 10240->320", 30u, 10240, 320, 16.0, 0 },
-        { "bf16 router 2560->512", 30u, 2560, 512, 16.0, 0 },
-        { "bf16 hc_gate_mix 320->4x2560", 30u, 320, 10240, 16.0, 1 },
-        { "q3_K 2560->10240", 11u, 2560, 10240, 3.4375, 0 },
-        { "iq4_xs 2560->10240", 23u, 2560, 10240, 4.25, 0 },
-        { "iq4_xs 6144->2560", 23u, 6144, 2560, 4.25, 0 },
-        { "q5_K 2560->12288", 13u, 2560, 12288, 5.5, 0 },
-        { "q2_0 2560->6144", 42u, 2560, 6144, 2.125, 0 },
-        { "bf16 big 2560->12288", 30u, 2560, 12288, 16.0, 0 },
-        { "q3_K big 2560->49152", 11u, 2560, 49152, 3.4375, 0 },
-        { "iq4_xs big 2560->49152", 23u, 2560, 49152, 4.25, 0 },
-        { "q2_0 big 2560->49152", 42u, 2560, 49152, 2.25, 0 },
+    static const struct { const char *name; uint32_t type, in_dim, out_dim; double bpw; int mix; uint32_t nt; } cases[] = {
+        { "hc norm+down T=1 separate", 30u, 10240, 320, 16.0, 2, 1 },
+        { "hc norm+down T=1 fused", 30u, 10240, 320, 16.0, 3, 1 },
+        { "hc norm+down T=2 separate", 30u, 10240, 320, 16.0, 2, 2 },
+        { "hc norm+down T=2 fused", 30u, 10240, 320, 16.0, 3, 2 },
+        { "hc norm+down T=3 separate", 30u, 10240, 320, 16.0, 2, 3 },
+        { "hc norm+down T=3 fused", 30u, 10240, 320, 16.0, 3, 3 },
+        { "hc ffn side T=1 separate", 30u, 10240, 640, 16.0, 4, 1 },
+        { "hc ffn side T=1 fused", 30u, 10240, 640, 16.0, 5, 1 },
+        { "hc ffn side T=2 separate", 30u, 10240, 640, 16.0, 4, 2 },
+        { "hc ffn side T=2 fused", 30u, 10240, 640, 16.0, 5, 2 },
+        { "hc ffn side T=3 separate", 30u, 10240, 640, 16.0, 4, 3 },
+        { "hc ffn side T=3 fused", 30u, 10240, 640, 16.0, 5, 3 },
+        { "bf16 hc down 10240->320", 30u, 10240, 320, 16.0, 0, 0 },
+        { "bf16 router 2560->512", 30u, 2560, 512, 16.0, 0, 0 },
+        { "bf16 hc_gate_mix 320->4x2560", 30u, 320, 10240, 16.0, 1, 0 },
+        { "q3_K 2560->10240", 11u, 2560, 10240, 3.4375, 0, 0 },
+        { "iq4_xs 2560->10240", 23u, 2560, 10240, 4.25, 0, 0 },
+        { "iq4_xs 6144->2560", 23u, 6144, 2560, 4.25, 0, 0 },
+        { "q5_K 2560->12288", 13u, 2560, 12288, 5.5, 0, 0 },
+        { "q2_0 2560->6144", 42u, 2560, 6144, 2.125, 0, 0 },
+        { "bf16 big 2560->12288", 30u, 2560, 12288, 16.0, 0, 0 },
+        { "q3_K big 2560->49152", 11u, 2560, 49152, 3.4375, 0, 0 },
+        { "iq4_xs big 2560->49152", 23u, 2560, 49152, 4.25, 0, 0 },
+        { "q2_0 big 2560->49152", 42u, 2560, 49152, 2.25, 0, 0 },
     };
     /* QWEN4_COLD_SPAN_MB=8 keeps the copies SLC-resident for a hot baseline */
     const char *span_env = getenv("QWEN4_COLD_SPAN_MB");
@@ -3304,12 +3541,19 @@ static void bench_cold(arena_t *a) {
     cold_ctx c = { .a = a, .off0 = off0 };
     c.x = upload(NULL, 4ull * 10240);
     c.y = upload(NULL, 4ull * 12288);
-    c.lo = upload(NULL, 320);
+    c.lo = upload(NULL, 3 * 320);
+    c.inj = upload(NULL, 3 * 128);
+    c.inj2 = upload(NULL, 3 * 128);
+    c.blk = upload(NULL, 3 * 2560);
+    c.rn = upload(NULL, 3 * 10240);
+    c.mixed = upload(NULL, 3 * 2560);
+    setenv("DS4_QWEN4_HC_NORM_DOWN", "1", 1);
     for (uint32_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
         const uint64_t bytes = (uint64_t)((double)cases[k].in_dim * cases[k].out_dim * cases[k].bpw / 8.0);
         c.stride = (bytes + 16383u) & ~16383ull;
         c.copies = span / c.stride ? (uint32_t)(span / c.stride) : 1u;
         c.type = cases[k].type; c.in_dim = cases[k].in_dim; c.out_dim = cases[k].out_dim; c.mix = cases[k].mix;
+        c.nt = cases[k].nt ? cases[k].nt : 1u;
         const char *only = getenv("QWEN4_BENCH_ONLY");
         if (only && only[0] && !strstr(cases[k].name, only)) continue;
         /* the GPU clocks ramp with load: warm for ~0.3 s, then best of 3 */
@@ -3465,6 +3709,10 @@ static void bench_dispatch(arena_t *a) {
     bench_run("q8 gemv 6144x2560 T=1", bench_q8_big, &c, 200);
     bench_run("q8 gemv 6144x2560 T=2", bench_q8_big2, &c, 200);
     bench_run("hc_norm (+inject partials)", bench_hc_norm, &c, 200);
+    setenv("DS4_QWEN4_HC_NORM_DOWN", "1", 1);
+    bench_run("hc norm+down bf16 separate", bench_hc_norm_down_split, &c, 200);
+    bench_run("hc norm+down bf16 fused", bench_hc_norm_down_fused, &c, 200);
+    unsetenv("DS4_QWEN4_HC_NORM_DOWN");
     bench_run("hc down gemv f16 320x10240", bench_hc_down, &c, 200);
     bench_run("hc_gate_mix f16", bench_hc_mix, &c, 200);
     bench_run("hc_gate_mix f16 T=2", bench_hc_mix2, &c, 200);
@@ -3865,6 +4113,12 @@ int main(void) {
     test_ple(&arena, 64, 12);
     printf("router\n");
     test_router(&arena, 512, 10, 3);
+    for (uint32_t T = 1; T <= 3; T++) {
+        test_hc_norm_down_exact(&arena, T, true);
+        test_hc_norm_down_exact(&arena, T, false);
+    }
+    test_hc_norm_down_rows(&arena);
+    test_hc_combine_norm_down(&arena);
     for (uint32_t T = 1; T <= 7; T += 2) {
         test_router_sg_exact(&arena, T, true, false);
         test_router_sg_exact(&arena, T, true, true);

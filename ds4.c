@@ -58967,18 +58967,12 @@ static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, co
                      : ds4_gpu_qwen4_idx_select_tensor(sel, score, tile_max, n_blocks, n_tokens, top_k);
 }
 
-/* grouped norm -> low-rank gate -> mixed; inject may be NULL (final mixer) */
-static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
-                               const ds4_tensor *norm, const ds4_tensor *down,
-                               const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
-    bool ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
-                                           inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
-                                           T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
-              qwen4_gemv(g->lo, m, down, g->xn, T);
+/* the low-rank gate of hc_mix over g->lo, mixing g->xn into g->mixed */
+static bool qwen4_graph_hc_gate_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_tensor *up, uint32_t T) {
     if (T > 8u &&
         up->type != DS4_TENSOR_Q8_0) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
-        return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
+        return ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
     }
@@ -59012,8 +59006,63 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         ds4_gpu_tensor_free(xn1);
         return ok1;
     }
-    return ok && ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size, up->abs_offset,
-                                                  up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
+    return ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size, up->abs_offset,
+                                            up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
+}
+
+/* grouped norm -> low-rank gate -> mixed; inject may be NULL (final mixer) */
+static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                               const ds4_tensor *norm, const ds4_tensor *down,
+                               const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
+    bool ok = false;
+#ifdef __APPLE__
+    /* the norm and the low-rank down projection in one dispatch */
+    ok = down->ndim >= 2 && down->dim[1] == DS4_N_HC_LOWRANK &&
+         ds4_gpu_qwen4_hc_norm_down_tensor(g->xn, g->inj, g->lo, g->R, m->map, m->size, norm->abs_offset,
+                                           inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
+                                           down->abs_offset, down->type, T, DS4_N_EMBD, DS4_N_HC,
+                                           inject ? DS4_N_HC : 0u, DS4_N_HC_LOWRANK, DS4_RMS_EPS,
+                                           NULL, NULL, NULL) != 0;
+#endif
+    if (!ok) {
+        ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
+                                          inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
+                                          T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
+             qwen4_gemv(g->lo, m, down, g->xn, T);
+    }
+    return ok && qwen4_graph_hc_gate_mix(g, m, up, T);
+}
+
+/* R += the block output g->blk weighted by its norm's inject partials g->inj,
+ * then hc_mix (the FFN side).  On Apple, up to three rows with BF16 hc
+ * weights add the block output inside the fused norm + down dispatch: it
+ * leaves the combined streams in hc_u and the new partials in inj_alt (both
+ * idle at these sizes), and the gate mix copies them back, one dispatch
+ * fewer per layer.  The streams are the separate combine's bits. */
+static bool qwen4_graph_hc_combine_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                       const ds4_tensor *norm, const ds4_tensor *down,
+                                       const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
+#ifdef __APPLE__
+    if (T <= 3u && inject && up->type == DS4_TENSOR_BF16 && down->ndim >= 2 && down->dim[1] == DS4_N_HC_LOWRANK &&
+        !(T == 3u && g->verify_rows_exact && getenv("DS4_QWEN4_EXACT_HC_SPLIT")) &&
+        ds4_gpu_qwen4_hc_norm_down_tensor(g->xn, g->inj_alt, g->lo, g->R, m->map, m->size, norm->abs_offset,
+                                          inject->abs_offset, inject->type, down->abs_offset, down->type, T,
+                                          DS4_N_EMBD, DS4_N_HC, DS4_N_HC, DS4_N_HC_LOWRANK, DS4_RMS_EPS,
+                                          g->blk, g->inj, g->hc_u) != 0) {
+        if (ds4_gpu_qwen4_hc_gate_mix_store_tensor(g->mixed, g->xn, g->lo, m->map, m->size, up->abs_offset,
+                                                   up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK,
+                                                   g->R, g->hc_u, g->inj, g->inj_alt)) {
+            return true;
+        }
+        const uint64_t dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+        return ds4_gpu_tensor_copy(g->R, 0, g->hc_u, 0, T * dim * sizeof(float)) &&
+               ds4_gpu_tensor_copy(g->inj, 0, g->inj_alt, 0,
+                                   (uint64_t)T * DS4_N_HC * DS4_QWEN4_HC_CHUNKS * DS4_N_HC * sizeof(float)) &&
+               qwen4_graph_hc_gate_mix(g, m, up, T);
+    }
+#endif
+    return ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0 &&
+           qwen4_graph_hc_mix(g, m, norm, down, up, inject, T);
 }
 
 /* Neural Engine prefill (DS4_ANE=1, Apple Silicon only).  While the GPU runs
@@ -59840,8 +59889,7 @@ static bool qwen4_layer_ffn_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
                ds4_gpu_qwen4_hc_gate_mix_tensor(g->mixed, g->xn, g->lo, m->map, m->size,
                    l->hc_ffn_up->abs_offset, l->hc_ffn_up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
     }
-    return ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0 &&
-           qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
+    return qwen4_graph_hc_combine_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
 }
 
 static bool qwen4_layer_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
@@ -60528,9 +60576,8 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     if (ok) ok = qwen4_mtp_mark(QWEN4_MTP_T_INPUT);
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
-    if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
     if (ok) ok = qwen4_mtp_mark(QWEN4_MTP_T_ATTN);
-    if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
+    if (ok) ok = qwen4_graph_hc_combine_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
     if (ok) ok = qwen4_graph_moe(g, m, l, T);
     if (ok) ok = qwen4_mtp_mark(QWEN4_MTP_T_MOE);
     ds4_gpu_tensor *last = NULL;
@@ -60741,8 +60788,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     g->R = g->mtp_R;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, 1);
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, 1);
-    if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, E, hc) != 0;
-    if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
+    if (ok) ok = qwen4_graph_hc_combine_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
     if (ok) ok = qwen4_graph_moe(g, m, l, 1);
     /* the chained draft only needs its argmax; DS4_QWEN4_MTP_DRAFT_ROWS can
      * score the frequent-token prefix exactly like the first draft's head */
@@ -80577,10 +80623,8 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
                 : qwen4_batch_attention(count, rowg, g, m, l, il, T);
         }
         QWEN4_BATCH_PROF(ds4_qwen4_layer_is_linear(il) ? 3 : 4);
-        if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T,
-                                                     DS4_N_EMBD, DS4_N_HC) != 0;
-        if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down,
-                                        l->hc_ffn_up, l->hc_ffn_inject, T);
+        if (ok) ok = qwen4_graph_hc_combine_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down,
+                                                l->hc_ffn_up, l->hc_ffn_inject, T);
         QWEN4_BATCH_PROF(5);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);
         QWEN4_BATCH_PROF(6);
@@ -80787,8 +80831,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
             if (ok) ok = qwen4_batch_attention_entries(arows, T, g, m, l, il) &&
                          qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
         }
-        if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
-        if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
+        if (ok) ok = qwen4_graph_hc_combine_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);
     }
     if (ok) ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
@@ -80869,8 +80912,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
                  qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, N) &&
                  qwen4_batch_attention_entries(arows, N, g, m, l, il) &&
                  qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, N);
-    if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, N, E, hc) != 0;
-    if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, N);
+    if (ok) ok = qwen4_graph_hc_combine_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, N);
     if (ok) ok = qwen4_graph_moe(g, m, l, N);
     /* every session's last committed row, gathered for one pass of the head
      * mixer into the batch's head rows */

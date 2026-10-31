@@ -3379,6 +3379,25 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps);
+/* Apple only: the hc norm and its BF16 low-rank down projection in one
+ * dispatch for 1 to 3 tokens; 0 when the shapes or types do not fit.  With
+ * blk it first combines R with the block output weighted by old_inj, and
+ * leaves the combined streams in next_R (R itself is not written) and the
+ * new partials in inj_part, which must not share old_inj's buffer. */
+int ds4_gpu_qwen4_hc_norm_down_tensor(
+        ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, ds4_gpu_tensor *lo, const ds4_gpu_tensor *R,
+        const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
+        uint32_t inject_type, uint64_t down_offset, uint32_t down_type, uint32_t n_tokens, uint32_t n_embd,
+        uint32_t n_hc, uint32_t n_inject, uint32_t n_rank, float eps,
+        const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj, ds4_gpu_tensor *next_R);
+/* The BF16 rows gate mix after a combining norm + down, also copying
+ * R_next over R and inj_next over inj; 0 (nothing encoded) if it does not
+ * apply. */
+int ds4_gpu_qwen4_hc_gate_mix_store_tensor(
+        ds4_gpu_tensor *mixed, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *lo,
+        const void *model_map, uint64_t model_size, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_rank,
+        ds4_gpu_tensor *R, const ds4_gpu_tensor *R_next, ds4_gpu_tensor *inj, const ds4_gpu_tensor *inj_next);
 int ds4_gpu_qwen4_hc_gate_mix_tensor(
         ds4_gpu_tensor *mixed, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *lo,
         const void *model_map, uint64_t model_size, uint64_t up_offset,

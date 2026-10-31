@@ -214,6 +214,243 @@ static inline float qwen4_hc_inject_weight(device const float *inj_part, uint hc
     return 2.0f * qwen4_sigmoid(a / (float)hc);
 }
 
+/* The hc norm and the BF16 low-rank down projection of the same streams in
+ * one dispatch, for decode and verify batches of NT <= 3 tokens.  The first
+ * n_down_tgs threadgroups are a K-split matvec of QWEN4_HC_DOWN_ROWS rows
+ * whose four simdgroups split each stream by 8-weight words; from the same
+ * loads they sum each stream's squares and its dot with r * g, and scale
+ * the dots by the stream's rsqrt(mean square + eps) at the end, so no group
+ * waits on a norm before streaming weights.  Their sums are spelled out
+ * with reassociation and contraction pinned off, so a token's lo does not
+ * depend on the batch it is in (verify rows round as decode rows;
+ * tests/test_qwen4_kernels.c pins it) though they may round differently
+ * from the separate norm and matvec in the last bit.  The other
+ * threadgroups are the norm's own (stream, chunk, token) groups, which
+ * still write xn and the inject partials for the gate mix and the combine.
+ *
+ * CB folds in the combine that precedes the FFN side's norm: the streams
+ * are R + 2*sigmoid(old inject/hc) * blk, which every threadgroup forms
+ * from the old residual and partials as it reads them.  The norm's groups
+ * write the combined streams to next_R and the new partials to inj_part;
+ * both must be other buffers than R and old_inj, which the remaining
+ * groups still read, and the gate mix that follows copies them back. */
+struct ds4_metal_args_qwen4_hc_norm_down {
+    uint32_t n_tokens;
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t n_inject;
+    float    eps;
+    uint32_t n_rank;       /* rows of the down projection */
+    uint32_t n_down_tgs;   /* threadgroups of the matvec role: n_rank / 2 */
+    uint32_t pad0;
+};
+
+/* kernel_qwen4_hc_combine's weight and update with the order pinned, so
+ * all threadgroups of the fused dispatch form the same streams. */
+static inline float qwen4_hc_inject_weight_pinned(device const float *inj_part, uint hc, uint s) {
+    float a = 0.0f;
+    for (uint src = 0; src < hc * QWEN4_HC_CHUNKS; src++) {
+#pragma clang fp reassociate(off)
+        a = a + inj_part[src * hc + s];
+    }
+    return 2.0f * qwen4_sigmoid(a / (float)hc);
+}
+
+#ifndef QWEN4_HC_DOWN_ROWS
+#define QWEN4_HC_DOWN_ROWS 2   /* low-rank rows per matvec group */
+#endif
+
+static inline float qwen4_hc_combined(float r, float w, float b) {
+    return fma(w, b, r);
+}
+
+template <short NT, bool CB>
+kernel void kernel_qwen4_hc_norm_down(
+        constant ds4_metal_args_qwen4_hc_norm_down & args,
+        device const float *R,          /* [T][hc*E] */
+        device const float *gamma,      /* [hc*E] */
+        device const char  *w_inject,   /* [n_inject][hc*E] bf16 */
+        device float       *xn,         /* [T][hc*E] */
+        device float       *inj_part,   /* [T][hc*chunks][n_inject] */
+        device const char  *w_down,     /* [n_rank][hc*E] bf16 */
+        device float       *lo,         /* [T][n_rank] */
+        device const float *blk,        /* CB: [T][E] block output */
+        device const float *old_inj,    /* CB: [T][hc*chunks][hc] partials of the block's own norm */
+        device float       *next_R,     /* CB: [T][hc*E] combined streams */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint E = args.n_embd, hc = args.n_hc, dim = E * hc;
+    const uint nth = ntg.x, nsg = nth / 32;
+    threadgroup float red[5][32];
+    if (tgpig.x >= args.n_down_tgs) {
+        /* kernel_qwen4_hc_norm<qwen4_w_bf16>, one (stream, chunk, token) group */
+        const uint idx = tgpig.x - args.n_down_tgs;
+        const uint tok = idx / (hc * QWEN4_HC_CHUNKS);
+        const uint s = (idx % (hc * QWEN4_HC_CHUNKS)) / QWEN4_HC_CHUNKS;
+        const uint chunk = idx % QWEN4_HC_CHUNKS;
+        if (tok >= args.n_tokens) return;
+        device const float *r = R + ((uint64_t)tok * hc + s) * E;
+        device const float *b = blk + (uint64_t)tok * E;
+        device const float *g = gamma + s * E;
+        device float *o = xn + ((uint64_t)tok * hc + s) * E;
+        const qwen4_w_bf16 w(w_inject);
+        const float wb = CB ? qwen4_hc_inject_weight_pinned(old_inj + (uint64_t)tok * hc * QWEN4_HC_CHUNKS * hc, hc, s)
+                            : 0.0f;
+        float ss = 0.0f;
+        for (uint i = tid; i < E; i += nth) {
+            const float c = CB ? qwen4_hc_combined(r[i], wb, b[i]) : r[i];
+            ss += c * c;
+        }
+        ss = simd_sum(ss);
+        if (tiisg == 0) red[0][sgitg] = ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tot = 0.0f;
+        for (uint q = 0; q < nsg; q++) tot += red[0][q];
+        const float inv = rsqrt(tot / (float)E + args.eps);
+        const uint per = (E + QWEN4_HC_CHUNKS - 1) / QWEN4_HC_CHUNKS;
+        const uint i0 = chunk * per, i1 = min(E, i0 + per);
+        float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint i = i0 + tid; i < i1; i += nth) {
+            const float c = CB ? qwen4_hc_combined(r[i], wb, b[i]) : r[i];
+            if (CB) next_R[((uint64_t)tok * hc + s) * E + i] = c;
+            const float v = c * inv * g[i];
+            o[i] = v;
+            for (uint j = 0; j < 4; j++) {
+                if (j < args.n_inject) acc[j] += w.at((uint64_t)j * dim + s * E + i) * v;
+            }
+        }
+        for (uint j = 0; j < 4; j++) {
+            if (j >= args.n_inject) break;
+            const float a = simd_sum(acc[j]);
+            if (tiisg == 0) red[1 + j][sgitg] = a;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < args.n_inject) {
+            float a = 0.0f;
+            for (uint q = 0; q < nsg; q++) a += red[1 + tid][q];
+            inj_part[((uint64_t)tok * hc * QWEN4_HC_CHUNKS + s * QWEN4_HC_CHUNKS + chunk) * args.n_inject + tid] = a;
+        }
+        return;
+    }
+
+    /* The matvec role in one pass over the streams: per stream, each row's
+     * dot with c * g and the stream's sum of squares, from the same loads;
+     * lo = sum over streams of rsqrt(mean square + eps) * dot after the
+     * reduction, so no group waits on a norm before streaming weights. */
+    constexpr short NR0 = QWEN4_HC_DOWN_ROWS;
+    constexpr uint HC = 4;
+    threadgroup float wgt[3][HC];
+    if (CB) {
+        if (tid < (uint)NT * HC) {
+            const uint t = tid / HC, s = tid % HC, tok = min(t, args.n_tokens - 1u);
+            wgt[t][s] = qwen4_hc_inject_weight_pinned(old_inj + (uint64_t)tok * HC * QWEN4_HC_CHUNKS * HC, HC, s);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int first_row = tgpig.x * NR0;
+    const uint64_t row_bytes = (uint64_t)dim * 2u;
+    device const uint4 *ax[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const uint4 *)(w_down + (uint64_t)min(first_row + row, (int)args.n_rank - 1) * row_bytes);
+    }
+    const uint n8s = E / 8u;   /* 8-weight words per stream */
+    float dots[NT][NR0][HC], sqs[NT][HC];
+    for (uint s = 0; s < HC; s++) {
+        float d[NT][NR0], q[NT];
+        for (short t = 0; t < NT; t++) {
+            q[t] = 0.0f;
+            for (short row = 0; row < NR0; row++) d[t][row] = 0.0f;
+        }
+        for (uint i = sgitg * 32 + tiisg; i < n8s; i += nsg * 32) {
+            const uint word = s * n8s + i;
+            uint4 w[NR0];
+            for (short row = 0; row < NR0; row++) w[row] = ax[row][word];
+            device const float *g = gamma + 8u * word;
+            for (short t = 0; t < NT; t++) {
+                const uint tok = min((uint)t, args.n_tokens - 1u);
+                device const float *r = R + (uint64_t)tok * dim + 8u * word;
+                device const float *b = blk + (uint64_t)tok * E + 8u * i;
+                const float wb = CB ? wgt[t][s] : 0.0f;
+                float y[8];
+                for (short j = 0; j < 8; j++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+                    const float c = CB ? qwen4_hc_combined(r[j], wb, b[j]) : r[j];
+                    const float sq = c * c;
+                    q[t] = q[t] + sq;
+                    y[j] = c * g[j];
+                }
+                for (short row = 0; row < NR0; row++) {
+                    const uint4 qw = w[row];
+                    const float4 w0 = as_type<float4>(uint4(qw.x << 16, qw.x & 0xFFFF0000u, qw.y << 16, qw.y & 0xFFFF0000u));
+                    const float4 w1 = as_type<float4>(uint4(qw.z << 16, qw.z & 0xFFFF0000u, qw.w << 16, qw.w & 0xFFFF0000u));
+                    const float wv[8] = { w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w };
+                    float p = 0.0f;
+                    for (short j = 0; j < 8; j++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+                        const float m = wv[j] * y[j];
+                        p = p + m;
+                    }
+                    {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+                        d[t][row] = d[t][row] + p;
+                    }
+                }
+            }
+        }
+        for (short t = 0; t < NT; t++) {
+            sqs[t][s] = q[t];
+            for (short row = 0; row < NR0; row++) dots[t][row][s] = d[t][row];
+        }
+    }
+    /* [t][row, then the squares][stream][simdgroup] */
+    threadgroup float tred[3 * (QWEN4_HC_DOWN_ROWS + 1) * HC * 4];
+    for (short t = 0; t < NT; t++) {
+        for (uint s = 0; s < HC; s++) {
+            for (short row = 0; row < NR0; ++row) {
+                const float v = simd_sum(dots[t][row][s]);
+                if (tiisg == 0) tred[((t * (NR0 + 1) + row) * HC + s) * 4 + sgitg] = v;
+            }
+            const float v = simd_sum(sqs[t][s]);
+            if (tiisg == 0) tred[((t * (NR0 + 1) + NR0) * HC + s) * 4 + sgitg] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg != 0 || tiisg >= (ushort)(NT * NR0)) return;
+    const uint t = tiisg / NR0, row = tiisg % NR0;
+    float acc = 0.0f;
+    for (uint s = 0; s < HC; s++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+        float dsum = 0.0f, ssum = 0.0f;
+        for (uint q = 0; q < nsg; q++) {
+            dsum = dsum + tred[((t * (NR0 + 1) + row) * HC + s) * 4 + q];
+            ssum = ssum + tred[((t * (NR0 + 1) + NR0) * HC + s) * 4 + q];
+        }
+        const float mean = ssum / (float)E;
+        const float m = rsqrt(mean + args.eps) * dsum;
+        acc = acc + m;
+    }
+    if (t < args.n_tokens && first_row + (int)row < (int)args.n_rank) lo[(uint64_t)t * args.n_rank + first_row + row] = acc;
+}
+
+#define QWEN4_HC_NORM_DOWN_INSTANCE(NAME, NT, CB) \
+template [[host_name(NAME)]] kernel void kernel_qwen4_hc_norm_down<NT, CB>( \
+        constant ds4_metal_args_qwen4_hc_norm_down &, device const float *, device const float *, \
+        device const char *, device float *, device float *, device const char *, device float *, \
+        device const float *, device const float *, device float *, uint3, ushort, ushort3, ushort, ushort);
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_nt1", 1, false)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_nt2", 2, false)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_nt3", 3, false)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_nt1", 1, true)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_nt2", 2, true)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_nt3", 3, true)
+
 struct ds4_metal_args_qwen4_hc_gate_mix {
     uint32_t n_tokens;
     uint32_t n_embd;
@@ -274,20 +511,34 @@ QWEN4_HC_MIX_INSTANCE(bf16, qwen4_w_bf16)
  * words), each word dotted with every token's inputs. */
 #define QWEN4_HC_MIX_ROWS 4
 
-template <short NT>
+/* ST: the dispatch also copies the combined streams and their inject
+ * partials, which kernel_qwen4_hc_norm_down<NT, true> left in its own
+ * buffers, over R and inj; nothing here reads either. */
+template <short NT, bool ST>
 kernel void kernel_qwen4_hc_gate_mix_bf16_rows(
         constant ds4_metal_args_qwen4_hc_gate_mix & args,
         device const float *xn,       /* [T][hc*E] */
         device const float *lo,       /* [T][n_rank] raw */
         device const char  *w_up,     /* [hc*E][n_rank] bf16 */
         device float       *mixed,    /* [T][E] */
+        device float4      *res,      /* ST: [T][hc*E] */
+        device const float4 *res_next,
+        device float       *inj,      /* ST: [T][hc*chunks][hc] */
+        device const float *inj_next,
         threadgroup float  *act [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 ntgs [[threadgroups_per_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
     const uint hc = args.n_hc, E = args.n_embd, R = args.n_rank;
+    if (ST) {
+        const uint nthr = ntgs.x * ntgs.y * ntg.x, gid = (tgpig.y * ntgs.x + tgpig.x) * ntg.x + tid;
+        const uint n4 = args.n_tokens * hc * E / 4u, ni = args.n_tokens * hc * QWEN4_HC_CHUNKS * hc;
+        for (uint i = gid; i < n4; i += nthr) res[i] = res_next[i];
+        for (uint i = gid; i < ni; i += nthr) inj[i] = inj_next[i];
+    }
     const uint tok0 = tgpig.y * NT;
     for (short t = 0; t < NT; t++) {
         device const float *l = lo + (uint64_t)min(tok0 + t, args.n_tokens - 1u) * R;
@@ -329,13 +580,17 @@ kernel void kernel_qwen4_hc_gate_mix_bf16_rows(
     }
 }
 
-#define QWEN4_HC_MIX_ROWS_INSTANCE(NAME, NT) \
-template [[host_name(NAME)]] kernel void kernel_qwen4_hc_gate_mix_bf16_rows<NT>( \
+#define QWEN4_HC_MIX_ROWS_INSTANCE(NAME, NT, ST) \
+template [[host_name(NAME)]] kernel void kernel_qwen4_hc_gate_mix_bf16_rows<NT, ST>( \
         constant ds4_metal_args_qwen4_hc_gate_mix &, device const float *, device const float *, \
-        device const char *, device float *, threadgroup float *, uint3, ushort, ushort3, ushort, ushort);
-QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows", 1)
-QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt2", 2)
-QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt3", 3)
+        device const char *, device float *, device float4 *, device const float4 *, device float *, \
+        device const float *, threadgroup float *, uint3, uint3, ushort, ushort3, ushort, ushort);
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows", 1, false)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt2", 2, false)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt3", 3, false)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_store", 1, true)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_store_nt2", 2, true)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_store_nt3", 3, true)
 
 /* F16 gate/mix with eight terms loaded ahead per lane round.  Under the
  * library's fast math the shipped loop compiles to x = l*(1/hc);
