@@ -4348,6 +4348,18 @@ int main(void) {
         test_moe_types(&arena, 16, 10, 2560, 640, 100, grid_types[i], 20u);
     }
     test_moe_types(&arena, 16, 10, 2560, 640, 100, 16u, 20u);
+    {
+        /* IQ2_XXS decode rows through the codebook kernel and the generic
+         * row dots, with the shared expert slot */
+        const uint64_t used0 = arena.used;
+        for (int grid = 0; grid < 2; grid++) {
+            setenv("DS4_QWEN4_MOE_IQ2XXS_GRID", grid ? "1" : "0", 1);
+            test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 20u);
+            test_moe_types(&arena, 16, 10, 2560, 640, 3, 16u, 42u);
+            arena.used = used0;
+        }
+        unsetenv("DS4_QWEN4_MOE_IQ2XXS_GRID");
+    }
     test_moe(&arena, 8, 10, 2560, 640, 1, 0u);
     test_moe(&arena, 32, 10, 64, 32, 3, 8u);
     test_moe(&arena, 32, 10, 64, 32, 3, 0u);

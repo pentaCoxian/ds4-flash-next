@@ -48663,6 +48663,7 @@ enum {
     QWEN4_K_MOE_MID_IQ3_XXS,
     QWEN4_K_MOE_MID_IQ3_S,
     QWEN4_K_MOE_MID_IQ4_XS,
+    QWEN4_K_MOE_MID_IQ2_XXS,
     QWEN4_K_MOE_DOWN_IQ4_NL,
     QWEN4_K_ROUTER_SG,
     QWEN4_K_HC_NORM_DOWN_NT1,
@@ -48814,6 +48815,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mid_iq3_xxs",
     "kernel_qwen4_moe_mid_iq3_s",
     "kernel_qwen4_moe_mid_iq4_xs",
+    "kernel_qwen4_moe_mid_iq2_xxs",
     "kernel_qwen4_moe_down_iq4_nl",
     "kernel_qwen4_router_topk_sg",
     "kernel_qwen4_hc_norm_down_nt1",
@@ -50270,7 +50272,14 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         return qwen4_dispatch(QWEN4_K_MOE_MID_Q2_0, &args, sizeof(args), b, 7,
                               MTLSizeMake((ff_dim + 7u) / 8u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
     }
-    const int grid_kernel = weight_type == DS4_METAL_TENSOR_IQ2_XS ? QWEN4_K_MOE_MID_IQ2_XS :
+    /* IQ2_XXS experts take the codebook kernel's lane layout too, instead of
+     * the generic row dots: 54 against 69 us per layer and token on the M3
+     * Max (encoder timeline).  Apple9 default; DS4_QWEN4_MOE_IQ2XXS_GRID=0/1
+     * overrides on any device. */
+    const int iq2xxs_env = ds4_gpu_env_bool("DS4_QWEN4_MOE_IQ2XXS_GRID");
+    const bool iq2xxs_grid = iq2xxs_env >= 0 ? iq2xxs_env > 0 : g_metal_apple_family == 9;
+    const int grid_kernel = weight_type == DS4_METAL_TENSOR_IQ2_XXS && iq2xxs_grid ? QWEN4_K_MOE_MID_IQ2_XXS :
+                            weight_type == DS4_METAL_TENSOR_IQ2_XS ? QWEN4_K_MOE_MID_IQ2_XS :
                             weight_type == DS4_METAL_TENSOR_IQ2_S ? QWEN4_K_MOE_MID_IQ2_S :
                             weight_type == DS4_METAL_TENSOR_IQ3_XXS ? QWEN4_K_MOE_MID_IQ3_XXS :
                             weight_type == DS4_METAL_TENSOR_IQ3_S ? QWEN4_K_MOE_MID_IQ3_S :

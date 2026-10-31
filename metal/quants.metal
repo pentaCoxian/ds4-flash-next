@@ -778,6 +778,27 @@ void ds4q_dequantize_iq3_s(device const block_iq3_s *xb, short il, thread type4x
     reg = (type4x4)r;
 }
 
+/* IQ2_XXS in the same chunk layout: sub-block ib32 holds four grid bytes
+ * and four 7-bit sign indices with a 4-bit scale; chunk il takes grid
+ * entries 2h and 2h + 1. */
+template <typename type4x4>
+void ds4q_dequantize_iq2_xxs(device const block_iq2_xxs *xb, short il, thread type4x4 &reg) {
+    const short ib32 = il/2, h = il%2;
+    device const ushort *q2 = xb->qs + 4*ib32;
+    const uint aux_g = (uint)q2[0] | ((uint)q2[1] << 16);
+    const uint aux_s = (uint)q2[2] | ((uint)q2[3] << 16);
+    const float dl = (float)xb->d * (0.5f + (float)(aux_s >> 28)) * 0.25f;
+    float4x4 r;
+    for (short k = 0; k < 2; k++) {
+        const uint j = 2*h + k;
+        constant uchar *grid = (constant uchar *)(ds4_metal_iq2xxs_grid + ((aux_g >> (8*j)) & 0xFFu));
+        const uint signs = ds4_metal_ksigns_iq2xs[(aux_s >> (7*j)) & 127u];
+        r[2*k] = ds4q_grid4(grid, signs, dl);
+        r[2*k + 1] = ds4q_grid4(grid + 4, signs >> 4, dl);
+    }
+    reg = (type4x4)r;
+}
+
 template <typename type4x4>
 void ds4q_dequantize_bf16(device const ds4q_bf16x16 *xb, short il, thread type4x4 &reg) {
     float4x4 r;
