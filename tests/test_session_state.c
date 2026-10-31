@@ -1,6 +1,6 @@
 /* Exercise private session bookkeeping without loading a model. The GPU build
  * also runs speculative rollback through the real pooled-indexer kernel. */
-#include "../ds4.c"
+#include "../src/ds4.c"
 #include <assert.h>
 
 static void test_vision_prefix(void) {

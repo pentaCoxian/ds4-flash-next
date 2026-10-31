@@ -1,5 +1,5 @@
 /* Run model checks only on dedicated GPU hosts with enough memory. */
-#include "../ds4.c"
+#include "../src/ds4.c"
 #include <assert.h>
 
 #define CHECK(x) do { if (!(x)) { \

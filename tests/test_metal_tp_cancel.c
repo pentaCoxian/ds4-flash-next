@@ -1,6 +1,6 @@
 /* Run on two dedicated Metal hosts; the peer is the ordinary ds4 worker. */
-#include "../ds4.h"
-#include "../ds4_tp.h"
+#include "../src/ds4.h"
+#include "../src/ds4_tp.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

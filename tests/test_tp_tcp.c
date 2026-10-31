@@ -1,5 +1,5 @@
 /* TCP gates must not depend on the requested socket-buffer size. */
-#include "../ds4_tp.c"
+#include "../src/ds4_tp.c"
 #include <assert.h>
 
 typedef struct {

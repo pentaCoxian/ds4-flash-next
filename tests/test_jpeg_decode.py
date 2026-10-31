@@ -28,7 +28,7 @@ class JpegDecodeTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         lib = Path(cls.temp.name) / "image.so"
         subprocess.run(shlex.split(os.environ.get("CC", "cc")) +
-                       ["-shared", "-fPIC", "-O2", str(root / "ds4_image.c"),
+                       ["-shared", "-fPIC", "-O2", str(root / "src" / "ds4_image.c"),
                         "-lm", "-o", str(lib)], check=True)
         cls.lib = ctypes.CDLL(str(lib))
         cls.lib.ds4_image_decode_memory.argtypes = [ctypes.POINTER(DecodedImage),

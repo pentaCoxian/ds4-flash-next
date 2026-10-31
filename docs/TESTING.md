@@ -57,9 +57,9 @@ contain real conversations.
 - [Steering vectors](../dir-steering/README.md)
 - [Benchmark scripts and charts](../speed-bench/README.md)
 - [Evaluation data and licenses](EVAL_DATA.md)
-- [Session payload implementation](../ds4.c) and
-  [cache header definitions](../ds4_kvstore.h)
-- [Pipeline protocol](../ds4_distributed.c) and [TP protocol](../ds4_tp.c)
+- [Session payload implementation](../src/ds4.c) and
+  [cache header definitions](../src/ds4_kvstore.h)
+- [Pipeline protocol](../src/ds4_distributed.c) and [TP protocol](../src/ds4_tp.c)
 
 For changes to state handling, cover rewind/replay, save/load, images, and
 multiple sessions as well as a fresh prompt. For distributed changes, exercise

@@ -17,9 +17,9 @@
  *  6. GLM batched-session placement scales independent cache allocations. */
 
 #define DS4_TEST_HOOKS
-#include "../ds4.h"
-#include "../ds4_gpu_mgpu.h"
-#include "../ds4_layer_pack.h"
+#include "../src/ds4.h"
+#include "../src/ds4_gpu_mgpu.h"
+#include "../src/ds4_layer_pack.h"
 
 #include <stdio.h>
 #include <stdlib.h>

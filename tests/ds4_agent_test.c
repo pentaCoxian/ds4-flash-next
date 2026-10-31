@@ -1,6 +1,6 @@
 #define DS4_AGENT_TEST
 #define DS4_AGENT_TEST_NO_MAIN
-#include "../ds4_agent.c"
+#include "../src/ds4_agent.c"
 #include <sys/resource.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/xattr.h>

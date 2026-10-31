@@ -1,4 +1,4 @@
-#include "../ds4.h"
+#include "../src/ds4.h"
 
 #include <math.h>
 #include <stdint.h>

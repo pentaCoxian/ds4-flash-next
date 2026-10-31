@@ -4,8 +4,8 @@
  * rather than calling cuda). The CUDA path is exercised on box smoke
  * runs.
  */
-#include "../ds4_gpu_args.h"
-#include "../ds4_gpu_mgpu.h"
+#include "../src/ds4_gpu_args.h"
+#include "../src/ds4_gpu_mgpu.h"
 
 #include <stdbool.h>
 #include <stdio.h>

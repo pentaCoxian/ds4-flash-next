@@ -348,7 +348,7 @@ projections, kept at the released BF16 by default), `--no-mtp` and
 `--dry-run`. Norms, conv kernels, `ssm_a`, dt biases and the routers stay F32.
 N-grams always retain the original BF16 bytes. The converter finishes through
 the native packer above; its temporary main-weight file is removed on success.
-`gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
+`gen_qwen4_unicode.py` regenerates `src/ds4_qwen4_unicode.inc` for the `qwen35`
 pre-tokenizer from a current `regex` release.
 
 `make test-qwen4-kernels` runs the Metal kernel tests and

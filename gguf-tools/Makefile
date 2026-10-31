@@ -14,7 +14,7 @@ SHARED_FLAGS := -dynamiclib
 QUALITY_LDLIBS := -lm -pthread -framework Foundation -framework Metal
 QUALITY_TARGETS := build/ds4.o build/ds4_metal.o build/ds4_distributed.o build/ds4_tp.o build/ds4_ssd.o build/ds4_layer_pack.o build/ds4_engram.o build/ds4_image.o build/rax.o build/ds4_gpu_args.o build/ds4_quants.o
 QUALITY_OBJS := ../build/ds4.o ../build/ds4_metal.o ../build/ds4_distributed.o ../build/ds4_tp.o ../build/ds4_ssd.o ../build/ds4_layer_pack.o ../build/ds4_engram.o ../build/ds4_image.o ../build/rax.o ../build/ds4_gpu_args.o ../build/ds4_quants.o
-QUALITY_LINK = $(CC) $(CFLAGS) -I.. -o
+QUALITY_LINK = $(CC) $(CFLAGS) -I.. -I../src -o
 LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \
 	-lllama -lggml -lggml-base -lggml-cpu -lggml-blas -lggml-metal \
 	-framework Foundation -framework Metal -framework Accelerate
@@ -37,7 +37,7 @@ QUALITY_TARGETS := build/ds4.o build/ds4_cuda.o build/ds4_distributed.o build/ds
 QUALITY_OBJS := ../build/ds4.o ../build/ds4_cuda.o ../build/ds4_distributed.o ../build/ds4_tp.o ../build/ds4_ssd.o ../build/ds4_layer_pack.o ../build/ds4_engram.o ../build/ds4_image.o ../build/rax.o ../build/ds4_gpu_args.o \
 	../cuda/mmq/ds4_ggml_stubs.o ../cuda/mmq/ds4_mmq.o ../cuda/mmq/ds4_mmq_d2r.o \
 	../cuda/mmq/quantize.o ../cuda/mmq/mmid.o ../cuda/mmq/mmvq.o ../cuda/mmq/ds4_repack.o
-QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I.. -o
+QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I.. -I../src -o
 LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \
 	-lllama -lggml -lggml-base -lggml-cpu -ldl -lpthread
 endif

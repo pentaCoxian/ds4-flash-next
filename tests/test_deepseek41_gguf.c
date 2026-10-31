@@ -1,6 +1,6 @@
 /* Header-only sparse fixtures: no real model or GPU allocation. */
-#include "../ds4.c"
-#include "../ds4_engram.h"
+#include "../src/ds4.c"
+#include "../src/ds4_engram.h"
 #include <assert.h>
 #include <sys/wait.h>
 #ifdef __APPLE__

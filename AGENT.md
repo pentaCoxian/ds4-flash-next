@@ -30,6 +30,8 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 
 ## Layout
 
+The sources below are in `src/`.
+
 - `ds4.c`: model loading, tokenizer, CPU reference code, Metal graph scheduling,
   sessions, disk-cache payload serialization.
 - `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.

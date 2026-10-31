@@ -1,4 +1,4 @@
-#include "../ds4.c"
+#include "../src/ds4.c"
 #include <assert.h>
 
 static void check_batch(ds4_engine *engine, const ds4_tokens *prompt, bool speculative) {

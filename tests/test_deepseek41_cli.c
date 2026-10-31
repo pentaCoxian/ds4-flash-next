@@ -1,6 +1,6 @@
 /* No generation: exercise the actual CLI transcript updater with the V4.1 fixture. */
 #define main ds4_cli_main
-#include "../ds4_cli.c"
+#include "../src/ds4_cli.c"
 #undef main
 #include <assert.h>
 

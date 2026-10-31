@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare V4.1 resize/layout planning with the released image_processor.py.
 
-Build ds4_image.c as a shared library and pass it with --library. This test
+Build src/ds4_image.c as a shared library and pass it with --library. This test
 uses only the reference's pure resize functions; PyTorch is not required.
 """
 import argparse

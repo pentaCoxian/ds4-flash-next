@@ -4,7 +4,7 @@
 static int test_pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 #define pthread_create test_pthread_create
 #endif
-#include "../ds4.c"
+#include "../src/ds4.c"
 #ifndef __APPLE__
 #undef pthread_create
 static int thread_budget = -1;

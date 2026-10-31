@@ -1,4 +1,4 @@
-#include "../ds4_tp.c"
+#include "../src/ds4_tp.c"
 #include <assert.h>
 #include <pthread.h>
 

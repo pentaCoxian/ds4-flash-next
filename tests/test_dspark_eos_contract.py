@@ -308,7 +308,7 @@ int main(void) {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[1] / 'ds4.c')
+    parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[1] / 'src' / 'ds4.c')
     parser.add_argument('--output', type=Path, help='exclusive-new report directory with emitted C, build and run evidence')
     args = parser.parse_args()
     raw = args.source.read_bytes()

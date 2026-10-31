@@ -195,5 +195,5 @@ requests need a complete route before proceeding, and the coordinator can
 replay the saved token prefix to rebuild worker state. Pipeline snapshots
 serialize all layer slices into one payload and redistribute them when loaded.
 
-For protocol details, see [ds4_distributed.c](../ds4_distributed.c)
-and [ds4_tp.c](../ds4_tp.c).
+For protocol details, see [ds4_distributed.c](../src/ds4_distributed.c)
+and [ds4_tp.c](../src/ds4_tp.c).

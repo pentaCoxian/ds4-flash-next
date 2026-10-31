@@ -1,5 +1,5 @@
 /* Exercise RDMA completion accounting without a device or model. */
-#include "../ds4_tp.c"
+#include "../src/ds4_tp.c"
 #include <assert.h>
 
 #ifdef DS4_TP_HAVE_VERBS

@@ -1,5 +1,5 @@
 /* Bounded SSD graph bring-up. Run only on a dedicated Metal test host. */
-#include "../ds4.c"
+#include "../src/ds4.c"
 #include <assert.h>
 #include <sys/wait.h>
 

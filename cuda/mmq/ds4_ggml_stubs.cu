@@ -11,7 +11,7 @@
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
-#include "../../ds4_rocm_memory.h"
+#include "../../src/ds4_rocm_memory.h"
 #else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>

@@ -1,5 +1,5 @@
 /* Exercise the real CDP/HTTP transport against the local fixture server. */
-#include "../ds4_web.c"
+#include "../src/ds4_web.c"
 #include <assert.h>
 
 int main(int argc, char **argv) {

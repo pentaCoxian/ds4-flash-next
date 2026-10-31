@@ -144,6 +144,6 @@ Use `--trace /tmp/ds4-trace.txt` to record prompt rendering, cache decisions,
 generated text, and tool-parser events. Traces can contain sensitive content.
 
 Cache formats are implementation details. The current header and extension
-definitions are in [ds4_kvstore.h](../ds4_kvstore.h) and
-[ds4_kvstore.c](../ds4_kvstore.c); model-specific payload handling is in
-[ds4.c](../ds4.c).
+definitions are in [ds4_kvstore.h](../src/ds4_kvstore.h) and
+[ds4_kvstore.c](../src/ds4_kvstore.c); model-specific payload handling is in
+[ds4.c](../src/ds4.c).

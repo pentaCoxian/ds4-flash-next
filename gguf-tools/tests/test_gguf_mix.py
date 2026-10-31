@@ -41,7 +41,7 @@ def write_gguf(path, tensors):
 
 class TypeTable(unittest.TestCase):
     def test_matches_ds4_quants(self):
-        src = (ROOT/'ds4_quants.c').read_text()
+        src = (ROOT/'src'/'ds4_quants.c').read_text()
         ids = {m[1]: int(m[2]) for m in re.finditer(r'\bQ_(\w+)\s*=\s*(\d+)', src)}
         infos = re.findall(r'\{\s*Q_(\w+),\s*(\d+),\s*(\d+),', src)
         self.assertGreater(len(infos), 10)

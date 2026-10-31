@@ -1,7 +1,7 @@
 /* Real-model mixed prefill/decode replay, including the sparse boundary.
  * Usage: test_qwen4_prefill MODEL PROMPT [MAX_CONTEXT [DUMP_DIRECTORY]] */
 #define _POSIX_C_SOURCE 200809L
-#include "../ds4.h"
+#include "../src/ds4.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
