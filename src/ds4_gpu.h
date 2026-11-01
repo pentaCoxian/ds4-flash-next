@@ -3380,8 +3380,8 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps);
-/* Apple only: the hc norm and its BF16 low-rank down projection in one
- * dispatch for 1 to 3 tokens; 0 when the shapes or types do not fit.  With
+/* Apple only: the hc norm and its BF16 or Q8_0 low-rank down projection in
+ * one dispatch for 1 to 3 tokens; 0 when the shapes or types do not fit.  With
  * blk it first combines R with the block output weighted by old_inj, and
  * leaves the combined streams in next_R (R itself is not written) and the
  * new partials in inj_part, which must not share old_inj's buffer. */

@@ -48672,6 +48672,12 @@ enum {
     QWEN4_K_HC_COMBINE_NORM_DOWN_NT1,
     QWEN4_K_HC_COMBINE_NORM_DOWN_NT2,
     QWEN4_K_HC_COMBINE_NORM_DOWN_NT3,
+    QWEN4_K_HC_NORM_DOWN_Q8_NT1,
+    QWEN4_K_HC_NORM_DOWN_Q8_NT2,
+    QWEN4_K_HC_NORM_DOWN_Q8_NT3,
+    QWEN4_K_HC_COMBINE_NORM_DOWN_Q8_NT1,
+    QWEN4_K_HC_COMBINE_NORM_DOWN_Q8_NT2,
+    QWEN4_K_HC_COMBINE_NORM_DOWN_Q8_NT3,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE_NT2,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE_NT3,
@@ -48824,6 +48830,12 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_combine_norm_down_nt1",
     "kernel_qwen4_hc_combine_norm_down_nt2",
     "kernel_qwen4_hc_combine_norm_down_nt3",
+    "kernel_qwen4_hc_norm_down_q8_nt1",
+    "kernel_qwen4_hc_norm_down_q8_nt2",
+    "kernel_qwen4_hc_norm_down_q8_nt3",
+    "kernel_qwen4_hc_combine_norm_down_q8_nt1",
+    "kernel_qwen4_hc_combine_norm_down_q8_nt2",
+    "kernel_qwen4_hc_combine_norm_down_q8_nt3",
     "kernel_qwen4_hc_gate_mix_bf16_rows_store",
     "kernel_qwen4_hc_gate_mix_bf16_rows_store_nt2",
     "kernel_qwen4_hc_gate_mix_bf16_rows_store_nt3",
@@ -49088,14 +49100,16 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
         MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
-/* The hc norm and its BF16 low-rank down projection in one dispatch
+/* The hc norm and its BF16 or Q8_0 low-rank down projection in one dispatch
  * (kernel_qwen4_hc_norm_down): xn and the inject partials come out as from
- * ds4_gpu_qwen4_hc_norm_tensor and lo within rounding of the BF16 matvec.
+ * ds4_gpu_qwen4_hc_norm_tensor and lo within rounding of the matvec.
  * With blk the combine of ds4_gpu_qwen4_hc_combine_tensor comes first, its
  * streams left in next_R (see ds4_gpu.h).  1 to 3 tokens, four streams,
- * BF16 inject and down rows; 0 otherwise, and the caller runs the separate
- * kernels.  Apple9 default; DS4_QWEN4_HC_NORM_DOWN=0/1 overrides on any
- * device. */
+ * BF16 inject rows; 0 otherwise, and the caller runs the separate kernels.
+ * BF16 down rows: Apple9 default.  Q8_0 down rows: every device, whose
+ * fallback is a separate norm and the generic matvec, whose 2- and 3-row
+ * products round differently from its 1-row one.  DS4_QWEN4_HC_NORM_DOWN=0/1
+ * overrides both on any device. */
 /* low-rank rows per matvec group: QWEN4_HC_DOWN_ROWS in metal/qwen4.metal */
 #define DS4_QWEN4_HC_DOWN_ROWS 2u
 
@@ -49106,11 +49120,13 @@ int ds4_gpu_qwen4_hc_norm_down_tensor(
         uint32_t n_hc, uint32_t n_inject, uint32_t n_rank, float eps,
         const ds4_gpu_tensor *blk, const ds4_gpu_tensor *old_inj, ds4_gpu_tensor *next_R) {
     const int override = ds4_gpu_env_bool("DS4_QWEN4_HC_NORM_DOWN");
-    if (!(override >= 0 ? override > 0 : g_metal_apple_family == 9)) return 0;
+    const bool q8 = down_type == 8u;
+    if (!(override >= 0 ? override > 0 : q8 || g_metal_apple_family == 9)) return 0;
     const uint64_t dim = (uint64_t)n_embd * n_hc;
     const bool combine = blk != NULL;
     if (n_tokens == 0 || n_tokens > 3u || n_hc != 4u || n_inject > 4u || (n_inject && inject_type != 30u) ||
-        down_type != 30u || (n_embd % 8u) != 0 || n_rank == 0 || (n_rank % DS4_QWEN4_HC_DOWN_ROWS) != 0) return 0;
+        (down_type != 30u && !q8) || (n_embd % (q8 ? 32u : 8u)) != 0 || n_rank == 0 ||
+        (n_rank % DS4_QWEN4_HC_DOWN_ROWS) != 0) return 0;
     /* the combine reads R and old_inj while other groups write next_R and inj_part */
     if (combine && (!old_inj || !next_R || n_inject != n_hc ||
                     ds4_gpu_tensor_buffer(next_R) == ds4_gpu_tensor_buffer(R) ||
@@ -49121,7 +49137,8 @@ int ds4_gpu_qwen4_hc_norm_down_tensor(
     if (!qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "hc norm input") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, gamma_offset, dim * sizeof(float), "hc norm gamma") ||
         !qwen4_bind_tensor(&b[3], xn, n_tokens * dim * sizeof(float), "hc norm output") ||
-        !qwen4_bind_weight(&b[5], model_map, model_size, down_offset, (uint64_t)n_rank * dim * 2u, "hc down rows") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, down_offset, (uint64_t)n_rank * qwen4_hc_row_bytes(down_type, dim),
+                           "hc down rows") ||
         !qwen4_bind_tensor(&b[6], lo, (uint64_t)n_tokens * n_rank * sizeof(float), "hc low-rank output")) {
         return 0;
     }
@@ -49148,7 +49165,8 @@ int ds4_gpu_qwen4_hc_norm_down_tensor(
         b[8] = b[0];
         b[9] = b[3];
     }
-    const int kernel = (combine ? QWEN4_K_HC_COMBINE_NORM_DOWN_NT1 : QWEN4_K_HC_NORM_DOWN_NT1) + (int)n_tokens - 1;
+    const int kernel = (combine ? q8 ? QWEN4_K_HC_COMBINE_NORM_DOWN_Q8_NT1 : QWEN4_K_HC_COMBINE_NORM_DOWN_NT1
+                                : q8 ? QWEN4_K_HC_NORM_DOWN_Q8_NT1 : QWEN4_K_HC_NORM_DOWN_NT1) + (int)n_tokens - 1;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 10,
                           MTLSizeMake(n_rank / DS4_QWEN4_HC_DOWN_ROWS + n_tokens * n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1),
                           MTLSizeMake(128, 1, 1), 0);

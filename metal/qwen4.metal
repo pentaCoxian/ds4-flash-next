@@ -214,19 +214,20 @@ static inline float qwen4_hc_inject_weight(device const float *inj_part, uint hc
     return 2.0f * qwen4_sigmoid(a / (float)hc);
 }
 
-/* The hc norm and the BF16 low-rank down projection of the same streams in
- * one dispatch, for decode and verify batches of NT <= 3 tokens.  The first
- * n_down_tgs threadgroups are a K-split matvec of QWEN4_HC_DOWN_ROWS rows
- * whose four simdgroups split each stream by 8-weight words; from the same
- * loads they sum each stream's squares and its dot with r * g, and scale
- * the dots by the stream's rsqrt(mean square + eps) at the end, so no group
- * waits on a norm before streaming weights.  Their sums are spelled out
- * with reassociation and contraction pinned off, so a token's lo does not
- * depend on the batch it is in (verify rows round as decode rows;
- * tests/test_qwen4_kernels.c pins it) though they may round differently
- * from the separate norm and matvec in the last bit.  The other
- * threadgroups are the norm's own (stream, chunk, token) groups, which
- * still write xn and the inject partials for the gate mix and the combine.
+/* The hc norm and the BF16 or Q8_0 low-rank down projection of the same
+ * streams in one dispatch, for decode and verify batches of NT <= 3
+ * tokens.  The first n_down_tgs threadgroups are a K-split matvec of
+ * QWEN4_HC_DOWN_ROWS rows whose four simdgroups split each stream by
+ * 8-weight words (qwen4_hc_down_*); from the same loads they sum each
+ * stream's squares and its dot with r * g, and scale the dots by the
+ * stream's rsqrt(mean square + eps) at the end, so no group waits on a norm
+ * before streaming weights.  Their sums are spelled out with reassociation
+ * and contraction pinned off, so a token's lo does not depend on the batch
+ * it is in (verify rows round as decode rows; tests/test_qwen4_kernels.c
+ * pins it) though they may round differently from the separate norm and
+ * matvec in the last bit.  The other threadgroups are the norm's own
+ * (stream, chunk, token) groups, which still write xn and the inject
+ * partials for the gate mix and the combine.
  *
  * CB folds in the combine that precedes the FFN side's norm: the streams
  * are R + 2*sigmoid(old inject/hc) * blk, which every threadgroup forms
@@ -264,7 +265,56 @@ static inline float qwen4_hc_combined(float r, float w, float b) {
     return fma(w, b, r);
 }
 
-template <short NT, bool CB>
+/* The down rows by 8-weight word: load fetches word i of a row, dot is its
+ * dot with y[8] in a pinned order.  A BF16 word is one uint4. */
+struct qwen4_hc_down_bf16 {
+    typedef uint4 word_t;
+    static uint64_t row_bytes(uint dim) { return (uint64_t)dim * 2u; }
+    static word_t load(device const char *row, uint i) { return ((device const uint4 *)row)[i]; }
+    static float dot(word_t qw, thread const float *y) {
+        const float4 w0 = as_type<float4>(uint4(qw.x << 16, qw.x & 0xFFFF0000u, qw.y << 16, qw.y & 0xFFFF0000u));
+        const float4 w1 = as_type<float4>(uint4(qw.z << 16, qw.z & 0xFFFF0000u, qw.w << 16, qw.w & 0xFFFF0000u));
+        const float wv[8] = { w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w };
+        float p = 0.0f;
+        for (short j = 0; j < 8; j++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+            const float m = wv[j] * y[j];
+            p = p + m;
+        }
+        return p;
+    }
+};
+
+/* A Q8_0 word is a quarter of a 34-byte block: the block's f16 scale and
+ * eight int8 weights, 2-byte aligned; the scale multiplies their dot. */
+struct qwen4_hc_down_q8 {
+    struct word_t { half d; ushort4 q; };
+    static uint64_t row_bytes(uint dim) { return (uint64_t)(dim / 32u) * 34u; }
+    static word_t load(device const char *row, uint i) {
+        device const char *b = row + (i >> 2) * 34u;
+        return word_t{ *(device const half *)b, ushort4(*(device const packed_ushort4 *)(b + 2u + (i & 3u) * 8u)) };
+    }
+    static float dot(word_t w, thread const float *y) {
+        const char2 c0 = as_type<char2>(w.q.x), c1 = as_type<char2>(w.q.y);
+        const char2 c2 = as_type<char2>(w.q.z), c3 = as_type<char2>(w.q.w);
+        const float wv[8] = { (float)c0.x, (float)c0.y, (float)c1.x, (float)c1.y,
+                              (float)c2.x, (float)c2.y, (float)c3.x, (float)c3.y };
+        float p = 0.0f;
+        for (short j = 0; j < 8; j++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+            const float m = wv[j] * y[j];
+            p = p + m;
+        }
+        {
+#pragma clang fp contract(off)
+            return (float)w.d * p;
+        }
+    }
+};
+
+template <short NT, bool CB, typename WD>
 kernel void kernel_qwen4_hc_norm_down(
         constant ds4_metal_args_qwen4_hc_norm_down & args,
         device const float *R,          /* [T][hc*E] */
@@ -272,7 +322,7 @@ kernel void kernel_qwen4_hc_norm_down(
         device const char  *w_inject,   /* [n_inject][hc*E] bf16 */
         device float       *xn,         /* [T][hc*E] */
         device float       *inj_part,   /* [T][hc*chunks][n_inject] */
-        device const char  *w_down,     /* [n_rank][hc*E] bf16 */
+        device const char  *w_down,     /* [n_rank][hc*E] bf16 or q8_0 */
         device float       *lo,         /* [T][n_rank] */
         device const float *blk,        /* CB: [T][E] block output */
         device const float *old_inj,    /* CB: [T][hc*chunks][hc] partials of the block's own norm */
@@ -351,10 +401,10 @@ kernel void kernel_qwen4_hc_norm_down(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const int first_row = tgpig.x * NR0;
-    const uint64_t row_bytes = (uint64_t)dim * 2u;
-    device const uint4 *ax[NR0];
+    const uint64_t row_bytes = WD::row_bytes(dim);
+    device const char *ax[NR0];
     for (short row = 0; row < NR0; ++row) {
-        ax[row] = (device const uint4 *)(w_down + (uint64_t)min(first_row + row, (int)args.n_rank - 1) * row_bytes);
+        ax[row] = w_down + (uint64_t)min(first_row + row, (int)args.n_rank - 1) * row_bytes;
     }
     const uint n8s = E / 8u;   /* 8-weight words per stream */
     float dots[NT][NR0][HC], sqs[NT][HC];
@@ -366,8 +416,8 @@ kernel void kernel_qwen4_hc_norm_down(
         }
         for (uint i = sgitg * 32 + tiisg; i < n8s; i += nsg * 32) {
             const uint word = s * n8s + i;
-            uint4 w[NR0];
-            for (short row = 0; row < NR0; row++) w[row] = ax[row][word];
+            typename WD::word_t w[NR0];
+            for (short row = 0; row < NR0; row++) w[row] = WD::load(ax[row], word);
             device const float *g = gamma + 8u * word;
             for (short t = 0; t < NT; t++) {
                 const uint tok = min((uint)t, args.n_tokens - 1u);
@@ -384,17 +434,7 @@ kernel void kernel_qwen4_hc_norm_down(
                     y[j] = c * g[j];
                 }
                 for (short row = 0; row < NR0; row++) {
-                    const uint4 qw = w[row];
-                    const float4 w0 = as_type<float4>(uint4(qw.x << 16, qw.x & 0xFFFF0000u, qw.y << 16, qw.y & 0xFFFF0000u));
-                    const float4 w1 = as_type<float4>(uint4(qw.z << 16, qw.z & 0xFFFF0000u, qw.w << 16, qw.w & 0xFFFF0000u));
-                    const float wv[8] = { w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w };
-                    float p = 0.0f;
-                    for (short j = 0; j < 8; j++) {
-#pragma clang fp reassociate(off)
-#pragma clang fp contract(off)
-                        const float m = wv[j] * y[j];
-                        p = p + m;
-                    }
+                    const float p = WD::dot(w[row], y);
                     {
 #pragma clang fp reassociate(off)
 #pragma clang fp contract(off)
@@ -439,17 +479,23 @@ kernel void kernel_qwen4_hc_norm_down(
     if (t < args.n_tokens && first_row + (int)row < (int)args.n_rank) lo[(uint64_t)t * args.n_rank + first_row + row] = acc;
 }
 
-#define QWEN4_HC_NORM_DOWN_INSTANCE(NAME, NT, CB) \
-template [[host_name(NAME)]] kernel void kernel_qwen4_hc_norm_down<NT, CB>( \
+#define QWEN4_HC_NORM_DOWN_INSTANCE(NAME, NT, CB, WD) \
+template [[host_name(NAME)]] kernel void kernel_qwen4_hc_norm_down<NT, CB, WD>( \
         constant ds4_metal_args_qwen4_hc_norm_down &, device const float *, device const float *, \
         device const char *, device float *, device float *, device const char *, device float *, \
         device const float *, device const float *, device float *, uint3, ushort, ushort3, ushort, ushort);
-QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_nt1", 1, false)
-QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_nt2", 2, false)
-QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_nt3", 3, false)
-QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_nt1", 1, true)
-QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_nt2", 2, true)
-QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_nt3", 3, true)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_nt1", 1, false, qwen4_hc_down_bf16)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_nt2", 2, false, qwen4_hc_down_bf16)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_nt3", 3, false, qwen4_hc_down_bf16)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_nt1", 1, true, qwen4_hc_down_bf16)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_nt2", 2, true, qwen4_hc_down_bf16)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_nt3", 3, true, qwen4_hc_down_bf16)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_q8_nt1", 1, false, qwen4_hc_down_q8)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_q8_nt2", 2, false, qwen4_hc_down_q8)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_norm_down_q8_nt3", 3, false, qwen4_hc_down_q8)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_q8_nt1", 1, true, qwen4_hc_down_q8)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_q8_nt2", 2, true, qwen4_hc_down_q8)
+QWEN4_HC_NORM_DOWN_INSTANCE("kernel_qwen4_hc_combine_norm_down_q8_nt3", 3, true, qwen4_hc_down_q8)
 
 struct ds4_metal_args_qwen4_hc_gate_mix {
     uint32_t n_tokens;
