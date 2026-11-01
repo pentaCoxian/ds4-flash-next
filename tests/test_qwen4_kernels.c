@@ -1416,7 +1416,7 @@ static void test_hc_combine_norm_down(arena_t *a, uint32_t wtype) {
  * the rows gate mix of 1 to 3 tokens, and with combine the FFN side's
  * combine + norm + down and the storing gate mix, which leaves the combined
  * streams in R and their partials in inj. */
-static void test_hc_fused_ref(arena_t *a, uint32_t wtype, bool with_combine) {
+static void test_hc_fused_ref(arena_t *a, uint32_t wtype) {
     const uint32_t E = 2560, hc = 4, dim = E * hc, rank = 320, CH = DS4_QWEN4_HC_CHUNKS, ni = hc * CH * hc;
     const float eps = 1e-6f;
     double *g_gamma, *g_down, *g_up, *g_inj;
@@ -1424,7 +1424,7 @@ static void test_hc_fused_ref(arena_t *a, uint32_t wtype, bool with_combine) {
     const uint64_t inj_off = arena_bf16(a, (uint64_t)hc * dim, &g_inj, 0.05f);
     const uint64_t down_off = arena_hc_rows(a, wtype, rank, dim, &g_down, 0.05f);
     const uint64_t up_off = arena_hc_rows(a, wtype, dim, rank, &g_up, 0.2f);
-    for (uint32_t T = 1; T <= 3u; T++) for (int combine = 0; combine < (with_combine ? 2 : 1); combine++) {
+    for (uint32_t T = 1; T <= 3u; T++) for (int combine = 0; combine < 2; combine++) {
         float *R = rand_vec((uint64_t)T * dim, 1.0f), *blk = rand_vec((uint64_t)T * E, 1.0f);
         float *old = rand_vec((uint64_t)T * ni, 0.5f);
 
@@ -3676,6 +3676,12 @@ static void bench_cold(arena_t *a) {
         { "hc q8 norm+down T=2 fused", 8u, 10240, 320, 8.5, 3, 2 },
         { "hc q8 norm+down T=3 separate", 8u, 10240, 320, 8.5, 2, 3 },
         { "hc q8 norm+down T=3 fused", 8u, 10240, 320, 8.5, 3, 3 },
+        { "hc q8 ffn side T=1 separate", 8u, 10240, 640, 8.5, 4, 1 },
+        { "hc q8 ffn side T=1 fused", 8u, 10240, 640, 8.5, 5, 1 },
+        { "hc q8 ffn side T=2 separate", 8u, 10240, 640, 8.5, 4, 2 },
+        { "hc q8 ffn side T=2 fused", 8u, 10240, 640, 8.5, 5, 2 },
+        { "hc q8 ffn side T=3 separate", 8u, 10240, 640, 8.5, 4, 3 },
+        { "hc q8 ffn side T=3 fused", 8u, 10240, 640, 8.5, 5, 3 },
         { "bf16 hc down 10240->320", 30u, 10240, 320, 16.0, 0, 0 },
         { "bf16 router 2560->512", 30u, 2560, 512, 16.0, 0, 0 },
         { "bf16 hc_gate_mix 320->4x2560", 30u, 320, 10240, 16.0, 1, 0 },
@@ -4420,9 +4426,9 @@ int main(void) {
     }
     for (uint32_t k = 0; k < 2u; k++) {
         test_hc_norm_down_rows(&arena, k ? 8u : 30u);
-        test_hc_fused_ref(&arena, k ? 8u : 30u, k == 0);
+        test_hc_combine_norm_down(&arena, k ? 8u : 30u);
+        test_hc_fused_ref(&arena, k ? 8u : 30u);
     }
-    test_hc_combine_norm_down(&arena, 30u);
     for (uint32_t T = 1; T <= 7; T += 2) {
         test_router_sg_exact(&arena, T, true, false);
         test_router_sg_exact(&arena, T, true, true);

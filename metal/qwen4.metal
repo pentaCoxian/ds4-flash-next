@@ -550,22 +550,53 @@ QWEN4_HC_MIX_INSTANCE(f32, qwen4_w_f32)
 QWEN4_HC_MIX_INSTANCE(q8, qwen4_w_q8)
 QWEN4_HC_MIX_INSTANCE(bf16, qwen4_w_bf16)
 
-/* BF16 gate/mix for NT token rows: the threadgroup activates the n_rank
- * low-rank inputs of each token once into threadgroup memory, then each
- * simdgroup takes QWEN4_HC_MIX_ROWS outputs d; per d the four 8-lane groups
- * read their stream's row as 4-weight words (consecutive lanes, consecutive
+/* BF16 or Q8_0 gate/mix for NT token rows: the threadgroup activates the
+ * n_rank low-rank inputs of each token once into threadgroup memory, then
+ * each simdgroup takes QWEN4_HC_MIX_ROWS outputs d; per d the four 8-lane
+ * groups read their stream's row as words (consecutive lanes, consecutive
  * words), each word dotted with every token's inputs. */
 #define QWEN4_HC_MIX_ROWS 4
+
+/* The up rows by word: load fetches word q of a row, act the matching
+ * activated inputs of one token, dot their product.  A BF16 word is four
+ * weights. */
+struct qwen4_hc_up_bf16 {
+    static constexpr constant uint n = 4;   /* weights per word */
+    typedef float4 word_t;
+    typedef float4 act_t;
+    static uint64_t row_bytes(uint rank) { return (uint64_t)rank * 2u; }
+    static word_t load(device const char *row, uint q) {
+        return as_type<float4>(uint4(((device const ushort4 *)row)[q]) << 16);
+    }
+    static act_t act(threadgroup const float4 *a, uint q) { return a[q]; }
+    static float dot(word_t w, act_t a) { return metal::dot(w, a); }
+};
+
+/* A Q8_0 word is a quarter block: its f16 scale and eight int8 weights. */
+struct qwen4_hc_up_q8 {
+    static constexpr constant uint n = 8;
+    struct word_t { float d; float4 lo, hi; };
+    struct act_t { float4 lo, hi; };
+    static uint64_t row_bytes(uint rank) { return (uint64_t)(rank / 32u) * 34u; }
+    static word_t load(device const char *row, uint q) {
+        device const char *b = row + (q >> 2) * 34u;
+        const ushort4 u = ushort4(*(device const packed_ushort4 *)(b + 2u + (q & 3u) * 8u));
+        const char4 c0 = as_type<char4>(ushort2(u.x, u.y)), c1 = as_type<char4>(ushort2(u.z, u.w));
+        return word_t{ (float)*(device const half *)b, float4(c0), float4(c1) };
+    }
+    static act_t act(threadgroup const float4 *a, uint q) { return act_t{ a[2u * q], a[2u * q + 1u] }; }
+    static float dot(word_t w, act_t a) { return w.d * (metal::dot(w.lo, a.lo) + metal::dot(w.hi, a.hi)); }
+};
 
 /* ST: the dispatch also copies the combined streams and their inject
  * partials, which kernel_qwen4_hc_norm_down<NT, true> left in its own
  * buffers, over R and inj; nothing here reads either. */
-template <short NT, bool ST>
-kernel void kernel_qwen4_hc_gate_mix_bf16_rows(
+template <short NT, bool ST, typename WU>
+kernel void kernel_qwen4_hc_gate_mix_rows(
         constant ds4_metal_args_qwen4_hc_gate_mix & args,
         device const float *xn,       /* [T][hc*E] */
         device const float *lo,       /* [T][n_rank] raw */
-        device const char  *w_up,     /* [hc*E][n_rank] bf16 */
+        device const char  *w_up,     /* [hc*E][n_rank] bf16 or q8_0 */
         device float       *mixed,    /* [T][E] */
         device float4      *res,      /* ST: [T][hc*E] */
         device const float4 *res_next,
@@ -593,20 +624,20 @@ kernel void kernel_qwen4_hc_gate_mix_bf16_rows(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint d0 = (tgpig.x * (ntg.x / 32u) + sgitg) * QWEN4_HC_MIX_ROWS;
     if (d0 >= E) return;
-    const uint s = tiisg / 8, lane = tiisg % 8, nq = R / 4;
+    const uint s = tiisg / 8, lane = tiisg % 8, nq = R / WU::n;
     threadgroup const float4 *a4 = (threadgroup const float4 *)act;
-    device const ushort4 *w[QWEN4_HC_MIX_ROWS];
+    device const char *w[QWEN4_HC_MIX_ROWS];
     for (uint k = 0; k < QWEN4_HC_MIX_ROWS; k++) {
         const uint d = min(d0 + k, E - 1u);
-        w[k] = (device const ushort4 *)(w_up + (uint64_t)(s * E + d) * R * 2u);
+        w[k] = w_up + (uint64_t)(s * E + d) * WU::row_bytes(R);
     }
     float acc[NT][QWEN4_HC_MIX_ROWS] = {{ 0.0f }};
     for (uint q = lane; q < nq; q += 8) {
-        float4 a[NT];
-        for (short t = 0; t < NT; t++) a[t] = a4[t * nq + q];
+        typename WU::act_t a[NT];
+        for (short t = 0; t < NT; t++) a[t] = WU::act(a4 + t * (R / 4u), q);
         for (uint k = 0; k < QWEN4_HC_MIX_ROWS; k++) {
-            const float4 wf = as_type<float4>(uint4(w[k][q]) << 16);
-            for (short t = 0; t < NT; t++) acc[t][k] += dot(wf, a[t]);
+            const typename WU::word_t wf = WU::load(w[k], q);
+            for (short t = 0; t < NT; t++) acc[t][k] += WU::dot(wf, a[t]);
         }
     }
     for (short t = 0; t < NT; t++) {
@@ -626,17 +657,23 @@ kernel void kernel_qwen4_hc_gate_mix_bf16_rows(
     }
 }
 
-#define QWEN4_HC_MIX_ROWS_INSTANCE(NAME, NT, ST) \
-template [[host_name(NAME)]] kernel void kernel_qwen4_hc_gate_mix_bf16_rows<NT, ST>( \
+#define QWEN4_HC_MIX_ROWS_INSTANCE(NAME, NT, ST, WU) \
+template [[host_name(NAME)]] kernel void kernel_qwen4_hc_gate_mix_rows<NT, ST, WU>( \
         constant ds4_metal_args_qwen4_hc_gate_mix &, device const float *, device const float *, \
         device const char *, device float *, device float4 *, device const float4 *, device float *, \
         device const float *, threadgroup float *, uint3, uint3, ushort, ushort3, ushort, ushort);
-QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows", 1, false)
-QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt2", 2, false)
-QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt3", 3, false)
-QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_store", 1, true)
-QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_store_nt2", 2, true)
-QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_store_nt3", 3, true)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows", 1, false, qwen4_hc_up_bf16)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt2", 2, false, qwen4_hc_up_bf16)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt3", 3, false, qwen4_hc_up_bf16)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_store", 1, true, qwen4_hc_up_bf16)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_store_nt2", 2, true, qwen4_hc_up_bf16)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_store_nt3", 3, true, qwen4_hc_up_bf16)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_q8_rows", 1, false, qwen4_hc_up_q8)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_q8_rows_nt2", 2, false, qwen4_hc_up_q8)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_q8_rows_nt3", 3, false, qwen4_hc_up_q8)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_q8_rows_store", 1, true, qwen4_hc_up_q8)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_q8_rows_store_nt2", 2, true, qwen4_hc_up_q8)
+QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_q8_rows_store_nt3", 3, true, qwen4_hc_up_q8)
 
 /* F16 gate/mix with eight terms loaded ahead per lane round.  Under the
  * library's fast math the shipped loop compiles to x = l*(1/hc);

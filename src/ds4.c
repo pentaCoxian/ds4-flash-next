@@ -59009,10 +59009,11 @@ static bool qwen4_graph_hc_gate_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m, 
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
     }
-    /* BF16 up rows take the same rows kernel at one, two and three tokens,
-     * and each token's sums there do not depend on the batch (fixed lane
-     * walk, per-token accumulators), so they need no split. */
-    if (T == 3u && g->verify_rows_exact && (up->type != DS4_TENSOR_BF16 || getenv("DS4_QWEN4_EXACT_HC_SPLIT"))) {
+    /* BF16 and Q8_0 up rows take the same rows kernel at one, two and three
+     * tokens, and each token's sums there do not depend on the batch (fixed
+     * lane walk, per-token accumulators), so they need no split. */
+    if (T == 3u && g->verify_rows_exact &&
+        ((up->type != DS4_TENSOR_BF16 && up->type != DS4_TENSOR_Q8_0) || getenv("DS4_QWEN4_EXACT_HC_SPLIT"))) {
         /* Split the 3-row gate/mix into the exact 2-row pair kernel plus the
          * 1-row generic kernel, so every row matches its T <= 2 rounding. */
         const uint64_t dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
@@ -59067,8 +59068,8 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 }
 
 /* R += the block output g->blk weighted by its norm's inject partials g->inj,
- * then hc_mix (the FFN side).  On Apple, up to three rows with BF16 hc
- * weights add the block output inside the fused norm + down dispatch: it
+ * then hc_mix (the FFN side).  On Apple, up to three rows with BF16 or Q8_0
+ * hc weights add the block output inside the fused norm + down dispatch: it
  * leaves the combined streams in hc_u and the new partials in inj_alt (both
  * idle at these sizes), and the gate mix copies them back, one dispatch
  * fewer per layer.  The streams are the separate combine's bits. */
@@ -59076,7 +59077,8 @@ static bool qwen4_graph_hc_combine_mix(ds4_qwen4_gpu_graph *g, const ds4_model *
                                        const ds4_tensor *norm, const ds4_tensor *down,
                                        const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
 #ifdef __APPLE__
-    if (T <= 3u && inject && up->type == DS4_TENSOR_BF16 && down->ndim >= 2 && down->dim[1] == DS4_N_HC_LOWRANK &&
+    if (T <= 3u && inject && (up->type == DS4_TENSOR_BF16 || up->type == DS4_TENSOR_Q8_0) &&
+        down->ndim >= 2 && down->dim[1] == DS4_N_HC_LOWRANK &&
         !(T == 3u && g->verify_rows_exact && getenv("DS4_QWEN4_EXACT_HC_SPLIT")) &&
         ds4_gpu_qwen4_hc_norm_down_tensor(g->xn, g->inj_alt, g->lo, g->R, m->map, m->size, norm->abs_offset,
                                           inject->abs_offset, inject->type, down->abs_offset, down->type, T,
