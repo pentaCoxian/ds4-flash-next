@@ -1505,6 +1505,48 @@ static void test_hc_fused_ref(arena_t *a, uint32_t wtype) {
     free(g_gamma); free(g_down); free(g_up); free(g_inj);
 }
 
+/* The prefill gate mix (T > 8): the activated low-rank rows, the up
+ * projection as the model's BF16 or Q8_0 GEMM over them, and the per-row
+ * mix, against the double reference. */
+static void test_hc_gemm_mix(arena_t *a, uint32_t wtype) {
+    const uint32_t E = 2560, hc = 4, dim = E * hc, rank = 320;
+    double *g_up;
+    const uint64_t up_off = arena_hc_rows(a, wtype, dim, rank, &g_up, 0.2f);
+    static const uint32_t Ts[3] = { 9, 64, 77 };
+    for (uint32_t k = 0; k < 3u; k++) {
+        const uint32_t T = Ts[k];
+        float *xn = rand_vec((uint64_t)T * dim, 1.0f), *lo = rand_vec((uint64_t)T * rank, 8.0f);
+        double *mixed = malloc((uint64_t)T * E * sizeof(double));
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t d = 0; d < E; d++) {
+                double m = 0.0;
+                for (uint32_t s = 0; s < hc; s++) {
+                    double acc = 0.0;
+                    for (uint32_t r = 0; r < rank; r++) acc += g_up[(uint64_t)(s * E + d) * rank + r] * silu_d(lo[t * rank + r] / hc);
+                    m += sigmoid_d(acc) * xn[(uint64_t)t * dim + s * E + d];
+                }
+                mixed[(uint64_t)t * E + d] = m / hc;
+            }
+        }
+        ds4_gpu_tensor *gxn = upload(xn, (uint64_t)T * dim), *glo = upload(lo, (uint64_t)T * rank);
+        ds4_gpu_tensor *gact = upload(NULL, (uint64_t)T * rank), *gu = upload(NULL, (uint64_t)T * dim);
+        ds4_gpu_tensor *gm = upload(NULL, (uint64_t)T * E);
+        require_ok(ds4_gpu_begin_commands() &&
+                   ds4_gpu_qwen4_hc_lo_act_tensor(gact, glo, T, hc, rank) &&
+                   (wtype == 8u ? ds4_gpu_qwen4_matmul_q8_0_tensor(gu, a->base, a->size, up_off, rank, dim, gact, T)
+                                : ds4_gpu_matmul_quant_tensor(gu, a->base, a->size, up_off, wtype, rank, dim, gact, T)) &&
+                   ds4_gpu_qwen4_hc_mix_rows_tensor(gm, gu, gxn, T, E, hc) &&
+                   ds4_gpu_end_commands(), "hc gemm mix");
+        char name[96];
+        snprintf(name, sizeof(name), "hc prefill mix T=%u %s", T, wtype == 8u ? "q8_0" : "bf16");
+        check_tensor(name, gm, mixed, (uint64_t)T * E, 1e-3);
+        ds4_gpu_tensor_free(gm); ds4_gpu_tensor_free(gu); ds4_gpu_tensor_free(gact);
+        ds4_gpu_tensor_free(glo); ds4_gpu_tensor_free(gxn);
+        free(mixed); free(lo); free(xn);
+    }
+    free(g_up);
+}
+
 /* The one-simdgroup router (DS4_QWEN4_ROUTER_SG) replays the 256-thread
  * kernel's reductions: experts, weights and the shared gate logit must be
  * bit-identical, with a BF16 gate row and without one, and with logits on
@@ -4428,6 +4470,7 @@ int main(void) {
         test_hc_norm_down_rows(&arena, k ? 8u : 30u);
         test_hc_combine_norm_down(&arena, k ? 8u : 30u);
         test_hc_fused_ref(&arena, k ? 8u : 30u);
+        test_hc_gemm_mix(&arena, k ? 8u : 30u);
     }
     for (uint32_t T = 1; T <= 7; T += 2) {
         test_router_sg_exact(&arena, T, true, false);

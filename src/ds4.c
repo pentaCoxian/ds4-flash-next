@@ -59002,9 +59002,16 @@ static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, co
 
 /* the low-rank gate of hc_mix over g->lo, mixing g->xn into g->mixed */
 static bool qwen4_graph_hc_gate_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_tensor *up, uint32_t T) {
-    if (T > 8u &&
-        up->type != DS4_TENSOR_Q8_0) {
-        /* prefill: the up projection as a GEMM over the activated low-rank rows */
+    /* Prefill takes the up projection as a GEMM over the activated low-rank
+     * rows.  Metal's Q8_0 GEMM rounds the activations as its BF16 one does
+     * (tests/test_qwen4_kernels.c); other backends keep Q8_0 up rows on the
+     * per-row kernel. */
+#ifdef __APPLE__
+    const bool gemm = T > 8u;
+#else
+    const bool gemm = T > 8u && up->type != DS4_TENSOR_Q8_0;
+#endif
+    if (gemm) {
         return ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
                ds4_gpu_qwen4_hc_mix_rows_tensor(g->mixed, g->hc_u, g->xn, T, DS4_N_EMBD, DS4_N_HC);
