@@ -542,7 +542,7 @@ test-deepseek41-cuda: tests/test_deepseek41_cuda
 tests/test_qwen4_cuda.o: tests/test_qwen4_kernels.c src/ds4_gpu.h src/ds4.h
 	$(CC) $(QUALITY_CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $<
 
-tests/test_qwen4_cuda: tests/test_qwen4_cuda.o $(OBJDIR)/ds4_cuda.o $(OBJDIR)/ds4_image.o $(MMQ_OBJS)
+tests/test_qwen4_cuda: tests/test_qwen4_cuda.o $(OBJDIR)/ds4_cuda.o $(OBJDIR)/ds4_image.o $(OBJDIR)/ds4_quants.o $(MMQ_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 .PHONY: test-qwen4-cuda

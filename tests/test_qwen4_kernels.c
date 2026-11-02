@@ -1210,6 +1210,7 @@ static uint64_t arena_hc_rows(arena_t *a, uint32_t wtype, uint64_t rows, uint64_
     return wtype == 8u ? arena_q8_0(a, rows, cols, shadow, scale) : arena_bf16(a, rows * cols, shadow, scale);
 }
 
+#ifdef __APPLE__
 /* the separate matvec the fused down projection replaces */
 static int hc_down_matvec(arena_t *a, ds4_gpu_tensor *lo, uint64_t down_off, uint32_t wtype, uint32_t dim,
                           uint32_t rank, const ds4_gpu_tensor *xn, uint32_t T) {
@@ -1504,6 +1505,7 @@ static void test_hc_fused_ref(arena_t *a, uint32_t wtype) {
     }
     free(g_gamma); free(g_down); free(g_up); free(g_inj);
 }
+#endif
 
 /* The prefill gate mix (T > 8): the activated low-rank rows, the up
  * projection as the model's BF16 or Q8_0 GEMM over them, and the per-row
@@ -1533,8 +1535,13 @@ static void test_hc_gemm_mix(arena_t *a, uint32_t wtype) {
         ds4_gpu_tensor *gm = upload(NULL, (uint64_t)T * E);
         require_ok(ds4_gpu_begin_commands() &&
                    ds4_gpu_qwen4_hc_lo_act_tensor(gact, glo, T, hc, rank) &&
+#ifdef __APPLE__
                    (wtype == 8u ? ds4_gpu_qwen4_matmul_q8_0_tensor(gu, a->base, a->size, up_off, rank, dim, gact, T)
                                 : ds4_gpu_matmul_quant_tensor(gu, a->base, a->size, up_off, wtype, rank, dim, gact, T)) &&
+#else
+                   /* the CUDA graph's qwen4_gemv */
+                   ds4_gpu_qwen4_dense_mm_tensor(gu, gact, a->base, a->size, up_off, wtype, T, rank, dim) &&
+#endif
                    ds4_gpu_qwen4_hc_mix_rows_tensor(gm, gu, gxn, T, E, hc) &&
                    ds4_gpu_end_commands(), "hc gemm mix");
         char name[96];
@@ -1980,13 +1987,17 @@ static void test_attention_rows(arena_t *a) {
 /* IQ4_NL and the codebook quants: random block bytes with a sane scale, the
  * shadow comes from the CPU dequantizer. */
 static bool wtype_is_dequant(uint32_t wtype) {
-    return wtype == 20u || wtype == 17u || wtype == 18u || wtype == 21u || wtype == 22u || wtype == 23u;
+    return wtype == 20u || wtype == 17u || wtype == 18u || wtype == 21u || wtype == 22u || wtype == 23u ||
+           wtype == 6u || wtype == 11u || wtype == 13u || wtype == 14u;
 }
 
 static uint64_t arena_dequant(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow, float scale) {
     uint64_t row_bytes = 0;
     require_ok(ds4_quant_row_bytes(wtype, cols, &row_bytes), "quant row bytes");
-    const uint64_t block_bytes = wtype == 20u ? 18u : wtype == 17u ? 74u : wtype == 22u ? 82u : wtype == 18u ? 98u : wtype == 23u ? 136u : 110u;
+    const uint64_t block_bytes = wtype == 20u ? 18u : wtype == 6u ? 22u : wtype == 17u ? 74u : wtype == 22u ? 82u :
+                                 wtype == 18u ? 98u : wtype == 23u ? 136u : wtype == 13u ? 176u : wtype == 14u ? 210u : 110u;
+    /* Q3_K and Q6_K keep d after the codes; Q5_K has dmin beside d */
+    const uint64_t d_at = wtype == 11u ? 108u : wtype == 14u ? 208u : 0u;
     const uint64_t off = arena_alloc(a, rows * row_bytes);
     uint8_t *w = a->base + off;
     float *deq = malloc(cols * sizeof(float));
@@ -1994,7 +2005,11 @@ static uint64_t arena_dequant(arena_t *a, uint32_t wtype, uint64_t rows, uint64_
     for (uint64_t i = 0; i < rows * row_bytes; i++) w[i] = (uint8_t)(frand() * 128.0f + 128.0f);
     for (uint64_t b = 0; b < rows * row_bytes / block_bytes; b++) {
         const uint16_t dh = f32_to_f16(scale * (0.5f + 0.5f * fabsf(frand())));
-        memcpy(w + b * block_bytes, &dh, 2);
+        memcpy(w + b * block_bytes + d_at, &dh, 2);
+        if (wtype == 13u) {
+            const uint16_t mh = f32_to_f16(scale * (0.5f + 0.5f * fabsf(frand())));
+            memcpy(w + b * block_bytes + 2, &mh, 2);
+        }
     }
     for (uint64_t r = 0; r < rows; r++) {
         require_ok(ds4_dequant_row(wtype, w + r * row_bytes, deq, cols), "cpu dequant");
@@ -2005,9 +2020,12 @@ static uint64_t arena_dequant(arena_t *a, uint32_t wtype, uint64_t rows, uint64_
 }
 
 static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow) {
-    /* the codes reach 127 (IQ4_NL), 127 * 31 (IQ4_XS) or 43 times the block scale */
+    /* the codes reach 127 (IQ4_NL), 127 * 31 (IQ4_XS), 16 (Q5_0), 32 * 4 (Q3_K),
+     * 63 * 31 (Q5_K), 128 * 32 (Q6_K) or 43 times the block scale */
     if (wtype_is_dequant(wtype))
-        return arena_dequant(a, wtype, rows, cols, shadow, wtype == 20u ? 0.0005f : wtype == 23u ? 0.00002f : 0.0002f);
+        return arena_dequant(a, wtype, rows, cols, shadow,
+                             wtype == 20u ? 0.0005f : wtype == 6u ? 0.003f : wtype == 11u ? 0.0004f :
+                             wtype == 23u || wtype == 13u || wtype == 14u ? 0.00002f : 0.0002f);
     if (wtype == 39u) return arena_mxfp4(a, rows, cols, shadow);
     if (wtype == 42u) return arena_q2_0(a, rows, cols, shadow, 0.05f);
     return wtype == 12u ? arena_q4_K(a, rows, cols, shadow, 0.05f) :
@@ -2270,6 +2288,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     const char *dname = dtype == 20u ? "iq4_nl" : dtype == 42u ? "q2_0" : dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
     check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
+#ifdef __APPLE__
     if ((dtype == 42u || dtype == 20u) && (F % 64u) == 0 && (E % 16u) == 0 && n_out <= 12u) {
         /* the fused down + reduce gives the bits of the two dispatches, with
          * the shared expert in its down slot and from a dense output */
@@ -2318,6 +2337,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         ds4_gpu_tensor_free(gout4); ds4_gpu_tensor_free(gR4);
         unsetenv("DS4_QWEN4_MOE_DOWN_REDUCE");
     }
+#endif
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: mid (+shared)", tier_name, E, F, slots, T);
     check_tensor(name, gmid, mid, (uint64_t)T * n_out * F, 2e-5);
@@ -3548,11 +3568,13 @@ static int bench_hc_norm_down_split(void *ud) {
     return ds4_gpu_qwen4_hc_norm_tensor(c->t[4], c->t[3], c->t[2], c->a->base, c->a->size, c->off[2], c->off[4], 30u, 1, 2560, 4, 4, 1e-6f) &&
            ds4_gpu_matmul_quant_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 30u, 10240, 320, c->t[4], 1);
 }
+#ifdef __APPLE__
 static int bench_hc_norm_down_fused(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_hc_norm_down_tensor(c->t[4], c->t[3], c->t[5], c->t[2], c->a->base, c->a->size, c->off[2], c->off[4], 30u,
                                              c->off[3], 30u, 1, 2560, 4, 4, 320, 1e-6f, NULL, NULL, NULL);
 }
+#endif
 static int bench_hc_down_bf16_2(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_quant_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 30u, 10240, 320, c->t[4], 2); }
 static int bench_hc_down_bf16(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_quant_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 30u, 10240, 320, c->t[4], 1); }
 static int bench_attn(void *ud) {
@@ -3701,6 +3723,7 @@ static int bench_p_moe_mm_q4k_lo(void *ud) { static ds4_gpu_tensor *st[6]; stati
 static int bench_gdn_scan(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1, 16, 48, 128, NULL, 0u, NULL, 0u); }
 static int bench_gdn_scan2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 2, 16, 48, 128, NULL, 0u, NULL, 0u); }
 
+#ifdef __APPLE__
 /* QWEN4_COLD_BENCH=1: decode matvecs cycling through ~160 MB of weight
  * copies, more than the system level cache holds, so every dispatch streams
  * its weights from DRAM as in the model.  Reports effective GB/s. */
@@ -3983,6 +4006,7 @@ static void bench_moe_cold(arena_t *a) {
         }
     }
 }
+#endif
 
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {
@@ -4119,7 +4143,9 @@ static void bench_dispatch(arena_t *a) {
     bench_run("hc_norm (+inject partials)", bench_hc_norm, &c, 200);
     setenv("DS4_QWEN4_HC_NORM_DOWN", "1", 1);
     bench_run("hc norm+down bf16 separate", bench_hc_norm_down_split, &c, 200);
+#ifdef __APPLE__
     bench_run("hc norm+down bf16 fused", bench_hc_norm_down_fused, &c, 200);
+#endif
     unsetenv("DS4_QWEN4_HC_NORM_DOWN");
     bench_run("hc down gemv f16 320x10240", bench_hc_down, &c, 200);
     bench_run("hc_gate_mix f16", bench_hc_mix, &c, 200);
@@ -4344,7 +4370,8 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     double *sh;
     uint64_t off = wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
                  : wtype == 1u ? arena_f16(a, (uint64_t)rows * in_dim, &sh, 0.05f)
-                               : arena_f32(a, (uint64_t)rows * in_dim, &sh, -0.05f, 0.05f);
+                 : wtype == 0u ? arena_f32(a, (uint64_t)rows * in_dim, &sh, -0.05f, 0.05f)
+                               : arena_tier(a, wtype, rows, in_dim, &sh);
     float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
     double *ref = malloc((uint64_t)T * rows * sizeof(double));
     for (uint32_t t = 0; t < T; t++)
@@ -4412,6 +4439,11 @@ int main(void) {
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
     setenv("DS4_QWEN4_ATTN_SPLIT_KEYS", "8", 1);
     require_ok(ds4_gpu_init(), "GPU initialization");
+#ifndef __APPLE__
+    /* CUDA pins the arena read-only, which maps untouched anonymous pages to
+     * the shared zero page: the weights written later would read as zeros. */
+    memset(arena.base, 0, arena.size);
+#endif
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
 #ifndef __APPLE__
@@ -4426,6 +4458,7 @@ int main(void) {
         return 0;
     }
     if (getenv("DS4_TEST_QWEN4_EXPERT_TILES")) {
+        if (!ds4_gpu_qwen4_tensor_tiles()) { printf("no tensor-core tiles on this GPU\n"); return 0; }
         test_half_expert_tiles(&arena,33,16,10,64);
         test_half_expert_tiles(&arena,33,12,39,64);
         test_half_expert_tiles(&arena,2049,16,10,192);
@@ -4467,6 +4500,7 @@ int main(void) {
         bench_hc_norm_reuse(&arena);
         return 0;
     }
+#ifdef __APPLE__
     if (getenv("QWEN4_COLD_BENCH")) {
         bench_cold(&arena);
         return 0;
@@ -4475,6 +4509,7 @@ int main(void) {
         bench_moe_cold(&arena);
         return 0;
     }
+#endif
     if (getenv("QWEN4_BENCH")) {
         bench_dispatch(&arena);
         return 0;
@@ -4525,16 +4560,20 @@ int main(void) {
     test_ple(&arena, 64, 12);
     printf("router\n");
     test_router(&arena, 512, 10, 3);
+#ifdef __APPLE__
     for (uint32_t T = 1; T <= 3; T++) {
         for (uint32_t k = 0; k < 2u; k++) {
             test_hc_norm_down_exact(&arena, T, true, k ? 8u : 30u);
             test_hc_norm_down_exact(&arena, T, false, k ? 8u : 30u);
         }
     }
+#endif
     for (uint32_t k = 0; k < 2u; k++) {
+#ifdef __APPLE__
         test_hc_norm_down_rows(&arena, k ? 8u : 30u);
         test_hc_combine_norm_down(&arena, k ? 8u : 30u);
         test_hc_fused_ref(&arena, k ? 8u : 30u);
+#endif
         test_hc_gemm_mix(&arena, k ? 8u : 30u);
     }
     for (uint32_t T = 1; T <= 7; T += 2) {
@@ -4641,20 +4680,36 @@ int main(void) {
     test_dense_mm(&arena, 320, 10240, 40, 1u);
     test_dense_mm(&arena, 2560, 100, 9, 8u);
 #ifndef __APPLE__
-    test_half_expert_tiles(&arena,33,16,10,64);
-    test_half_expert_tiles(&arena,2049,16,10,64);
-    test_half_expert_tiles(&arena,8193,16,10,64);
-    test_half_expert_tiles(&arena,33,12,39,64);
-    test_half_expert_tiles(&arena,2049,12,39,64);
-    test_half_expert_tiles(&arena,8193,12,39,64);
-    test_half_expert_tiles(&arena,2049,16,10,192);
-    test_half_expert_tiles(&arena,2049,12,39,192);
+    /* the sm_80 tiles round as their references do; older GPUs run the
+     * FP32 tiles, which the routed-expert tests above cover */
+    if (ds4_gpu_qwen4_tensor_tiles()) {
+        test_half_expert_tiles(&arena,33,16,10,64);
+        test_half_expert_tiles(&arena,2049,16,10,64);
+        test_half_expert_tiles(&arena,8193,16,10,64);
+        test_half_expert_tiles(&arena,33,12,39,64);
+        test_half_expert_tiles(&arena,2049,12,39,64);
+        test_half_expert_tiles(&arena,8193,12,39,64);
+        test_half_expert_tiles(&arena,2049,16,10,192);
+        test_half_expert_tiles(&arena,2049,12,39,192);
+    }
     test_dense_mm(&arena, 2560, 100, 37, 8u);
     test_dense_mm(&arena, 10240, 1700, 32, 8u);
     test_dense_mm_large(&arena, 1u);
     test_dense_mm_large(&arena, 8u);
     test_dense_mm(&arena, 67, 97, 35, 1u);
     test_dense_mm(&arena, 96, 129, 35, 8u);
+    {
+        /* the mixed dense types of ISTA's files through the row kernels
+         * (T <= 8), the tiles and cuBLAS */
+        static const uint32_t mixed[] = { 6u, 11u, 12u, 13u, 14u, 17u, 18u, 20u, 21u, 22u, 23u, 42u };
+        static const uint32_t rows_T[] = { 1u, 3u, 8u, 12u, 40u };
+        const uint64_t used0 = arena.used;
+        for (size_t i = 0; i < sizeof(mixed) / sizeof(mixed[0]); i++)
+            for (size_t j = 0; j < sizeof(rows_T) / sizeof(rows_T[0]); j++) {
+                test_dense_mm(&arena, 512, 96, rows_T[j], mixed[i]);
+                arena.used = used0;
+            }
+    }
     test_dense_mm(&arena, 32, 7, 1, 8u);
     test_dense_mm(&arena, 96, 9, 1, 8u);
     test_dense_mm(&arena, 68, 9, 1, 1u);

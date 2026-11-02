@@ -40087,6 +40087,27 @@ static uint64_t qwen4_kv_row_bytes(bool q8) {
     return q8 ? kv_dim + kv_dim / 16u : kv_dim * 2u;
 }
 
+/* One GDN layer's recurrent state and conv history. */
+static uint64_t qwen4_gdn_state_bytes(void) {
+    return ((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM +
+            (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM) * sizeof(float);
+}
+
+/* One attention layer's caches for ctx tokens: K/V rows, raw indexer keys
+ * and pooled block keys. */
+static uint64_t qwen4_attn_cache_bytes(uint32_t ctx, uint32_t T, bool kv_q8) {
+    return (uint64_t)ctx * 2u * qwen4_kv_row_bytes(kv_q8) +
+           (uint64_t)qwen4_ik_cache_rows(ctx, T) * DS4_N_INDEXER_HEAD_DIM * 4u +
+           ((uint64_t)ctx / 4u + 1u) * DS4_N_INDEXER_HEAD_DIM * 2u;
+}
+
+/* The transients of a T-row chunk (DS4_QWEN4_SCRATCH_FIELDS). */
+static uint64_t qwen4_transient_bytes(uint32_t ctx, uint64_t T) {
+    const uint64_t blocks = ctx / 4u + 1u, E = DS4_N_EMBD, hc_dim = E * DS4_N_HC;
+    return T * (12u * hc_dim + 24u * E + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + 2u * DS4_N_FF_EXP) +
+                2u * blocks) * 4u;
+}
+
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
@@ -40106,23 +40127,21 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
          * layer, pooled block keys, rope positions; transients scale with the
          * prefill chunk */
         const uint64_t T = prefill_chunk ? prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
-        const uint64_t blocks = ctx / 4u + 1u, E = DS4_N_EMBD, hc_dim = E * DS4_N_HC;
-        const uint64_t kv_row = 2ull * qwen4_kv_row_bytes(backend == DS4_BACKEND_METAL && qwen4_kv_q8());
+        const uint64_t blocks = ctx / 4u + 1u;
+        const bool kv_q8 = backend == DS4_BACKEND_METAL && qwen4_kv_q8();
+        const uint64_t kv_row = 2ull * qwen4_kv_row_bytes(kv_q8);
         uint32_t n_attn = 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) n_attn += !ds4_qwen4_layer_is_linear(il);
         m.prefill_cap = (uint32_t)T;
         m.raw_cap = ctx;
         m.comp_cap = (uint32_t)blocks;
         m.raw_bytes = (uint64_t)n_attn * ctx * kv_row + (uint64_t)ctx * 16u;
-        m.compressed_bytes = (uint64_t)n_attn * ((uint64_t)qwen4_ik_cache_rows(ctx, (uint32_t)T) * DS4_N_INDEXER_HEAD_DIM * 4u +
-                                                 blocks * DS4_N_INDEXER_HEAD_DIM * 2u);
-        m.scratch_bytes = T * (12u * hc_dim + 24u * E + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + 2u * DS4_N_FF_EXP) +
-                               2u * blocks) * 4u;
+        m.compressed_bytes = (uint64_t)n_attn * qwen4_attn_cache_bytes(ctx, (uint32_t)T, kv_q8) -
+                             (uint64_t)n_attn * ctx * kv_row;
+        m.scratch_bytes = qwen4_transient_bytes(ctx, T);
         /* Recurrent layers have fixed state even at a tiny context. Reserve
          * both MTP snapshots as well as live state for conservative admission. */
-        m.scratch_bytes += 3ull * (DS4_N_LAYER - n_attn) *
-            ((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM +
-             (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM) * sizeof(float);
+        m.scratch_bytes += 3ull * (DS4_N_LAYER - n_attn) * qwen4_gdn_state_bytes();
         m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
         return m;
     }
@@ -58285,6 +58304,20 @@ typedef struct ds4_qwen4_gpu_graph {
     float steer_attn_scale;
     float steer_ffn_scale;
     bool dump_prompt_rows;
+    /* CUDA layer placement over several GPUs (NULL tier: one device).  Layer
+     * il runs on tier[il] and keeps its state there; the output head, the
+     * MTP block and the logits live on head_tier.  Every used tier holds its
+     * own transients and rope positions, and the pointers above name those of
+     * cur_tier, the tier the graph is running on; at a layer boundary only R,
+     * the residual streams, crosses (qwen4_graph_use_tier). */
+    const int *tier;
+    int head_tier, cur_tier;
+    struct {
+#define QWEN4_TIER_FIELD(field_) ds4_gpu_tensor *field_;
+        DS4_QWEN4_SCRATCH_FIELDS(QWEN4_TIER_FIELD)
+#undef QWEN4_TIER_FIELD
+        ds4_gpu_tensor *pos3;
+    } on_tier[DS4_MAX_GPUS];
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
@@ -58343,14 +58376,9 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         const ds4_layer_weights *l = &w->layer[il];
         const ds4_tensor *hc[4] = { l->hc_attn_up, l->hc_attn_inject, l->hc_ffn_up, l->hc_ffn_inject };
         for (int i = 0; i < 4; i++) {
-#ifdef __APPLE__
-            const bool bf16_ok = hc[i]->type == DS4_TENSOR_BF16;
-#else
-            const bool bf16_ok = false;
-#endif
             if (hc[i]->type != DS4_TENSOR_F16 && hc[i]->type != DS4_TENSOR_F32 && hc[i]->type != DS4_TENSOR_Q8_0 &&
-                !bf16_ok) {
-                fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F16/F32/Q8_0 hc up/inject weights (layer %u)\n", il);
+                hc[i]->type != DS4_TENSOR_BF16) {
+                fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F16/F32/BF16/Q8_0 hc up/inject weights (layer %u)\n", il);
                 return false;
             }
         }
@@ -58397,6 +58425,14 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->anchor_ple_hist, &g->anchor_ik_tail, &g->pos3,
         &g->draft_head, &g->steer_dirs,
     };
+    /* the other tiers' sets; cur_tier's is the one the pointers name */
+    for (int t = 0; g->tier && t < DS4_MAX_GPUS; t++) {
+        if (t == g->cur_tier) continue;
+#define QWEN4_FREE_TIER(field_) ds4_gpu_tensor_free(g->on_tier[t].field_);
+        DS4_QWEN4_SCRATCH_FIELDS(QWEN4_FREE_TIER)
+#undef QWEN4_FREE_TIER
+        ds4_gpu_tensor_free(g->on_tier[t].pos3);
+    }
     if (g->owns_scratch) {
         ds4_gpu_tensor **scratch[] = {
 #define QWEN4_SCRATCH_PTR(field_) &g->field_,
@@ -58533,6 +58569,51 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
     return t;
 }
 
+static ds4_gpu_tensor *qwen4_graph_alloc_f32_on(int tier, uint64_t n) {
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_ptr_on(tier, n * sizeof(float));
+    if (t) ds4_gpu_tensor_fill_f32(t, 0.0f, n);
+    return t;
+}
+
+/* The tier of layer il; the MTP block runs with the output head. */
+static int qwen4_layer_tier(const ds4_qwen4_gpu_graph *g, uint32_t il) {
+    return g->tier ? g->tier[il] : 0;
+}
+
+/* Lazily allocated per-layer state goes where its layer runs. */
+static ds4_gpu_tensor *qwen4_graph_alloc_layer_f32(const ds4_qwen4_gpu_graph *g, uint32_t il, uint64_t n) {
+    return g->tier ? qwen4_graph_alloc_f32_on(qwen4_layer_tier(g, il), n) : qwen4_graph_alloc_f32(n);
+}
+
+static void qwen4_tier_store(ds4_qwen4_gpu_graph *g, int t) {
+#define QWEN4_STORE(field_) g->on_tier[t].field_ = g->field_;
+    DS4_QWEN4_SCRATCH_FIELDS(QWEN4_STORE)
+#undef QWEN4_STORE
+    g->on_tier[t].pos3 = g->pos3;
+}
+
+static void qwen4_tier_load(ds4_qwen4_gpu_graph *g, int t) {
+#define QWEN4_LOAD(field_) g->field_ = g->on_tier[t].field_;
+    DS4_QWEN4_SCRATCH_FIELDS(QWEN4_LOAD)
+#undef QWEN4_LOAD
+    g->pos3 = g->on_tier[t].pos3;
+    g->cur_tier = t;
+}
+
+/* Continue on tier t.  The fenced switch orders t's work after everything
+ * queued so far; the first carry_rows rows of R follow, a peer copy where
+ * the GPUs have one and through pinned host memory otherwise.  The swaps
+ * the FFN mix makes inside a tier's set are kept by storing it back. */
+static bool qwen4_graph_use_tier(ds4_qwen4_gpu_graph *g, int t, uint32_t carry_rows) {
+    if (!g->tier || t == g->cur_tier) return true;
+    ds4_gpu_tensor *R = g->R;
+    qwen4_tier_store(g, g->cur_tier);
+    if (ds4_gpu_set_current_device_fenced(t) != 0) return false;
+    qwen4_tier_load(g, t);
+    return !carry_rows || ds4_gpu_tensor_copy_xdev_default(g->R, R,
+        (uint64_t)carry_rows * DS4_N_EMBD * DS4_N_HC * sizeof(float)) != 0;
+}
+
 /* With the Neural Engine on (DS4_ANE=1) the KV buffers go into the session
  * residency set when they are allocated: otherwise the first command buffer
  * after the ANE's evaluations maps them in again, 85 ms for the prompt tail
@@ -58555,54 +58636,16 @@ static void qwen4_graph_keep_kv_resident(ds4_qwen4_gpu_graph *g) {
 #endif
 }
 
-/* shared borrows the engine arena for the transients; NULL allocates private
- * ones.  A borrowing graph must fit inside the arena it borrows: the caller
- * checks cap_tokens and n_block_cap before passing one.
- *
- * state_pool/hist_pool, when given, hold every slot's recurrent state in one
- * tensor per layer and this graph takes slot's view of it.  A batched decode
- * then advances all its rows with one dispatch; without a pool each session
- * keeps its own tensors and the batch falls back to a dispatch per row. */
-static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
-                              bool mtp, const ds4_qwen4_gpu_graph *shared,
-                              ds4_gpu_tensor *const *state_pool,
-                              ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
-    memset(g, 0, sizeof(*g));
-    if (!qwen4_graph_weights_supported(w)) return false;
-#ifdef DS4_HAS_QWEN4_METAL
-    ds4_gpu_qwen4_set_kv_q8(qwen4_kv_q8());
-#endif
-    mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
-    const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
+/* One set of the transients, on tier t (cap_tokens rows, n_block_cap blocks). */
+static bool qwen4_graph_alloc_scratch(ds4_qwen4_gpu_graph *g, int t) {
+    const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = g->cap_tokens;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t iq_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
-    g->ctx_cap = ctx_cap;
-    g->cap_tokens = cap_tokens;
-    g->ik_rows = qwen4_ik_cache_rows(ctx_cap, cap_tokens);
-    g->k_blocks = DS4_N_INDEXER_TOP_K / 4u;
-    g->n_logit_rows = mtp ? 3u : 1u;
-    g->n_block_cap = ctx_cap / 4u + 1u;
-    static bool warned_ctx = false;
-    if (!warned_ctx && g_qwen4_native_ctx && ctx_cap > g_qwen4_native_ctx && !g_qwen4_rope_yarn) {
-        warned_ctx = true;
-        fprintf(stderr, "ds4: context %u exceeds the native %u tokens; prompts past that need "
-                "DS4_QWEN4_YARN_FACTOR (see README)\n", ctx_cap, g_qwen4_native_ctx);
-    }
-    g->sel_stride = g->k_blocks * 4u + 4u;
-
     bool ok = true;
-    g->owns_scratch = shared == NULL;
-#define QWEN4_ALLOC(field_, n_) do { g->field_ = qwen4_graph_alloc_f32(n_); ok = ok && g->field_; } while (0)
-    if (shared) {
-#define QWEN4_BORROW(field_) g->field_ = shared->field_;
-        DS4_QWEN4_SCRATCH_FIELDS(QWEN4_BORROW)
-#undef QWEN4_BORROW
-        g->host_row = shared->host_row;
-        goto private_state;
-    }
+#define QWEN4_ALLOC(field_, n_) do { g->field_ = qwen4_graph_alloc_f32_on(t, n_); ok = ok && g->field_; } while (0)
     QWEN4_ALLOC(R, T * hc_dim);
     QWEN4_ALLOC(xn, T * hc_dim);
     QWEN4_ALLOC(lo, T * DS4_N_HC_LOWRANK);
@@ -58649,12 +58692,94 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(sh_out, T * E);
     QWEN4_ALLOC(hc_u, T * hc_dim);
     QWEN4_ALLOC(hc_lo_act, T * DS4_N_HC_LOWRANK);
+#undef QWEN4_ALLOC
+    return ok;
+}
+
+static bool qwen4_tier_used(const int *tier, int t) {
+    if (!tier) return t == 0;
+    for (uint32_t il = 0; il <= DS4_N_LAYER; il++) if (tier[il] == t) return true;
+    return false;
+}
+
+/* shared borrows the engine arena for the transients; NULL allocates private
+ * ones.  A borrowing graph must fit inside the arena it borrows: the caller
+ * checks cap_tokens and n_block_cap before passing one.
+ *
+ * state_pool/hist_pool, when given, hold every slot's recurrent state in one
+ * tensor per layer and this graph takes slot's view of it.  A batched decode
+ * then advances all its rows with one dispatch; without a pool each session
+ * keeps its own tensors and the batch falls back to a dispatch per row.
+ *
+ * tier, when given, maps each layer to its CUDA tier and tier[DS4_N_LAYER]
+ * is the output head's (the engine's placement past its embedding entry). */
+static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
+                              bool mtp, const ds4_qwen4_gpu_graph *shared,
+                              ds4_gpu_tensor *const *state_pool,
+                              ds4_gpu_tensor *const *hist_pool, uint32_t slot, const int *tier) {
+    memset(g, 0, sizeof(*g));
+    if (!qwen4_graph_weights_supported(w)) return false;
+    /* The n-gram rows are staged before the trunk starts, on layer 0's tier,
+     * and the MTP block reads the head's streams and weights. */
+    if (tier && (shared || state_pool || tier[DS4_N_PLE_LAYER] != tier[0] ||
+                 (DS4_N_NEXTN_PREDICT != 0 && tier[DS4_N_LAYER - 1u] != tier[DS4_N_LAYER]))) {
+        fprintf(stderr, "ds4: Qwen3.8 layer placement needs private transients, the PLE layer with layer 0 "
+                        "and the MTP block with the output head\n");
+        return false;
+    }
+    g->tier = tier;
+    g->head_tier = tier ? tier[DS4_N_LAYER] : 0;
+#ifdef DS4_HAS_QWEN4_METAL
+    ds4_gpu_qwen4_set_kv_q8(qwen4_kv_q8());
+#endif
+    mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
+    const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
+    const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    g->ctx_cap = ctx_cap;
+    g->cap_tokens = cap_tokens;
+    g->ik_rows = qwen4_ik_cache_rows(ctx_cap, cap_tokens);
+    g->k_blocks = DS4_N_INDEXER_TOP_K / 4u;
+    g->n_logit_rows = mtp ? 3u : 1u;
+    g->n_block_cap = ctx_cap / 4u + 1u;
+    static bool warned_ctx = false;
+    if (!warned_ctx && g_qwen4_native_ctx && ctx_cap > g_qwen4_native_ctx && !g_qwen4_rope_yarn) {
+        warned_ctx = true;
+        fprintf(stderr, "ds4: context %u exceeds the native %u tokens; prompts past that need "
+                "DS4_QWEN4_YARN_FACTOR (see README)\n", ctx_cap, g_qwen4_native_ctx);
+    }
+    g->sel_stride = g->k_blocks * 4u + 4u;
+
+    bool ok = true;
+    g->owns_scratch = shared == NULL;
+    int alloc_tier = 0;
+#define QWEN4_ALLOC(field_, n_) do { g->field_ = qwen4_graph_alloc_f32_on(alloc_tier, n_); ok = ok && g->field_; } while (0)
+    if (shared) {
+#define QWEN4_BORROW(field_) g->field_ = shared->field_;
+        DS4_QWEN4_SCRATCH_FIELDS(QWEN4_BORROW)
+#undef QWEN4_BORROW
+        g->host_row = shared->host_row;
+        goto private_state;
+    }
+    for (int t = 0; t < DS4_MAX_GPUS && ok; t++) {
+        if (!qwen4_tier_used(tier, t)) continue;
+        ok = qwen4_graph_alloc_scratch(g, t);
+        if (ok && tier) {
+            g->pos3 = qwen4_graph_alloc_f32_on(t, (uint64_t)ctx_cap * 4u);
+            ok = g->pos3 != NULL;
+            qwen4_tier_store(g, t);
+        }
+    }
+    if (tier && ok) qwen4_tier_load(g, tier[0]);
     g->host_row = xmalloc(T * hc_dim * sizeof(float));
 
 private_state:
     /* The PLE conv history carries across calls and the logits belong to the
      * caller that reads them back, so neither can be shared. */
+    alloc_tier = qwen4_layer_tier(g, DS4_N_PLE_LAYER);
     QWEN4_ALLOC(ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
+    if (mtp) QWEN4_ALLOC(snap_ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
+    alloc_tier = g->head_tier;
     QWEN4_ALLOC(logits, (uint64_t)g->n_logit_rows * DS4_N_VOCAB);
     if (mtp) {
         QWEN4_ALLOC(mtp_e, 3u * E);
@@ -58663,7 +58788,6 @@ private_state:
         QWEN4_ALLOC(mtp_R, 3u * hc_dim);
         QWEN4_ALLOC(mtp_argmax, 2u);
         QWEN4_ALLOC(mtp_argmax_tmp, ((DS4_N_VOCAB + 4095u) / 4096u) * 4u);
-        QWEN4_ALLOC(snap_ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
     }
 #undef QWEN4_ALLOC
     const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
@@ -58676,24 +58800,25 @@ private_state:
                 g->layer_lin_hist[il] = ds4_gpu_tensor_view(hist_pool[il],
                                                             (uint64_t)slot * hist_bytes, hist_bytes);
             } else {
-                g->layer_lin_state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
-                g->layer_lin_hist[il] = qwen4_graph_alloc_f32((uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+                g->layer_lin_state[il] = qwen4_graph_alloc_layer_f32(g, il, v_dim * DS4_N_LIN_HEAD_DIM);
+                g->layer_lin_hist[il] = qwen4_graph_alloc_layer_f32(g, il, (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
             }
             ok = ok && g->layer_lin_state[il] && g->layer_lin_hist[il];
             if (ok && mtp) {
-                g->snap_lin_state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
-                g->snap_lin_hist[il] = qwen4_graph_alloc_f32((uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+                g->snap_lin_state[il] = qwen4_graph_alloc_layer_f32(g, il, v_dim * DS4_N_LIN_HEAD_DIM);
+                g->snap_lin_hist[il] = qwen4_graph_alloc_layer_f32(g, il, (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
                 ok = g->snap_lin_state[il] && g->snap_lin_hist[il];
             }
         } else {
-            g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_row_bytes(qwen4_kv_q8()));
-            g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_row_bytes(qwen4_kv_q8()));
-            g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)g->ik_rows * DS4_N_INDEXER_HEAD_DIM);
-            g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
+            const int t = qwen4_layer_tier(g, il);
+            g->layer_k_cache[il] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)ctx_cap * qwen4_kv_row_bytes(qwen4_kv_q8()));
+            g->layer_v_cache[il] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)ctx_cap * qwen4_kv_row_bytes(qwen4_kv_q8()));
+            g->layer_ik_cache[il] = qwen4_graph_alloc_layer_f32(g, il, (uint64_t)g->ik_rows * DS4_N_INDEXER_HEAD_DIM);
+            g->layer_block_key[il] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
             ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] && g->layer_ik_cache[il] && g->layer_block_key[il];
         }
     }
-    g->pos3 = qwen4_graph_alloc_f32((uint64_t)ctx_cap * 4u);
+    if (!tier) g->pos3 = qwen4_graph_alloc_f32((uint64_t)ctx_cap * 4u);
     ok = ok && g->pos3;
     g->host_pos3 = xmalloc(T * 4u * sizeof(uint32_t));
     g->host_logits = xmalloc((uint64_t)g->n_logit_rows * DS4_N_VOCAB * sizeof(float));
@@ -59411,6 +59536,11 @@ static void qwen4_ane_set_moe_layer(int il) {
     g_qwen4_ane.moe_layer = il;
 }
 
+/* Marks a chunk too short to halve into a pair; 0 rows clears the mark. */
+static void qwen4_ane_set_lone(uint32_t T) {
+    g_qwen4_ane.lone = g_qwen4_ane.pipe && T && T < 2u * g_qwen4_ane.min_rows;
+}
+
 static bool qwen4_ane_settle(void) {
     return ds4_gpu_ane_settle() != 0;
 }
@@ -59459,6 +59589,7 @@ static bool qwen4_ane_shexp_in(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
 }
 static bool qwen4_ane_shexp_out(ds4_qwen4_gpu_graph *g, uint32_t T) { (void)g; (void)T; return false; }
 static void qwen4_ane_set_moe_layer(int il) { (void)il; }
+static void qwen4_ane_set_lone(uint32_t T) { (void)T; }
 static bool qwen4_ane_settle(void) { return true; }
 #endif
 
@@ -59818,7 +59949,6 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     } else
 #endif
     if (ok) {
-#ifdef DS4_HAS_QWEN4_METAL
         ok = ds4_gpu_qwen4_moe_mid2_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                            l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                            DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
@@ -59826,14 +59956,6 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                            shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
                                            shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type,
                                            shared_dense ? UINT32_MAX : l->ffn_up_shexp->type) != 0;
-#else
-        ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
-                                          l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
-                                          DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
-                                          shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
-                                          shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
-                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0;
-#endif
 #ifdef DS4_HAS_QWEN4_METAL
         /* the down rows and the reduce in one dispatch where it applies */
         if (ok) {
@@ -59879,8 +60001,14 @@ static bool qwen4_graph_stage_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
         if (t == 0 && g->snap_after_first) g->snap_mrope_delta = g->mrope_delta;
         if (t == 1u && g->snap_after_second) g->snap2_mrope_delta = g->mrope_delta;
     }
-    return ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) &&
-           ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
+    bool ok = ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) &&
+              ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
+    /* every tier's attention layers read the rope positions */
+    for (int t = 0; g->tier && ok && t < DS4_MAX_GPUS; t++) {
+        if (t != g->cur_tier && g->on_tier[t].pos3)
+            ok = ds4_gpu_tensor_write(g->on_tier[t].pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
+    }
+    return ok;
 }
 
 /* host side: the PLE n-gram gather.  The rows come from disk and only the
@@ -60030,7 +60158,8 @@ static bool qwen4_graph_forward_tokens_once(ds4_qwen4_gpu_graph *g, const ds4_mo
     const bool ngram_late = !ngram_first && timing != 2 && DS4_N_PLE_LAYER > 0 && DS4_N_PLE_LAYER < n_trunk;
     const double t0 = timing ? now_sec() : 0.0;
     double t_ngram = 0.0;
-    if (!qwen4_graph_stage_rows(g, m, w, tokens, T)) return false;
+    if (!qwen4_graph_use_tier(g, qwen4_layer_tier(g, 0), 0) ||
+        !qwen4_graph_stage_rows(g, m, w, tokens, T)) return false;
     if (!ngram_late && !qwen4_graph_stage_ngrams(g, m, tokens, T)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
@@ -60051,6 +60180,8 @@ static bool qwen4_graph_forward_tokens_once(ds4_qwen4_gpu_graph *g, const ds4_mo
     } while (0)
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        ok = qwen4_graph_use_tier(g, qwen4_layer_tier(g, il), T);
+        if (!ok) break;
         if (ngram_late && il == DS4_N_PLE_LAYER) {
             const double tn = timing ? now_sec() : 0.0;
             ok = ds4_gpu_flush_commands() != 0 && qwen4_graph_stage_ngrams(g, m, tokens, T);
@@ -60079,6 +60210,7 @@ static bool qwen4_graph_forward_tokens_once(ds4_qwen4_gpu_graph *g, const ds4_mo
                 1000.0 * prof[2], 1000.0 * prof[3], 1000.0 * prof[4], 1000.0 * prof[5]);
     }
 #undef QWEN4_PROF
+    if (ok) ok = qwen4_graph_use_tier(g, g->head_tier, T);
     if (ok && logits_out && all_rows) {
         ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
              qwen4_gemv(g->logits, m, w->output, g->mixed, T);
@@ -60149,9 +60281,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         return qwen4_graph_forward_tokens_once(g, m, w, tokens, T, logits_out, all_rows);
     }
     const bool snap1 = g->snap_after_first, snap2 = g->snap_after_second;
-    g_qwen4_ane.lone = g_qwen4_ane.pipe && T < 2u * g_qwen4_ane.min_rows;
+    qwen4_ane_set_lone(T);
     const bool ok = qwen4_graph_forward_tokens_once(g, m, w, tokens, T, logits_out, all_rows);
-    g_qwen4_ane.lone = false;
+    qwen4_ane_set_lone(0);
     if (qwen4_ane_settle()) return ok;
     fprintf(stderr, "ds4: rerunning the prefill chunk at %u (%u tokens) on the GPU\n", g->ane_pos, T);
     if (!qwen4_graph_state_copy_ane(g, false)) return false;
@@ -60444,12 +60576,12 @@ static bool qwen4_graph_ensure_state_set(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor 
     bool ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         if (!g->layer_lin_state[il]) continue;
-        state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
-        hist[il] = qwen4_graph_alloc_f32(hist_n);
+        state[il] = qwen4_graph_alloc_layer_f32(g, il, v_dim * DS4_N_LIN_HEAD_DIM);
+        hist[il] = qwen4_graph_alloc_layer_f32(g, il, hist_n);
         ok = state[il] && hist[il];
     }
-    if (ok) *ple = qwen4_graph_alloc_f32((uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM *
-                                         (uint64_t)DS4_N_EMBD * DS4_N_HC);
+    if (ok) *ple = qwen4_graph_alloc_layer_f32(g, DS4_N_PLE_LAYER, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM *
+                                               (uint64_t)DS4_N_EMBD * DS4_N_HC);
     if (ok && *ple) return true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(state[il]);
@@ -60509,13 +60641,13 @@ static bool qwen4_graph_ensure_snapshot(ds4_qwen4_gpu_graph *g,
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
     const uint64_t state_n = v_dim * DS4_N_LIN_HEAD_DIM;
     const uint64_t hist_n = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim;
-    *ple = qwen4_graph_alloc_f32((uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM *
-                                              (uint64_t)DS4_N_EMBD * DS4_N_HC);
+    *ple = qwen4_graph_alloc_layer_f32(g, DS4_N_PLE_LAYER, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM *
+                                       (uint64_t)DS4_N_EMBD * DS4_N_HC);
     if (!*ple) return false;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!g->snap_lin_state[il]) continue;
-        state[il] = qwen4_graph_alloc_f32(state_n);
-        hist[il] = qwen4_graph_alloc_f32(hist_n);
+        state[il] = qwen4_graph_alloc_layer_f32(g, il, state_n);
+        hist[il] = qwen4_graph_alloc_layer_f32(g, il, hist_n);
         if (!state[il] || !hist[il]) {
             for (uint32_t j = 0; j <= il; j++) {
                 ds4_gpu_tensor_free(state[j]);
@@ -60619,7 +60751,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
                                  uint32_t row, const int *next_tokens, uint32_t T, uint32_t idx, bool want_logits,
                                  float *logits_out, int *draft_out) {
     if (!g->mtp_R || T == 0u || T > 3u || idx > g->ctx_cap || T > g->ctx_cap - idx ||
-        row > g->cap_tokens || T > g->cap_tokens - row) return false;
+        row > g->cap_tokens || T > g->cap_tokens - row || !qwen4_graph_use_tier(g, g->head_tier, 0)) return false;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     const uint32_t il = DS4_N_LAYER - 1u;
     const ds4_layer_weights *l = &w->layer[il];
@@ -60745,6 +60877,7 @@ static bool qwen4_mtp_fill_on(void) {
 static bool qwen4_graph_mtp_fill(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                  ds4_gpu_tensor *R_rows, uint32_t pos0, uint32_t n, const int *next) {
     if (!g->mtp_R || n == 0) return true;
+    if (!qwen4_graph_use_tier(g, g->head_tier, 0)) return false;
     const uint32_t il = DS4_N_LAYER - 1u;
     const ds4_layer_weights *l = &w->layer[il];
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
@@ -60754,7 +60887,7 @@ static bool qwen4_graph_mtp_fill(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
     if (sub > ds4_gpu_tensor_bytes(g->part) / cat_bytes) sub = ds4_gpu_tensor_bytes(g->part) / cat_bytes;
     if (sub > g->cap_tokens) sub = g->cap_tokens;
     if (sub == 0 || n > g->cap_tokens || pos0 + n > g->ctx_cap) return false;
-    if (!g->mtp_fill_e) g->mtp_fill_e = qwen4_graph_alloc_f32((uint64_t)g->cap_tokens * E);
+    if (!g->mtp_fill_e) g->mtp_fill_e = qwen4_graph_alloc_f32_on(g->head_tier, (uint64_t)g->cap_tokens * E);
     if (!g->mtp_fill_e) return false;
     const ds4_vision_span *spans = g->vis_spans;
     size_t n_spans = g->vis_span_count;
@@ -60808,7 +60941,7 @@ static bool qwen4_graph_mtp_keep_tail(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *R_
     g->mtp_tail_valid = false;
     if (!g->mtp_R) return true;
     const uint64_t row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
-    if (!g->mtp_tail) g->mtp_tail = qwen4_graph_alloc_f32((uint64_t)DS4_N_HC * DS4_N_EMBD);
+    if (!g->mtp_tail) g->mtp_tail = qwen4_graph_alloc_f32_on(g->head_tier, (uint64_t)DS4_N_HC * DS4_N_EMBD);
     if (!g->mtp_tail || !glm_graph_begin_commands_if_needed() ||
         !ds4_gpu_tensor_copy(g->mtp_tail, 0, R_rows, (uint64_t)row * row_bytes, row_bytes) ||
         !ds4_gpu_end_commands()) return false;
@@ -60835,7 +60968,8 @@ static bool qwen4_graph_mtp_fill_tail(ds4_qwen4_gpu_graph *g, const ds4_model *m
 static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        int next_token, uint32_t idx, int *draft_out) {
     if (!g->mtp_R || g->mtp_last_rows == 0u || g->mtp_last_rows > 3u || !draft_out ||
-        idx >= g->ctx_cap || next_token < 0 || next_token >= (int)DS4_N_VOCAB) return false;
+        idx >= g->ctx_cap || next_token < 0 || next_token >= (int)DS4_N_VOCAB ||
+        !qwen4_graph_use_tier(g, g->head_tier, 0)) return false;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     const uint32_t il = DS4_N_LAYER - 1u;
     const ds4_layer_weights *l = &w->layer[il];
@@ -60936,7 +61070,7 @@ static int generate_qwen4_metal_argmax(
     /* --prefill-chunk sizes the transients here as it does for sessions */
     const uint32_t cap_tokens = prefill_chunk && prefill_chunk < (uint32_t)ctx_size ?
         prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
-    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, cap_tokens, false, NULL, NULL, NULL, 0)) {
+    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, cap_tokens, false, NULL, NULL, NULL, 0, NULL)) {
         free(g);
         return 1;
     }
@@ -61372,6 +61506,10 @@ static size_t engine_size_mul_sat(size_t bytes, uint32_t count) {
     return bytes * count;
 }
 
+static size_t engine_size_add_sat(size_t a, size_t b) {
+    return a > SIZE_MAX - b ? SIZE_MAX : a + b;
+}
+
 /* GLM keeps one compact DSA row for every logical context position. These
  * caches are allocated on the same tier as their transformer layer, so they
  * must be priced per layer by the multi-GPU packer. */
@@ -61464,14 +61602,20 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
  * Visible in both GPU and DS4_NO_GPU builds. */
 static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     if (ds4_model_is_qwen4()) {
-        /* Qwen currently uses one device and independent session workspaces.
-         * Reserve its whole graph here, not DeepSeek's per-layer KV layout. */
+        /* One device: the whole graph of every session.  Layers placed over
+         * several: every used tier holds each session's transients and rope
+         * positions; the layers' state is in their entries. */
         const int ctx = e && e->placement_ctx_hint > 0 ?
             e->placement_ctx_hint : 4096;
         const ds4_context_memory mem = ds4_context_memory_estimate_with_prefill(
                 DS4_BACKEND_CUDA, ctx, e ? e->prefill_chunk : 0);
-        const size_t bytes = mem.total_bytes > SIZE_MAX ?
-            SIZE_MAX : (size_t)mem.total_bytes;
+#ifndef DS4_NO_GPU
+        const uint64_t per_session = e && e->gpu_cfg.n_gpus > 1 ?
+            qwen4_transient_bytes((uint32_t)ctx, mem.prefill_cap) + (uint64_t)ctx * 16u : mem.total_bytes;
+#else
+        const uint64_t per_session = mem.total_bytes;
+#endif
+        const size_t bytes = per_session > SIZE_MAX ? SIZE_MAX : (size_t)per_session;
         return engine_size_mul_sat(bytes, engine_placement_session_count(e));
     }
 #ifndef DS4_NO_GPU
@@ -66416,7 +66560,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s) || ds4_session_is_qwen4(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -69623,7 +69767,9 @@ static void qwen4_ft_ref_compare(const float *logits, const int *seq, uint32_t n
  * DS4_QWEN4_MTP_BATCH_CHECK also compares sequential and paired GPU drafts
  * (requires MTP_OUT, GPU=1, and GPU_CHUNK >= 2). */
 static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab,
-                                  const ds4_weights *weights, const ds4_tokens *prompt, bool metal) {
+                                  const ds4_weights *weights, const ds4_tokens *prompt, bool metal,
+                                  const int *tier) {
+    (void)tier;   /* the GPU comparison's layer placement */
     /* DS4_QWEN4_FT_LIST=<file>: batch mode.  Each line is
      * "<comma ids>\t<out path>"; every sequence runs through the Metal graph
      * (prefill all-rows logits, the production kernel path) and its
@@ -69642,7 +69788,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             return 1;
         }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, false, NULL, NULL, NULL, 0)) {
+        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, false, NULL, NULL, NULL, 0, NULL)) {
             free(g);
             fclose(lf);
             return 1;
@@ -69805,7 +69951,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             return 1;
         }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-        if (!qwen4_graph_alloc(g, weights, n_seq + 4u, chunk, draft != NULL, NULL, NULL, NULL, 0)) {
+        if (!qwen4_graph_alloc(g, weights, n_seq + 4u, chunk, draft != NULL, NULL, NULL, NULL, 0, tier)) {
             free(g);
             return 1;
         }
@@ -69958,7 +70104,8 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     const ds4_weights *weights = &e->weights;
 
     if (ds4_model_is_qwen4()) {
-        return qwen4_first_token_test(model, vocab, weights, prompt, ds4_backend_uses_graph(e->backend));
+        return qwen4_first_token_test(model, vocab, weights, prompt, ds4_backend_uses_graph(e->backend),
+                                      e->multi_tier ? e->placement + 1 : NULL);
     }
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -71165,9 +71312,30 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
 
     if (ds4_model_is_qwen4()) {
         /* Vision weights are shared; the disk-only n-grams above are not
-         * resident. Session caches/scratch are reserved together per tier. */
+         * resident.  On one GPU the session caches and transients are
+         * reserved together per tier.  Placed over several, each layer
+         * carries its sessions' state (a GDN layer's with its MTP snapshots
+         * and prompt anchor) and the MTP block is priced with the output
+         * head it runs beside (engine_classify_multi_tier keeps them
+         * together); only the transients are reserved per tier. */
         out[0] = out[0] > SIZE_MAX - e->vision_model.size ?
             SIZE_MAX : out[0] + e->vision_model.size;
+#ifndef DS4_NO_GPU
+        if (e->gpu_cfg.n_gpus > 1) {
+            const uint32_t ctx = e->placement_ctx_hint > 0 ? (uint32_t)e->placement_ctx_hint : 4096u;
+            const uint32_t T = e->prefill_chunk ? e->prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                const uint64_t state = ds4_qwen4_layer_is_linear(il) ? 4u * qwen4_gdn_state_bytes()
+                                                                     : qwen4_attn_cache_bytes(ctx, T, false);
+                out[il + 1] = engine_size_add_sat(out[il + 1],
+                                                  engine_size_mul_sat((size_t)state, engine_placement_session_count(e)));
+            }
+            if (DS4_N_NEXTN_PREDICT != 0) {
+                out[DS4_N_LAYER + 1] = engine_size_add_sat(out[DS4_N_LAYER + 1], out[DS4_N_LAYER]);
+                out[DS4_N_LAYER] = 0;
+            }
+        }
+#endif
         return 0;
     }
 
@@ -71510,6 +71678,22 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
         pcfg.gpu_budget_bytes[d] = budget > reserve ? budget - reserve : 0;
     }
 
+    /* Qwen3.8's layers run one GPU after another, so filling the first GPU
+     * to its budget gains nothing: each takes its share of the total, which
+     * leaves every GPU the same proportion of headroom. */
+    if (ds4_model_is_qwen4() && pcfg.n_gpus > 1) {
+        size_t total = 0, largest = 0, cap = 0;
+        for (uint32_t i = 0; i < DS4_N_LAYER + 2u; i++) {
+            total = engine_size_add_sat(total, entry_bytes[i]);
+            if (entry_bytes[i] > largest) largest = entry_bytes[i];
+        }
+        for (int d = 0; d < pcfg.n_gpus; d++) cap = engine_size_add_sat(cap, pcfg.gpu_budget_bytes[d]);
+        for (int d = 0; total <= cap && d < pcfg.n_gpus; d++) {
+            const size_t share = (size_t)((double)total * ((double)pcfg.gpu_budget_bytes[d] / (double)cap)) + largest;
+            if (share < pcfg.gpu_budget_bytes[d]) pcfg.gpu_budget_bytes[d] = share;
+        }
+    }
+
     const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
     if (cuda_tp_ep && engine_reserve_cuda_ep_output_shards(e, &pcfg) != 0) {
         return -1;
@@ -71523,6 +71707,8 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
         return -1;
     }
     e->n_placement_entries = DS4_N_LAYER + 2;
+    if (ds4_model_is_qwen4() && DS4_N_NEXTN_PREDICT != 0)
+        e->placement[DS4_N_LAYER] = e->placement[DS4_N_LAYER + 1];
     engine_adjust_output_head_for_cuda_tp(e, entry_bytes);
 
     int first_tier = e->placement[0];
@@ -72527,14 +72713,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA ||
 #endif
             (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
+        /* Several CUDA GPUs take contiguous layer ranges (qwen4_graph_use_tier);
+         * the steering directions would need a copy per GPU. */
+        const bool placed = gpu_cfg && gpu_cfg->n_gpus > 1;
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
-            (gpu_cfg && gpu_cfg->n_gpus > 1) ||
+            (placed && (e->backend != DS4_BACKEND_CUDA ||
+                        (opt->directional_steering_file && opt->directional_steering_file[0]))) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
             e->ssd_streaming || opt->dspark ||
             (opt->mtp_path && opt->mtp_path[0])) {
-            fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA (or --cpu --first-token-test); "
-                            "tensor parallelism, pipeline execution, SSD streaming, DSpark "
-                            "and external MTP models are not supported\n");
+            fprintf(stderr, "ds4: Qwen3.8 requires Metal or CUDA (one GPU, or layer placement over several) "
+                            "(or --cpu --first-token-test); tensor parallelism, distributed execution, "
+                            "SSD streaming, DSpark, external MTP models and steering across GPUs "
+                            "are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -72766,7 +72957,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = e;
             return 0;
         }
-        if (opt->first_token_test) {
+        /* With layers placed over several GPUs the test runs on the engine's
+         * placement, set up below as for generation. */
+        if (opt->first_token_test && !(gpu_cfg && gpu_cfg->n_gpus > 1)) {
             if (e->backend != DS4_BACKEND_CPU && e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) {
                 fprintf(stderr, "ds4: Qwen3.8 first-token test needs CPU, Metal or CUDA\n");
                 ds4_engine_close(e);
@@ -74915,7 +75108,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                e->glm_mtp, shared,
                                s->qwen4_slot >= 0 ? e->qwen4_lin_state_pool : NULL,
                                s->qwen4_slot >= 0 ? e->qwen4_lin_hist_pool : NULL,
-                               s->qwen4_slot >= 0 ? (uint32_t)s->qwen4_slot : 0u)) {
+                               s->qwen4_slot >= 0 ? (uint32_t)s->qwen4_slot : 0u,
+                               e->multi_tier ? e->placement + 1 : NULL)) {
             if (s->qwen4_slot >= 0) e->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             free(s);
             return 1;

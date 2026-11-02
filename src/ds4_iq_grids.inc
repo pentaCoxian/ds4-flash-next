@@ -1,7 +1,13 @@
 /* Codebooks of the IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S quants, from llama.cpp
- * ggml-common.h (MIT). metal/quants.metal carries the same tables. */
+ * ggml-common.h (MIT). metal/quants.metal carries the same tables.  The CUDA
+ * Qwen3.8 kernels include this file with DS4_IQ_GRID defined as device
+ * constants. */
 
-static const uint64_t iq2xs_grid[512] = {
+#ifndef DS4_IQ_GRID
+#define DS4_IQ_GRID static const
+#endif
+
+DS4_IQ_GRID uint64_t iq2xs_grid[512] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x080808080819192b,
     0x0808080808192b19, 0x08080808082b0808, 0x08080808082b082b, 0x08080808082b1919,
@@ -132,7 +138,7 @@ static const uint64_t iq2xs_grid[512] = {
     0x2b2b2b2b082b2b08, 0x2b2b2b2b082b2b2b, 0x2b2b2b2b2b190819, 0x2b2b2b2b2b2b2b2b,
 };
 
-static const uint64_t iq2s_grid[1024] = {
+DS4_IQ_GRID uint64_t iq2s_grid[1024] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x080808080819192b,
     0x0808080808192b19, 0x08080808082b0808, 0x08080808082b082b, 0x08080808082b1919,
@@ -391,7 +397,7 @@ static const uint64_t iq2s_grid[1024] = {
     0x2b2b2b2b082b082b, 0x2b2b2b2b082b2b08, 0x2b2b2b2b2b082b08, 0x2b2b2b2b2b2b2b2b,
 };
 
-static const uint32_t iq3xxs_grid[256] = {
+DS4_IQ_GRID uint32_t iq3xxs_grid[256] = {
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
     0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
     0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
@@ -426,7 +432,7 @@ static const uint32_t iq3xxs_grid[256] = {
     0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
 };
 
-static const uint32_t iq3s_grid[512] = {
+DS4_IQ_GRID uint32_t iq3s_grid[512] = {
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
     0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
     0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
@@ -493,7 +499,7 @@ static const uint32_t iq3s_grid[512] = {
     0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
 };
 
-static const uint8_t ksigns_iq2xs[128] = {
+DS4_IQ_GRID uint8_t ksigns_iq2xs[128] = {
       0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
     144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
     160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,

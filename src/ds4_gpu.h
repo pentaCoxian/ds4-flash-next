@@ -3357,6 +3357,8 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
                                const ds4_gpu_tensor *logits, uint32_t n_vocab);
 /* M3 Ultra decode defaults; DS4_QWEN4_DECODE_FUSIONS=0 restores old paths. */
 int ds4_gpu_qwen4_decode_fusions_enabled(void);
+/* CUDA: whether the Qwen matrix kernels take the sm_80 tensor-core tiles. */
+int ds4_gpu_qwen4_tensor_tiles(void);
 int ds4_gpu_qwen4_shexp_slot_mixed(uint32_t n_tokens);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */
 int ds4_gpu_qwen4_hc_combine_norm_tensor(
