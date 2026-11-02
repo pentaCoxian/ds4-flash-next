@@ -151,7 +151,7 @@ Tips for agents:
 | `--quant` | File | Weights | When |
 |---|---|---|---|
 | `iq3m8` | this README | 42.4 GiB | 64 GB, with this build |
-| `iq3m` | iq3m8 with BF16 mixers | 42.9 GiB | with upstream ds4, which has no fast Q8_0 mixer kernels |
+| `iq3m` | iq3m8 with BF16 mixers ([Hugging Face](https://huggingface.co/pentacoxian-dev/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS_M64-GGUF)) | 42.9 GiB | with upstream ds4, which has no fast Q8_0 mixer kernels |
 | `q2` | ISTA Q2_0 | 35.0 GiB | 64 GB at the default GPU limit, or contexts to 524K; about 10% faster than iq3m, clearly worse answers |
 | `iq3` | ISTA IQ3_XXS | 43.8 GiB | 262K without the Neural Engine on 64 GB |
 | `iq3s` | ISTA IQ3_S, the best file | 51.0 GiB | 96 GB or more |
