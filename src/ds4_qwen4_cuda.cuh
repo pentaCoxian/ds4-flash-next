@@ -917,12 +917,13 @@ __global__ void router(int *selected, float *weights, const float *logits,
  * expert rows are as fast as their memory allows only this way on Volta.
  * group8i gives the eight weights of group g and their scale d, and for the
  * K-quants with a minimum m, so that the group's sum is d*q.x - m*sum(x). */
-__device__ __forceinline__ int sign4(unsigned bits) {   /* 0xff where bit k of the nibble is set */
-    return (int)__vcmpne4(((bits & 15) * 0x01010101u) & 0x08040201u, 0);
-}
+/* the four bytes of g negated where bit k of the nibble bits is set.  The
+ * grids hold no zero byte, so the per-byte negation (g ^ ff) + 1 never
+ * carries; Volta has no hardware for the SIMD intrinsics (__vcmpne4,
+ * __vsub4) that would do it otherwise. */
 __device__ __forceinline__ int signed4(unsigned g, unsigned bits) {
-    const int s = sign4(bits);
-    return (int)__vsub4(g ^ (unsigned)s, (unsigned)s);
+    const unsigned b01 = ((bits & 15) * 0x00204081u) & 0x01010101u;
+    return (int)((g ^ (b01 * 0xffu)) + b01);
 }
 
 __host__ __device__ constexpr bool grouped_i8(unsigned type) {
@@ -932,7 +933,7 @@ __host__ __device__ constexpr bool grouped_i8(unsigned type) {
 
 template<unsigned TYPE>
 __device__ __forceinline__ void group8i(const char *row, unsigned g, int &w0, int &w1, float &d, float &m,
-        const uint64_t *grid_table = NULL, const uint8_t *sign_table = NULL) {
+        const void *grid_table = NULL, const uint8_t *sign_table = NULL) {
     m = 0;
     if (TYPE == 8) {
         const uint8_t *b = (const uint8_t *)row + (g / 4) * 34;
@@ -1002,28 +1003,30 @@ __device__ __forceinline__ void group8i(const char *row, unsigned g, int &w0, in
         const unsigned ss = u16_at(b + 6 + 8 * ib) | (u16_at(b + 8 + 8 * ib) << 16);
         d = half_at(b) * (.5f + (ss >> 28)) * .25f;
         /* the constant-memory tables serialize a warp's different entries */
-        grid = grid_table ? grid_table[(ids >> (8 * l)) & 255] : cuda_iq2xxs_grid[(ids >> (8 * l)) & 255];
+        grid = grid_table ? ((const uint64_t *)grid_table)[(ids >> (8 * l)) & 255] : cuda_iq2xxs_grid[(ids >> (8 * l)) & 255];
         signs = sign_table ? sign_table[(ss >> (7 * l)) & 127] : cuda_ksigns_iq2xs[(ss >> (7 * l)) & 127];
     } else if (TYPE == 17) {
         const unsigned q = u16_at(b + 2 + 2 * gi);
         d = half_at(b) * (.5f + ((b[66 + ib] >> (4 * (l / 2))) & 15)) * .25f;
-        grid = iq2xs_grid[q & 511];
-        signs = ksigns_iq2xs[q >> 9];
+        grid = grid_table ? ((const uint64_t *)grid_table)[q & 511] : iq2xs_grid[q & 511];
+        signs = sign_table ? sign_table[q >> 9] : ksigns_iq2xs[q >> 9];
     } else if (TYPE == 22) {
         d = half_at(b) * (.5f + ((b[74 + ib] >> (4 * (l / 2))) & 15)) * .25f;
-        grid = iq2s_grid[b[2 + gi] | (((b[66 + ib] >> (2 * l)) & 3) << 8)];
+        const unsigned gi2 = b[2 + gi] | (((b[66 + ib] >> (2 * l)) & 3) << 8);
+        grid = grid_table ? ((const uint64_t *)grid_table)[gi2] : iq2s_grid[gi2];
         signs = b[34 + gi];
     } else if (TYPE == 18) {
         const unsigned aux = u16_at(b + 66 + 4 * ib) | (u16_at(b + 68 + 4 * ib) << 16);
         const unsigned qi = u16_at(b + 2 + 2 * gi);
         d = half_at(b) * (.5f + (aux >> 28)) * .5f;
-        grid = iq3xxs_grid[qi & 255] | ((uint64_t)iq3xxs_grid[qi >> 8] << 32);
-        signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+        const uint32_t *t = grid_table ? (const uint32_t *)grid_table : iq3xxs_grid;
+        grid = t[qi & 255] | ((uint64_t)t[qi >> 8] << 32);
+        signs = sign_table ? sign_table[(aux >> (7 * l)) & 127] : ksigns_iq2xs[(aux >> (7 * l)) & 127];
     } else {                   /* IQ3_S */
         d = half_at(b) * (float)(1 + 2 * ((b[106 + ib / 2] >> (4 * (ib % 2))) & 15));
         const unsigned qh = b[66 + ib] >> (2 * l), qi = u16_at(b + 2 + 2 * gi);
-        grid = iq3s_grid[(qi & 255) | ((qh & 1) << 8)] |
-               ((uint64_t)iq3s_grid[(qi >> 8) | (((qh >> 1) & 1) << 8)] << 32);
+        const uint32_t *t = grid_table ? (const uint32_t *)grid_table : iq3s_grid;
+        grid = t[(qi & 255) | ((qh & 1) << 8)] | ((uint64_t)t[(qi >> 8) | (((qh >> 1) & 1) << 8)] << 32);
         signs = b[74 + gi];
     }
     w0 = signed4((uint32_t)grid, signs); w1 = signed4((uint32_t)(grid >> 32), signs >> 4);
@@ -1043,7 +1046,7 @@ __host__ __device__ constexpr bool grouped_i32(unsigned type) {
 
 template<unsigned TYPE>
 __device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8], float &d0, float &d1,
-        const uint64_t *grid_table = NULL, const uint8_t *sign_table = NULL) {
+        const void *grid_table = NULL, const uint8_t *sign_table = NULL) {
     if (TYPE == 20) {          /* IQ4_NL: one 18-byte block of 32 */
         const uint8_t *b = (const uint8_t *)row + s * 18;
         const uint64_t lo = bytes8(b + 2), hi = bytes8(b + 10);
@@ -1084,12 +1087,13 @@ __device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8
         d0 = d1 = d * (float)(1 + 2 * ((b[106 + ib / 2] >> (4 * (ib % 2))) & 15));
         const unsigned qh = b[66 + ib], sg = u32_at2(b + 74 + 4 * ib);
         const uint64_t qs = bytes8(b + 2 + 8 * ib);
+        const uint32_t *t = grid_table ? (const uint32_t *)grid_table : iq3s_grid;
         #pragma unroll
         for (unsigned l = 0; l < 4; l++) {
             const unsigned lo = byte_k(qs, 2 * l) | ((qh >> (2 * l)) & 1) << 8;
             const unsigned hi = byte_k(qs, 2 * l + 1) | ((qh >> (2 * l + 1)) & 1) << 8;
             const unsigned sl = sg >> (8 * l);
-            w[2 * l] = signed4(iq3s_grid[lo], sl); w[2 * l + 1] = signed4(iq3s_grid[hi], sl >> 4);
+            w[2 * l] = signed4(t[lo], sl); w[2 * l + 1] = signed4(t[hi], sl >> 4);
         }
         return;
     }
@@ -1097,11 +1101,12 @@ __device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8
         const unsigned aux = u32_at2(b + 66 + 4 * ib);
         d0 = d1 = d * (.5f + (aux >> 28)) * .5f;
         const uint64_t qs = bytes8(b + 2 + 8 * ib);
+        const uint32_t *t = grid_table ? (const uint32_t *)grid_table : iq3xxs_grid;
         #pragma unroll
         for (unsigned l = 0; l < 4; l++) {
-            const unsigned sl = ksigns_iq2xs[(aux >> (7 * l)) & 127];
-            w[2 * l] = signed4(iq3xxs_grid[byte_k(qs, 2 * l)], sl);
-            w[2 * l + 1] = signed4(iq3xxs_grid[byte_k(qs, 2 * l + 1)], sl >> 4);
+            const unsigned sl = sign_table ? sign_table[(aux >> (7 * l)) & 127] : ksigns_iq2xs[(aux >> (7 * l)) & 127];
+            w[2 * l] = signed4(t[byte_k(qs, 2 * l)], sl);
+            w[2 * l + 1] = signed4(t[byte_k(qs, 2 * l + 1)], sl >> 4);
         }
         return;
     }
@@ -1111,7 +1116,8 @@ __device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8
         d0 = d1 = d * (.5f + (ss >> 28)) * .25f;
         #pragma unroll
         for (unsigned l = 0; l < 4; l++) {
-            const uint64_t g = grid_table ? grid_table[(ids >> (8 * l)) & 255] : cuda_iq2xxs_grid[(ids >> (8 * l)) & 255];
+            const uint64_t g = grid_table ? ((const uint64_t *)grid_table)[(ids >> (8 * l)) & 255]
+                                          : cuda_iq2xxs_grid[(ids >> (8 * l)) & 255];
             const unsigned sl = sign_table ? sign_table[(ss >> (7 * l)) & 127] : cuda_ksigns_iq2xs[(ss >> (7 * l)) & 127];
             w[2 * l] = signed4((unsigned)g, sl); w[2 * l + 1] = signed4((unsigned)(g >> 32), sl >> 4);
         }
@@ -1125,8 +1131,8 @@ __device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8
         #pragma unroll
         for (unsigned l = 0; l < 4; l++) {
             const unsigned v = (unsigned)(q >> (16 * l)) & 0xffff;
-            const uint64_t g = iq2xs_grid[v & 511];
-            const unsigned sl = ksigns_iq2xs[v >> 9];
+            const uint64_t g = grid_table ? ((const uint64_t *)grid_table)[v & 511] : iq2xs_grid[v & 511];
+            const unsigned sl = sign_table ? sign_table[v >> 9] : ksigns_iq2xs[v >> 9];
             w[2 * l] = signed4((unsigned)g, sl); w[2 * l + 1] = signed4((unsigned)(g >> 32), sl >> 4);
         }
         return;
@@ -1138,7 +1144,8 @@ __device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8
         const unsigned qs = u32_at2(b + 2 + 4 * ib), sg = u32_at2(b + 34 + 4 * ib);
         #pragma unroll
         for (unsigned l = 0; l < 4; l++) {
-            const uint64_t g = iq2s_grid[((qs >> (8 * l)) & 255) | (((qh >> (2 * l)) & 3) << 8)];
+            const unsigned gi = ((qs >> (8 * l)) & 255) | (((qh >> (2 * l)) & 3) << 8);
+            const uint64_t g = grid_table ? ((const uint64_t *)grid_table)[gi] : iq2s_grid[gi];
             const unsigned sl = sg >> (8 * l);
             w[2 * l] = signed4((unsigned)g, sl); w[2 * l + 1] = signed4((unsigned)(g >> 32), sl >> 4);
         }
@@ -1210,7 +1217,7 @@ __host__ __device__ constexpr bool iq_codebook(unsigned type) {
 template<unsigned TYPE, unsigned ROWS, unsigned NR, unsigned CH>
 __device__ __forceinline__ void doti_rows(float (&acc)[NR][ROWS], const char *const (&r)[NR],
         const int8_t *xq, const float *xd, const unsigned (&xr)[ROWS], unsigned mask, unsigned K,
-        const uint64_t *grid_table = NULL, const uint8_t *sign_table = NULL) {
+        const void *grid_table = NULL, const uint8_t *sign_table = NULL) {
     for (unsigned c = threadIdx.x & 31; c < K / (8 * CH); c += 32) {
         if constexpr (CH == 4 && grouped_i32(TYPE)) {
             int q[NR][8];
@@ -1272,7 +1279,7 @@ template<unsigned TYPE, bool DOWN> struct moe_geometry {
 template<unsigned TYPE, unsigned ROWS, unsigned NR>
 __device__ __forceinline__ void moe_rows_q8(float (&acc)[NR][ROWS], const char *const (&r)[NR], const int8_t *xq,
         const float *xd, const unsigned (&xr)[ROWS], unsigned mask, unsigned K, bool down,
-        const uint64_t *grid_table = NULL, const uint8_t *sign_table = NULL) {
+        const void *grid_table = NULL, const uint8_t *sign_table = NULL) {
     if (down) doti_rows<TYPE, ROWS, NR, moe_geometry<TYPE, true>::CH>(acc, r, xq, xd, xr, mask, K, grid_table, sign_table);
     else doti_rows<TYPE, ROWS, NR, moe_geometry<TYPE, false>::CH>(acc, r, xq, xd, xr, mask, K, grid_table, sign_table);
 }
@@ -1288,6 +1295,26 @@ __device__ __forceinline__ void moe_rows_q8_any(float (&acc)[NR][ROWS], const ch
     default: break;
     }
 #undef QWEN_ROWS_Q8
+}
+
+/* The expert kernels stage the IQ types' codebooks in shared memory: a
+ * warp's lanes look up 32 random entries at once, which a table in global
+ * memory serves through L1 a line at a time (IQ3_S gate and up rows of a
+ * three-row verify: 62 us against 70). */
+__host__ __device__ constexpr unsigned iq_grid_bytes(unsigned type) {
+    return type == 16 ? 2048 : type == 17 ? 4096 : type == 22 ? 8192 : type == 18 ? 1024 : type == 21 ? 2048 : 0;
+}
+__host__ __device__ constexpr bool iq_grid_signs(unsigned type) { return type == 16 || type == 17 || type == 18; }
+
+template<unsigned TYPE>
+__device__ __forceinline__ void stage_iq_grid(uint8_t *grid, uint8_t *signs) {
+    if (TYPE == 16) for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) ((uint64_t *)grid)[i] = cuda_iq2xxs_grid[i];
+    if (TYPE == 17) for (unsigned i = threadIdx.x; i < 512; i += blockDim.x) ((uint64_t *)grid)[i] = iq2xs_grid[i];
+    if (TYPE == 22) for (unsigned i = threadIdx.x; i < 1024; i += blockDim.x) ((uint64_t *)grid)[i] = iq2s_grid[i];
+    if (TYPE == 18) for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) ((uint32_t *)grid)[i] = iq3xxs_grid[i];
+    if (TYPE == 21) for (unsigned i = threadIdx.x; i < 512; i += blockDim.x) ((uint32_t *)grid)[i] = iq3s_grid[i];
+    if (iq_grid_signs(TYPE))
+        for (unsigned i = threadIdx.x; i < 128; i += blockDim.x) signs[i] = TYPE == 16 ? cuda_ksigns_iq2xs[i] : ksigns_iq2xs[i];
 }
 
 /* moe_mv with int8 activations (xq/xd hold the rows the FP32 kernel reads
@@ -1331,11 +1358,11 @@ __global__ void __launch_bounds__(128, 8) moe_mv_q8(float *out, const int8_t *xq
             }
         }
     }
-    __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
-    __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
-    if (TYPE == 16) {
-        for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) grid_table[i] = cuda_iq2xxs_grid[i];
-        for (unsigned i = threadIdx.x; i < 128; i += blockDim.x) sign_table[i] = cuda_ksigns_iq2xs[i];
+    constexpr unsigned GB = iq_grid_bytes(TYPE);
+    __shared__ __align__(16) uint8_t grid_table[GB ? GB : 16];
+    __shared__ uint8_t sign_table[iq_grid_signs(TYPE) ? 128 : 1];
+    if constexpr (GB > 0) {
+        stage_iq_grid<TYPE>(grid_table, sign_table);
         __syncthreads();
     }
     if (row0 >= M) return;
