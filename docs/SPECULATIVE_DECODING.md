@@ -89,9 +89,11 @@ own outcomes.
 - Once chained, the cycle verifies three rows when p1 times the calibrated
   p2 beats the rate times the extra verify time, by 10% (the chain is paid
   for by then).
-- The chained draft scores the head's first 98304 rows, the frequent tokens
-  (`DS4_QWEN4_MTP_CHAIN_ROWS=N` changes it); the first draft and the verify
-  rows use the whole head.
+- Both drafts score the head's first 98304 rows, the frequent tokens
+  (`DS4_QWEN4_MTP_DRAFT_ROWS=N` and `DS4_QWEN4_MTP_CHAIN_ROWS=N` change it);
+  the verify rows use the whole head, so the drafts change only which tokens
+  are proposed. On a coding agent turn, Japanese and English prose the first
+  draft was accepted as often as with the whole head.
 
 Greedy output is the same under every policy, so policies compare exactly by
 their cycle mix priced at those costs. Against depth 2 on an M3 Max at 8K:

@@ -58906,7 +58906,12 @@ static bool qwen4_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor
  * scores the draft over that leading prefix of the output head only.  The
  * verify rows always use the full head, so committed tokens and every
  * teacher-forced logit are unchanged; only which draft is proposed can differ
- * when the true argmax lies beyond the prefix.  Default: the full vocabulary. */
+ * when the true argmax lies beyond the prefix.  Default: the first 98304 rows,
+ * as for the chained draft.  At depth 2 over 256 greedy tokens of a coding
+ * agent turn, Japanese and English prose (iq3m8), they accepted as many first
+ * drafts as the whole head (120/135, 107/147, 106/148 against 102/152), and
+ * the head's 1.1 ms on an M3 Max scales with its rows; 65536 rows lost two of
+ * the agent's.  DS4_QWEN4_MTP_DRAFT_ROWS=248320 scores the whole head. */
 /* DS4_QWEN4_MTP_DRAFT_VOCAB=<file>: token ids, one per line, most frequent
  * first (the MTPLX FR-Spec idea).  The draft head becomes a gathered copy of
  * those output rows, so the draft is scored over that subset and the argmax
@@ -58976,14 +58981,14 @@ static bool qwen4_graph_fused(const ds4_qwen4_gpu_graph *g, uint32_t T) {
 static uint32_t qwen4_mtp_draft_rows(void) {
     /* read per cycle so the A/B harnesses can switch it per step */
     const char *env = getenv("DS4_QWEN4_MTP_DRAFT_ROWS");
-    const long long v = env && env[0] ? strtoll(env, NULL, 10) : 0;
+    const long long v = env && env[0] ? strtoll(env, NULL, 10) : 98304;
     return v > 0 && v < (long long)DS4_N_VOCAB ? (uint32_t)v : DS4_N_VOCAB;
 }
 /* The chained second draft scores the first 98304 rows of the head, the
  * frequent tokens: its chain then costs 0.044 of a 2-row cycle instead of
  * 0.062 on the M3 Max, and its lower acceptance where the next token lies
- * past the prefix is learned by the depth policy like any other.  The first
- * draft and the verify rows keep the whole head.
+ * past the prefix is learned by the depth policy like any other.  The verify
+ * rows keep the whole head.
  * DS4_QWEN4_MTP_CHAIN_ROWS=N sets the prefix (the vocabulary size: all). */
 static uint32_t qwen4_mtp_chain_rows(void) {
     const char *env = getenv("DS4_QWEN4_MTP_CHAIN_ROWS");
