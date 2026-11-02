@@ -1,279 +1,182 @@
-# ds4 Flash-Next: Qwen3.8-Flash-Next on Apple Silicon
+# Qwen3.8-Flash-Next on a 64 GB Mac
 
-A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar), tuned
-for the M1 to M3 Max, that runs **Qwen3.8-Flash-Next** on Apple Silicon Macs with
-64 GB of memory or more:
-the **full 262K context**, MTP speculative decoding and vision, as a local
-OpenAI/Anthropic compatible server for OpenCode, Claude Code, Pi or any
-other agent. The same launcher also runs **DeepSeek V4 Flash** and the other
-ds4 models, see [Other models](#other-models).
+Run **Qwen3.8-Flash-Next** on a 64 GB M1 to M3 Max with the **full 262K
+context**, MTP speculative decoding, vision and Neural Engine prefill, as a
+local OpenAI/Anthropic compatible server for OpenCode, Claude Code, DSH, Pi
+or any other agent.
 
-What it adds to stock ds4:
+It is built around one file, **iq3m8**
+([IQ3_XXS_M64_HC8 on Hugging Face](https://huggingface.co/pentacoxian-dev/Qwen3.8-Flash-Next-GSQ-RCO-M64-GGUF)):
+ISTA-DASLab's GSQ-RCO IQ3_XXS quant, reshaped to fit 64 GB with room to
+spare and to decode faster on the M3 Max, at the same quality.
 
-- **The small ISTA-DASLab GSQ-RCO files.** Their weights take 35 to 51 GiB,
-  so the model fits a 64 GB Mac with room for the whole context window.
-  Stock ds4 does not open these files; its own take 42 and 70 GiB.
-- **One launcher.** `dstar serve` picks the context that fits the memory of
-  the machine, turns on MTP and vision, and prints the one `sysctl` line it
-  may need.
-- **Agent sessions that do not replay.** A retried or edited turn on a 31K
-  prompt takes 0.3 s instead of 109 s, and a new session with the same
-  system prompt and tools starts from a checkpoint on disk.
-- **Metal kernels for these quants**, written and measured on an M1 Max,
-  where stock ds4 decoded at 21 to 23 tokens per second and this fork
-  decodes at 35.
-- **DeepSeek V4 Flash on a 64 GB Mac.** The 81 GiB Q2 file is larger than
-  the memory, so `dstar serve deepseek` streams it from the SSD: 10.35
-  tokens per second on an M1 Max, against 9.4 in stock ds4. See
-  [the numbers](#deepseek-v4-flash-on-a-64-gb-mac).
-
-Nearly all of it is the same code on every Apple Silicon chip. What is and
-what is not specific to M1 is listed in [Which Macs gain](docs/FLASH_NEXT_FORK.md#which-macs-gain).
-
-## Qwen3.8-Flash-Next: which quant for your Mac
-
-Qwen3.8-Flash-Next is the main model here and what `dstar pull` downloads.
-ISTA-DASLab publishes it in three sizes (quants); a larger one answers
-better and is slower. `--quant` picks one, in `dstar pull` and in
-`dstar serve`:
-
-| Your Mac | Quant | `--quant` | Weights | Context it runs with |
-|---|---|---|---|---|
-| 64 GB | Q2_0, the fastest | `q2` (default) | 35 GiB | 262K; up to 524K |
-| 64 GB | IQ3_XXS with four layers from Q2_0, better answers | `iq3m` | 43 GiB | 262K, with the Neural Engine |
-| 64 GB | `iq3m` with 8-bit hyper-connection mixers, the same answers faster | `iq3m8` | 42 GiB | 262K, with the Neural Engine |
-| 64 GB | IQ3_XXS | `iq3` | 44 GiB | 262K, without the Neural Engine |
-| 96 GB or more | IQ3_S, the best file | `iq3s` | 51 GiB | 262K; up to 524K from 128 GB |
-
-On a 64 GB Mac `iq3m` is the one to pick for answers: it is IQ3_XXS (same
-KL to the best file, 0.18 against 0.44 for Q2_0, and much better Japanese)
-with the routed down experts of four layers taken from Q2_0, which leaves
-room at 262K for the Neural Engine to prefill a quarter faster. Q2_0
-decodes about 10% faster. `dstar pull --quant iq3m` builds it from the
-`iq3` and `q2` files. `iq3m8` is `iq3m` with the low-rank projections of its
-hyper-connection mixers in Q8_0 instead of BF16: KL 0.011 against `iq3m`
-and no further from IQ3_S, 0.6 GiB less, and about 10% faster decoding on
-an M3 Max (`dstar pull --quant iq3m8` requantizes it from `iq3m` in about
-15 seconds; it needs numpy). ISTA's LiveCodeBench scores are 81.1, 86.3 and 86.9
-for Q2_0, IQ3_XXS and IQ3_S; speeds are in
-[The larger quants](docs/FLASH_NEXT_FORK.md#the-larger-quants).
-`dstar doctor` prints the largest context each quant can hold on your Mac.
-
-**On 64 GB the GPU memory limit has to be raised for the IQ3 files and the
-longest contexts.** macOS lets the GPU use about three quarters of the
-memory by default, 48 GiB of 64: enough for Q2_0 at 262K, and at 524K in
-1024-row chunks. When a context does not fit, `dstar serve` takes a smaller
-one and prints the line to run:
-
-```sh
-sudo sysctl iogpu.wired_limit_mb=57344    # iq3m and iq3 at 262K
-```
-
-The setting is lost at every reboot. With iq3m at 262K the server plans
-53.9 GiB of the 64 (the K/V cache is 8-bit), so close the
-browser first.
-
-Below 64 GB nothing has been tried. Qwen3.8 has no SSD streaming in ds4, so
-the weights must fit in memory: Q2_0 with a 32K context needs 42 GiB.
-
-## Flash-Next speed on an M1 Max
-
-M1 Max, 32-core GPU, 64 GB, the Q2_0 file. A prompt of C code with a
-300 token greedy answer, `--prefill-chunk 2048`:
-
-| Context | Decode | Decode with MTP | Prefill |
-|---|---|---|---|
-| 4K | 35.5 to 37.7 tok/s | 44 to 45 tok/s | ~355 tok/s |
-| 128K | 36.0 tok/s | 43.4 tok/s | ~345 tok/s |
-| 256K | 32.9 tok/s | 37.4 tok/s | ~290 to 320 tok/s |
-
-Prose is a little slower to prefill, about 280 to 320 tokens per second.
-MTP gains depend on the text: about +20 to 30% on code, about +10% on
-prose. In one chat grown to 398K tokens, MTP decode went from 44 to 35
-tokens per second and prefill from 328 to 292.
-IQ3_XXS runs at about 0.8 of this speed (35 to 31 tokens per second with
-MTP up to 259K) and IQ3_S a little below that.
-
-## Flash-Next speed on an M3 Max
-
-M3 Max, 40-core GPU, measured with `dstar`'s settings at a 262K context,
-greedy decoding of 200 tokens after 8K prompts (a coding agent prompt and
-Japanese prose), alternating runs on a laptop whose speed varies about 10%
-with its temperature:
-
-| Quant | Prefill | Decode with MTP |
-|---|---|---|
-| `iq3m`, 1024-row chunks with the Neural Engine | 585 to 607 tok/s | 47 to 52 tok/s |
-| `iq3`, 1024-row chunks | 450 to 505 tok/s | 47 to 53 tok/s |
-| `q2`, 2048-row chunks with the Neural Engine | about 610 tok/s at 32K | about 59 tok/s at 32K |
-
-With the 8-bit K/V cache, `dstar` now gives iq3 and iq3m 2048-row chunks
-with the Neural Engine at 262K too; on this M3 Max that prefills about 2%
-faster than iq3m's 1024-row chunks above.
-
-The M3 has its own settings for a few kernels, see
-[Which Macs gain](docs/FLASH_NEXT_FORK.md#which-macs-gain). Other chips run
-the same kernels but nobody has timed them; if you do, the two commands at
-the end of that section make a useful report.
-
-## DeepSeek V4 Flash on a 64 GB Mac
-
-The other model measured here, `dstar pull ds4f-q2` and `dstar serve deepseek`.
-The Q2 file is 81 GiB, so on 64 GB ds4 keeps the dense weights and a cache
-of routed experts in memory and reads the rest from the SSD as tokens need
-them. Measured on an M1 Max, 32K context, greedy decoding:
-
-| | Before the changes | This fork |
-|---|---|---|
-| Decode, 400 token answer | 9.4 tok/s | 10.35 tok/s |
-| Prefill, 5K prompt | 94 tok/s | 101 tok/s |
-
-Decode reaches 14.4 tokens per second while every expert it needs is in the
-cache, and falls as the answer wanders: each of the 15 or so experts read
-from the SSD per token costs about 2 ms. The memory plan is 48.9 GiB, of
-which 36.4 GiB is the cache, 5526 of the 11008 experts.
-
-Two things to know. DSpark speculative decoding is slower here (6.3 to 7.4
-tokens per second), because every drafted token pulls more experts from the
-disk, so the launcher leaves it off. And a busy performance core slows the
-GPU by up to 45%: run it on a quiet machine. With 32 GB it is not usable,
-3.6 tokens per second in a simulation.
-
-## Requirements
-
-- An Apple Silicon Mac with 64 GB of RAM or more. The fork targets M1 and M2
-  (Max or Ultra); M3 and later run the same code. Only the M1 Max has been
-  measured so far; reports from other chips are welcome.
-- For Flash-Next, about 67 GB of disk for the model (both shards) and 1.5 GB
-  for the MTP block. A fast internal SSD, since the n-gram
-  table is read from disk on every token.
-- For Flash-Next contexts above 131K on 64 GB, a higher GPU memory limit,
-  see [above](#qwen38-flash-next-which-quant-for-your-mac).
-- 32 and 48 GB Macs are planned but not supported yet. Until then my
-  [Splash M1 port](https://github.com/paperniuk/splash) with Qwen3.8-27B
-  (21 GB) is the better choice there.
+This repository is a fork of [paperniuk/ds4](https://github.com/paperniuk/ds4),
+the Flash-Next fork of [antirez/ds4](https://github.com/antirez/ds4)
+(DwarfStar). Upstream's prebuilt release does not have iq3m8 or the kernels
+that make it fast; build this one from source.
 
 ## Quick start
 
-The prebuilt release ([dstar 1.0](https://github.com/paperniuk/ds4/releases/latest)),
-macOS 15 or newer, nothing to compile:
-
 ```sh
-curl -fsSL https://raw.githubusercontent.com/paperniuk/ds4/m1-flash-next/install.sh | bash
+git clone https://github.com/pentaCoxian/ds4-flash-next.git
+cd ds4-flash-next && make
+./dstar doctor                  # what your Mac fits: memory, files, contexts
+./dstar pull --quant iq3m8      # 76 GB, resumable
+sudo sysctl iogpu.wired_limit_mb=57344   # once per boot, for 262K
+./dstar serve                   # http://127.0.0.1:8010/v1
 ```
 
-It checks the download against its SHA-256, unpacks it into `~/dstar`
-(`DSTAR_DIR` to change) and links the launcher into `~/.local/bin`, so
-`dstar` works from any directory. If `~/.local/bin` is not on your `PATH`,
-it prints the line to add. Then:
+Open `http://127.0.0.1:8010/dashboard` to watch prefill, decode, MTP and GPU
+memory live. Then point your agent at the server:
 
 ```sh
-dstar doctor     # what your Mac fits: memory, files, the context per quant
-dstar pull       # 69 GB: the model, the MTP block, the vision encoder
-dstar serve      # server on http://127.0.0.1:8010/v1, live metrics on /dashboard
-dstar opencode   # provider block for OpenCode
-dstar dsh        # model route for the DeepSeek Harness (dsh)
+./dstar opencode   # provider block for OpenCode
+./dstar dsh        # model route for the DeepSeek Harness (dsh)
+./dstar link       # make dstar a command that works from any directory
 ```
 
-Running the installer again updates to the latest release; the models stay
-where they are.
+[Coding agent clients](docs/CLIENTS.md) covers Claude Code, Codex CLI and Pi
+too; use port 8010 and the context the server started with.
 
-Or build from source and run the launcher from the repository folder:
+## The model
 
-```sh
-git clone https://github.com/paperniuk/ds4.git
-cd ds4 && make
-./dstar doctor   # the same commands, as ./dstar
-```
+iq3m8 is two changes to ISTA-DASLab's
+[GSQ-RCO IQ3_XXS](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF):
 
-`./dstar link` puts that copy on your `PATH` instead, if you prefer it to
-the release.
+1. **The routed down experts of layers 29, 30, 31 and 35 come from ISTA's
+   Q2_0 file**, copied byte for byte. Of the 18 layers IQ3_XXS keeps in
+   IQ4_NL, these four moved the output least when swapped. That saves 0.9
+   GiB, which on 64 GB makes room at 262K for the Neural Engine. This step
+   alone is `iq3m`.
+2. **The 194 low-rank hyper-connection mixer projections are Q8_0 instead of
+   BF16.** They are 1.2 of the 4.3 GiB a decode token reads, and with this
+   fork's Q8_0 kernels the token takes 20.6 ms of GPU time instead of 22.4.
 
-`dstar serve` picks the context for you: the full 262K when the memory of
-the machine and the GPU memory limit allow it, a smaller one otherwise, and
-it prints the `sudo sysctl` line that unlocks the larger one. MTP and vision are on when their files are present.
+KL divergence against IQ3_S, ISTA's best file, over 2048-token sequences
+of C code, English prose and Japanese prose:
+
+| File | Weights | Mean KL vs IQ3_S | Top-1 agreement |
+|---|---|---|---|
+| Q2_0 (ISTA) | 35.0 GiB | 0.438 | 78.9% |
+| IQ3_XXS (ISTA) | 43.8 GiB | 0.1834 | 85.7% |
+| iq3m | 42.9 GiB | 0.1835 | 85.5% |
+| **iq3m8** | **42.4 GiB** | **0.1795** | **85.4%** |
+
+ISTA's LiveCodeBench score for IQ3_XXS is 86.3 (Q2_0 81.1, IQ3_S 86.9).
+No benchmarks were run on iq3m or iq3m8; by KL they sit with IQ3_XXS, well
+above Q2_0, and the gap is largest in Japanese.
+
+### Speed
+
+M3 Max, 40-core GPU, 40K context, 8K prompts (a coding agent / Japanese
+prose), 256 greedy tokens, best of three alternating rounds:
+
+| File | Decode | Decode with MTP | Prefill |
+|---|---|---|---|
+| iq3m | 43.9 / 42.0 tok/s | 50.6 / 50.9 tok/s | 497 / 485 tok/s |
+| **iq3m8** | **46.1 / 47.8 tok/s** | **53.0 / 52.4 tok/s** | **489 / 500 tok/s** |
+
+Measured with the build of 2026-11-01; the decode changes since then are
+not in these numbers. At 262K under an emulation of a 64 GB Mac, iq3m
+prefilled 585 to 607 tok/s with the Neural Engine against 450 to 505 for
+IQ3_XXS, which has no room for it there. Greedy output is the same with
+and without MTP. Only the M3 Max has been measured with iq3m8; M1 and M2
+run the same Q8_0 kernels, untimed.
+
+### Memory
+
+At 262K with MTP and the Neural Engine, ds4 plans 51.4 GiB: the weights and
+MTP block 43.8, the 8-bit KV cache 3.7, the prefill buffers 3.1 and the
+Neural Engine 0.9. The vision encoder maps only while it encodes an image.
+
+macOS lets the GPU use three quarters of the memory by default, 48 GiB of
+64. That holds iq3m8 at 32K only. `dstar serve` takes the largest context
+that fits and prints the line that unlocks more:
+
+| GPU limit | iq3m8 runs with |
+|---|---|
+| default (48 GiB) | 32K |
+| `sudo sysctl iogpu.wired_limit_mb=53248` | 262K, without the Neural Engine |
+| `sudo sysctl iogpu.wired_limit_mb=57344` | 262K, with the Neural Engine (prefill about a quarter faster) |
+
+The setting is lost at every reboot. At 57344 the system keeps 8 GB, so
+close the browser and other GPU-heavy apps first.
+
+## Requirements
+
+- An Apple Silicon Mac with 64 GB or more; tuned for the M1 to M3 Max.
+- 76 GB of disk: 45.5 GB for iq3m8, 28.8 GB for ISTA's n-gram table, 1.5
+  GB for the MTP block and 0.6 GB for the vision encoder. A fast internal
+  SSD, because the n-gram table is read from disk on every token.
+- Below 64 GB nothing runs yet: Qwen3.8 has no SSD streaming in ds4.
+  paperniuk's [Splash M1 port](https://github.com/paperniuk/splash) with
+  Qwen3.8-27B (21 GB) is the choice there.
+
+## Using it
+
+`dstar serve` picks the context that fits the memory of the Mac and the GPU
+limit, and turns on MTP, vision and the Neural Engine when they fit. Once
+iq3m8 is on disk, it is what `dstar serve` runs.
 
 | Command | What it does |
 |---|---|
-| `dstar pull` | download what is missing into `~/models/flash-next`, resumable; `--quant q2/iq3/iq3s` picks the quant, `--no-vision` skips the encoder |
-| `dstar serve` | start the server; `--ctx 131k/262k/400k/524k`, `--quant q2/iq3/iq3s`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--power N` |
+| `dstar pull --quant iq3m8` | download iq3m8, the n-gram table, the MTP block and the vision encoder into `~/models/flash-next`, resumable; `--no-vision` skips the encoder |
+| `dstar serve` | start the server; `--ctx 131k/262k/400k/524k`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--no-ane`, `--power N` |
 | `dstar serve --dry-run` | print the `ds4-server` command and environment instead of running it |
 | `dstar chat` | talk to the model in the terminal |
-| `dstar doctor` | check the machine, the files, the memory limit and which contexts fit |
+| `dstar doctor` | check the machine, the files, the GPU limit and which contexts fit |
 | `dstar opencode` | print the provider block for `~/.config/opencode/opencode.json` |
-| `dstar dsh` | print the model route for a DeepSeek Harness profile's `cordis.patch.yml` ([details](docs/CLIENTS.md#deepseek-harness-dsh)) |
-| `dstar link` | link the launcher into `~/.local/bin`, so `dstar` works from any directory |
-| `dstar models` | list the other models ds4 runs |
-| `dstar pull NAME` | download one of them into `./gguf` |
-| `dstar serve NAME` | serve another model by a word from its file name (`dstar serve deepseek`); also `dstar chat NAME` |
-
-### Other models
-
-ds4 is not a Flash-Next engine, and neither is the launcher. It runs
-DeepSeek V4 and V4.1 Flash, GLM 5.2 and 5.3 and the upstream Qwen3.8 files
-too:
-
-```sh
-dstar models                  # names and sizes
-dstar pull ds4f-q2            # DeepSeek V4 Flash Q2, 81 GiB
-dstar serve deepseek          # or a path to the GGUF
-dstar chat deepseek
-```
-
-The name is looked up in `./gguf` and next to `~/models/flash-next`.
-Without a name, `dstar serve` and `dstar chat` run Flash-Next when it is on
-disk and otherwise the one other model that is; `DSTAR_MODEL=deepseek`
-makes another model the default. `dstar doctor` lists what it found.
-
-Only Flash-Next gets its context sized to the machine. For the others the
-context defaults to 32768 (`--ctx N` changes it) and is not checked against
-the memory. A model larger than the RAM is started with `--ssd-streaming`.
-Everything after `--` goes to `ds4-server` unchanged. See
-[docs/MODELS.md](docs/MODELS.md) for what fits where.
-
-`DSTAR_MODELS` changes the Flash-Next directory, `DSTAR_QUANT` the default
-quant, `PORT` and `HOST` the address.
-See [docs/CLIENTS.md](docs/CLIENTS.md) for Claude Code and other clients;
-use port 8010 and the context the server was started with.
+| `dstar dsh` | print the model route for a DeepSeek Harness profile ([details](docs/CLIENTS.md#deepseek-harness-dsh)) |
+| `dstar link` | link the launcher into `~/.local/bin` |
 
 `--power N` keeps the GPU busy N percent of the time, for a cooler and
-quieter Mac: the engine sleeps after every decoded token and every prefill
-chunk. Speed drops a little more than in proportion, `--power 50` gives 16
-tokens per second where the full speed is 35, and the output does not
-change. In `dstar chat` the `/power N` command changes it on the fly.
+quieter Mac; the output does not change. `DSTAR_MODELS` changes the model
+directory, `PORT` and `HOST` the address. After a `git pull`, run `make` and
+restart the server.
 
-After a `git pull`, run `make` and restart the server. There is nothing to
-switch on: the speedups are the default path.
-
-## Tips for agents
+Tips for agents:
 
 - Pick the reasoning effort once per session. Qwen3.8 writes it at the top of
   the system prompt, so switching it mid-session prefills the whole
   conversation again.
 - The server keeps one live conversation. Switching to another one saves the
-  current state to the disk cache (`--kv-disk-dir`), and switching back
-  restores it in about a second.
+  current state to the disk cache, and switching back restores it in about a
+  second. A retried or edited turn reuses the cache instead of prefilling the
+  prompt again.
+
+## Other quants and models
+
+`--quant` in `dstar pull` and `dstar serve` picks another file:
+
+| `--quant` | File | Weights | When |
+|---|---|---|---|
+| `iq3m8` | this README | 42.4 GiB | 64 GB, with this build |
+| `iq3m` | iq3m8 with BF16 mixers | 42.9 GiB | with upstream ds4, which has no fast Q8_0 mixer kernels |
+| `q2` | ISTA Q2_0 | 35.0 GiB | 64 GB at the default GPU limit, or contexts to 524K; about 10% faster than iq3m, clearly worse answers |
+| `iq3` | ISTA IQ3_XXS | 43.8 GiB | 262K without the Neural Engine on 64 GB |
+| `iq3s` | ISTA IQ3_S, the best file | 51.0 GiB | 96 GB or more |
+
+Without `--quant`, `dstar pull` downloads `q2`. The launcher also runs
+DeepSeek V4 and V4.1 Flash (streamed from the SSD on 64 GB), GLM and the
+upstream Qwen3.8 files: `dstar models` lists them, `dstar pull NAME` and
+`dstar serve NAME` run one. See [The fork in detail](docs/FLASH_NEXT_FORK.md)
+for their numbers and [Models](docs/MODELS.md) for what fits where.
 
 ## Status
 
-Experimental, one developer, one machine. Parts of this fork that help every
-ds4 user are being proposed upstream. Everything else in ds4 (other models,
-CUDA, distributed inference, SSD streaming) is inherited from upstream and
-should keep working, but is not the focus here.
+Experimental, one developer, measured on one M3 Max. Everything else in ds4
+(other models, CUDA, distributed inference, SSD streaming) is inherited from
+upstream and should keep working, but is not the focus here.
 
-Model weights are under the Qwen community license; read it before any
+The weights are under the Qwen Community License 1.0; read it before any
 commercial use. The code is MIT, like upstream.
 
 ## More
 
-- [The fork in detail](docs/FLASH_NEXT_FORK.md): contexts beyond 262K, what changed, which Macs gain, the larger quants, running `ds4-server` by hand, sampling and the switches for measuring.
-- [The upstream README](https://github.com/antirez/ds4#readme): what DwarfStar is, its other models and hardware.
-- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
+- [The fork in detail](docs/FLASH_NEXT_FORK.md): what changed, which Macs gain, the larger quants, contexts beyond 262K, running `ds4-server` by hand.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
-- [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
-- [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
-- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
-- [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
-- [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
-- [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
+- [Speculative decoding](docs/SPECULATIVE_DECODING.md): Qwen MTP, the depth policy, and sampling.
+- [Serving](docs/SERVER.md): APIs, the live dashboard, images, batching, and disk KV caches.
+- [Coding agent clients](docs/CLIENTS.md): OpenCode, DSH, Pi, Codex CLI, and Claude Code.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
+- [The upstream README](https://github.com/antirez/ds4#readme): what DwarfStar is, its other models and hardware.
