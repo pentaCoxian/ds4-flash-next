@@ -548,6 +548,7 @@ tests/test_qwen4_cuda: tests/test_qwen4_cuda.o $(OBJDIR)/ds4_cuda.o $(OBJDIR)/ds
 .PHONY: test-qwen4-cuda
 test-qwen4-cuda: tests/test_qwen4_cuda
 	./tests/test_qwen4_cuda
+	DS4_TEST_QWEN4_Q8=1 ./tests/test_qwen4_cuda
 endif
 
 $(OBJDIR)/ds4.o: src/ds4.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_gpu.h src/ds4_gpu_tp.h src/ds4_deepseek41_gpu.h src/ds4_linux_memory.h src/ds4_engram.h

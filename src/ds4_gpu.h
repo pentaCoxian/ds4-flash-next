@@ -3359,6 +3359,10 @@ int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch
 int ds4_gpu_qwen4_decode_fusions_enabled(void);
 /* CUDA: whether the Qwen matrix kernels take the sm_80 tensor-core tiles. */
 int ds4_gpu_qwen4_tensor_tiles(void);
+/* CUDA: round x's rows to int8 once for the decode/verify products that
+ * read it next, until the next call (x = NULL drops it); x must not change
+ * meanwhile. */
+int ds4_gpu_qwen4_q8_input(const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim);
 int ds4_gpu_qwen4_shexp_slot_mixed(uint32_t n_tokens);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */
 int ds4_gpu_qwen4_hc_combine_norm_tensor(

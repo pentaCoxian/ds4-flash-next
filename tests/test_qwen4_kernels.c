@@ -2136,6 +2136,30 @@ static void test_idx_prefilter(void) {
 /* Routed gate/up and down types can differ; shared experts stay Q8_0
  * for quantized cases and F32 for the F32 case. */
 /* shared expert weight types of test_moe_types (Q8_0 unless a test sets them) */
+/* CUDA decode and verify rows (T <= 8) read int8 activations unless
+ * DS4_QWEN4_F32_ACT is set: DS4_TEST_QWEN4_Q8=1 runs their tests, the rest
+ * run with FP32 activations. */
+static bool g_act_q8;
+
+static bool q8_act_type(uint32_t wtype) {
+    return wtype == 6u || wtype == 8u || wtype == 11u || wtype == 12u || wtype == 13u || wtype == 14u || wtype == 16u ||
+           wtype == 17u || wtype == 18u || wtype == 20u || wtype == 21u || wtype == 22u || wtype == 23u || wtype == 42u;
+}
+
+static bool q8_act_rows(uint32_t T, uint32_t wtype, uint32_t wtype2) {
+    return g_act_q8 && T <= 8u && q8_act_type(wtype) && q8_act_type(wtype2);
+}
+
+/* x as the GPU rounds it: int8 per 32 values with the scale amax/127 */
+static void q8_round(float *x, uint64_t n) {
+    for (uint64_t b = 0; b + 32u <= n; b += 32u) {
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < 32u; i++) amax = fmaxf(amax, fabsf(x[b + i]));
+        const float s = amax / 127.0f;
+        for (uint32_t i = 0; i < 32u; i++) x[b + i] = s > 0.0f ? nearbyintf(x[b + i] / s) * s : 0.0f;
+    }
+}
+
 static uint32_t g_moe_sh_gate = 8u, g_moe_sh_up = 8u, g_moe_sh_down = 8u;
 
 static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F,
@@ -2176,6 +2200,24 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     double *mid = malloc((uint64_t)T * n_out * F * sizeof(double));
     double *part = malloc((uint64_t)T * n_out * E * sizeof(double));
     double *out = malloc((uint64_t)T * E * sizeof(double));
+    /* int8 decode rows: the reference reads x as the GPU rounds it, and the
+     * down rows the GPU's own mid rounded the same way */
+    const bool act_q8 = q8_act_rows(T, wtype, dtype) && q8_act_type(g_moe_sh_gate) &&
+                        q8_act_type(g_moe_sh_up) && q8_act_type(g_moe_sh_down) && E % 32 == 0 && F % 32 == 0;
+    float *xr = malloc((uint64_t)T * E * sizeof(float)), *mid_gpu = NULL;
+    memcpy(xr, x, (uint64_t)T * E * sizeof(float));
+    if (act_q8) q8_round(xr, (uint64_t)T * E);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    require_ok(ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "sel write");
+    ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)T * n_out * F);
+    const uint32_t shared_type = q8 ? g_moe_sh_gate : 0u;
+    require_ok(ds4_gpu_qwen4_moe_mid2_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T, slots, E, F,
+                                             sg_off, su_off, shared_type, q8 ? g_moe_sh_up : 0u), "moe mid");
+    if (act_q8) {
+        mid_gpu = download(gmid, (uint64_t)T * n_out * F);
+        q8_round(mid_gpu, (uint64_t)T * n_out * F);
+    }
     for (uint32_t t = 0; t < T; t++) {
         for (uint32_t d = 0; d < E; d++) out[t * E + d] = 0.0;
         for (uint32_t s = 0; s < n_out; s++) {
@@ -2188,31 +2230,25 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
             for (uint32_t f = 0; f < F; f++) {
                 double g = 0.0, u = 0.0;
                 for (uint32_t i = 0; i < E; i++) {
-                    g += gw[(uint64_t)f * E + i] * x[t * E + i];
-                    u += uw[(uint64_t)f * E + i] * x[t * E + i];
+                    g += gw[(uint64_t)f * E + i] * xr[t * E + i];
+                    u += uw[(uint64_t)f * E + i] * xr[t * E + i];
                 }
                 mid[((uint64_t)t * n_out + s) * F + f] = silu_d(g) * u;
             }
             const double wgt = shared ? sigmoid_d(sgate[t]) : w[t * slots + s];
+            const uint64_t mrow = ((uint64_t)t * n_out + s) * F;
             for (uint32_t d = 0; d < E; d++) {
                 double acc = 0.0;
-                for (uint32_t f = 0; f < F; f++) acc += dw[(uint64_t)d * stride + f] * mid[((uint64_t)t * n_out + s) * F + f];
+                for (uint32_t f = 0; f < F; f++) acc += dw[(uint64_t)d * stride + f] * (mid_gpu ? (double)mid_gpu[mrow + f] : mid[mrow + f]);
                 part[((uint64_t)t * n_out + s) * E + d] = acc;
                 out[t * E + d] += wgt * acc;
             }
         }
     }
-    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
-    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
-    require_ok(ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "sel write");
     ds4_gpu_tensor *gw = upload(w, (uint64_t)T * slots);
-    ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)T * n_out * F);
     ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * n_out * E);
     ds4_gpu_tensor *gsg = upload(sgate, T);
     ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * E);
-    const uint32_t shared_type = q8 ? g_moe_sh_gate : 0u;
-    require_ok(ds4_gpu_qwen4_moe_mid2_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T, slots, E, F,
-                                             sg_off, su_off, shared_type, q8 ? g_moe_sh_up : 0u), "moe mid");
     require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
                                              sd_off, q8 ? g_moe_sh_down : 0u), "moe down");
     if ((dtype == 10u || dtype == 39u) && getenv("DS4_TEST_QWEN4_MV_EXACT")) {
@@ -2345,7 +2381,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     check_tensor(name, gpart, part, (uint64_t)T * n_out * E, 2e-5);
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: out", dname, E, F, slots, T);
     check_tensor(name, gout, out, (uint64_t)T * E, 2e-5);
-    if (q8 && (E % 64) == 0 && (F % 64) == 0) {
+    if (q8 && !act_q8 && (E % 64) == 0 && (F % 64) == 0) {
         /* prefill path: lists + tiled GEMMs over routed slots only (f16 tiles) */
         ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * T * 4);
         ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc((uint64_t)NE * 4);
@@ -2378,7 +2414,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     }
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gsg); ds4_gpu_tensor_free(gpart);
     ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gw); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
-    free(out); free(part); free(mid); free(w); free(sel); free(sgate); free(x);
+    free(out); free(part); free(mid); free(w); free(sel); free(sgate); free(x); free(xr); free(mid_gpu);
     free(gate_w); free(up_w); free(down_w); free(sg_w); free(su_w); free(sd_w);
 }
 
@@ -4337,11 +4373,14 @@ static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_
     double *sh;
     const uint64_t off = arena_q8_0(a, rows, in_dim, &sh, 0.05f);
     float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
+    float *xr = malloc((uint64_t)T * in_dim * sizeof(float));
+    memcpy(xr, x, (uint64_t)T * in_dim * sizeof(float));
+    if (q8_act_rows(T, wtype, wtype) && in_dim % 32 == 0) q8_round(xr, (uint64_t)T * in_dim);
     double *ref = malloc((uint64_t)T * rows * sizeof(double));
     for (uint32_t t = 0; t < T; t++)
         for (uint32_t r = 0; r < rows; r++) {
             double acc = 0.0;
-            for (uint32_t k = 0; k < in_dim; k++) acc += sh[(uint64_t)r * in_dim + k] * x[(uint64_t)t * in_dim + k];
+            for (uint32_t k = 0; k < in_dim; k++) acc += sh[(uint64_t)r * in_dim + k] * xr[(uint64_t)t * in_dim + k];
             ref[(uint64_t)t * rows + r] = acc;
         }
     ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
@@ -4373,11 +4412,14 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
                  : wtype == 0u ? arena_f32(a, (uint64_t)rows * in_dim, &sh, -0.05f, 0.05f)
                                : arena_tier(a, wtype, rows, in_dim, &sh);
     float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
+    float *xr = malloc((uint64_t)T * in_dim * sizeof(float));
+    memcpy(xr, x, (uint64_t)T * in_dim * sizeof(float));
+    if (q8_act_rows(T, wtype, wtype) && in_dim % 32 == 0) q8_round(xr, (uint64_t)T * in_dim);
     double *ref = malloc((uint64_t)T * rows * sizeof(double));
     for (uint32_t t = 0; t < T; t++)
         for (uint32_t r = 0; r < rows; r++) {
             double acc = 0.0;
-            for (uint32_t k = 0; k < in_dim; k++) acc += sh[(uint64_t)r * in_dim + k] * x[(uint64_t)t * in_dim + k];
+            for (uint32_t k = 0; k < in_dim; k++) acc += sh[(uint64_t)r * in_dim + k] * xr[(uint64_t)t * in_dim + k];
             ref[(uint64_t)t * rows + r] = acc;
         }
     ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
@@ -4386,9 +4428,140 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     char name[96];
     snprintf(name, sizeof(name), "dense mm type %u %ux%u T=%u", wtype, rows, in_dim, T);
     check_tensor(name, gout, ref, (uint64_t)T * rows, 3e-5);
-    free(ref); free(x); free(sh);
+    free(ref); free(x); free(xr); free(sh);
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
+
+#ifndef __APPLE__
+static void require_same_rows(const char *what, const float *got, const float *ref, uint64_t n) {
+    if (memcmp(got, ref, n * sizeof(float)) != 0) {
+        for (uint64_t i = 0; i < n; i++)
+            if (memcmp(got + i, ref + i, sizeof(float)) != 0) {
+                fprintf(stderr, "%s: row value %llu differs: %.9g vs %.9g\n", what, (unsigned long long)i, got[i], ref[i]);
+                break;
+            }
+        exit(1);
+    }
+}
+
+/* A verify row's int8 dense product has the bits of the lone token's, and
+ * the activation registered with ds4_gpu_qwen4_q8_input those of rounding
+ * on the fly. */
+static void test_dense_q8_rows(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
+    double *sh;
+    const uint64_t off = arena_tier(a, wtype, rows, in_dim, &sh);
+    float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
+    ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * rows);
+    require_ok(ds4_gpu_qwen4_dense_mm_tensor(gout, gx, a->base, a->size, off, wtype, T, in_dim, rows), "dense q8 rows");
+    float *all = download(gout, (uint64_t)T * rows);
+    require_ok(ds4_gpu_qwen4_q8_input(gx, T, in_dim), "q8 input");
+    require_ok(ds4_gpu_qwen4_dense_mm_tensor(gout, gx, a->base, a->size, off, wtype, T, in_dim, rows), "dense q8 input");
+    require_ok(ds4_gpu_qwen4_q8_input(NULL, 0, 0), "q8 input drop");
+    float *reg = download(gout, (uint64_t)T * rows);
+    char name[96];
+    snprintf(name, sizeof(name), "dense q8 type %u %ux%u T=%u registered input", wtype, rows, in_dim, T);
+    require_same_rows(name, reg, all, (uint64_t)T * rows);
+    for (uint32_t t = 0; t < T; t++) {
+        ds4_gpu_tensor *g1 = upload(x + (uint64_t)t * in_dim, in_dim);
+        ds4_gpu_tensor *o1 = upload(NULL, rows);
+        require_ok(ds4_gpu_qwen4_dense_mm_tensor(o1, g1, a->base, a->size, off, wtype, 1, in_dim, rows), "dense q8 row");
+        float *one = download(o1, rows);
+        snprintf(name, sizeof(name), "dense q8 type %u %ux%u T=%u row %u", wtype, rows, in_dim, T, t);
+        require_same_rows(name, all + (uint64_t)t * rows, one, rows);
+        free(one);
+        ds4_gpu_tensor_free(o1); ds4_gpu_tensor_free(g1);
+    }
+    printf("  %-48s ok  verify rows = lone rows\n", name);
+    free(reg); free(all); free(x); free(sh);
+    ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
+}
+
+/* The routed experts' int8 rows: tokens that share an expert are computed
+ * by one block, with the bits each token gets alone. */
+static void test_moe_q8_rows(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F, uint32_t T,
+                             uint32_t wtype, uint32_t dtype) {
+    double *sh;
+    const uint64_t gate_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &sh); free(sh);
+    const uint64_t up_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &sh); free(sh);
+    const uint64_t down_off = arena_tier(a, dtype, (uint64_t)NE * E, F, &sh); free(sh);
+    const uint64_t sg_off = arena_tier(a, 23u, F, E, &sh); free(sh);
+    const uint64_t su_off = arena_tier(a, 21u, F, E, &sh); free(sh);
+    const uint64_t sd_off = arena_tier(a, 20u, E, F, &sh); free(sh);
+    const uint32_t n_out = slots + 1u;
+    float *x = rand_vec((uint64_t)T * E, 1.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * 4);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < slots; s++) sel[t * slots + s] = (int32_t)((t * 7u + s * 3u) % NE);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    require_ok(ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "sel write");
+    ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)T * n_out * F);
+    ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * n_out * E);
+    require_ok(ds4_gpu_qwen4_moe_mid2_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T, slots, E, F,
+                                             sg_off, su_off, 23u, 21u), "moe q8 mid");
+    require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
+                                             sd_off, 20u), "moe q8 down");
+    float *mid = download(gmid, (uint64_t)T * n_out * F), *part = download(gpart, (uint64_t)T * n_out * E);
+    char name[96];
+    for (uint32_t t = 0; t < T; t++) {
+        ds4_gpu_tensor *g1 = upload(x + (uint64_t)t * E, E);
+        ds4_gpu_tensor *s1 = ds4_gpu_tensor_alloc((uint64_t)slots * 4);
+        require_ok(ds4_gpu_tensor_write(s1, 0, sel + (uint64_t)t * slots, (uint64_t)slots * 4), "sel row write");
+        ds4_gpu_tensor *m1 = upload(NULL, (uint64_t)n_out * F), *p1 = upload(NULL, (uint64_t)n_out * E);
+        require_ok(ds4_gpu_qwen4_moe_mid2_tensor(m1, g1, s1, a->base, a->size, gate_off, up_off, wtype, NE, 1, slots, E, F,
+                                                 sg_off, su_off, 23u, 21u), "moe q8 mid row");
+        /* the lone down rows read the batch's mid row, so the comparison is of the down kernel alone */
+        ds4_gpu_tensor *mt = upload(mid + (uint64_t)t * n_out * F, (uint64_t)n_out * F);
+        require_ok(ds4_gpu_qwen4_moe_down_tensor(p1, mt, s1, a->base, a->size, down_off, dtype, NE, 1, slots, F, E,
+                                                 sd_off, 20u), "moe q8 down row");
+        float *m = download(m1, (uint64_t)n_out * F), *p = download(p1, (uint64_t)n_out * E);
+        snprintf(name, sizeof(name), "moe q8 %u/%u NE=%u T=%u row %u: mid", wtype, dtype, NE, T, t);
+        require_same_rows(name, mid + (uint64_t)t * n_out * F, m, (uint64_t)n_out * F);
+        snprintf(name, sizeof(name), "moe q8 %u/%u NE=%u T=%u row %u: down", wtype, dtype, NE, T, t);
+        require_same_rows(name, part + (uint64_t)t * n_out * E, p, (uint64_t)n_out * E);
+        free(m); free(p);
+        ds4_gpu_tensor_free(mt); ds4_gpu_tensor_free(p1); ds4_gpu_tensor_free(m1);
+        ds4_gpu_tensor_free(s1); ds4_gpu_tensor_free(g1);
+    }
+    snprintf(name, sizeof(name), "moe q8 %u/%u NE=%u slots=%u T=%u", wtype, dtype, NE, slots, T);
+    printf("  %-48s ok  verify rows = lone rows\n", name);
+    free(part); free(mid); free(sel); free(x);
+    ds4_gpu_tensor_free(gpart); ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
+}
+
+static void test_act_q8(arena_t *a) {
+    static const uint32_t types[14] = { 6u, 8u, 11u, 12u, 13u, 14u, 16u, 17u, 18u, 20u, 21u, 22u, 23u, 42u };
+    printf("int8 activations: dense rows\n");
+    for (int i = 0; i < 14; i++) {
+        /* a warp per row (the codebook types 32 weights per lane), two, four, eight */
+        const uint64_t used = a->used;
+        test_dense_mm(a, 2560, 2560, 3, types[i]);
+        test_dense_mm(a, 2560, 1280, 1, types[i]);
+        test_dense_mm(a, 6144, 640, 8, types[i]);
+        test_dense_mm(a, 2560, 512, 2, types[i]);
+        test_dense_q8_rows(a, 2560, 2560, 3, types[i]);
+        test_dense_q8_rows(a, 6144, 2560, 5, types[i]);
+        test_dense_q8_rows(a, 2560, 320, 2, types[i]);
+        a->used = used;
+    }
+    printf("int8 activations: routed experts\n");
+    static const uint32_t gate_types[7] = { 16u, 17u, 18u, 21u, 22u, 23u, 12u };
+    const uint32_t sg = g_moe_sh_gate, su = g_moe_sh_up, sd = g_moe_sh_down;
+    g_moe_sh_gate = 23u; g_moe_sh_up = 21u; g_moe_sh_down = 20u;
+    for (int i = 0; i < 7; i++) {
+        const uint64_t used = a->used;
+        test_moe_types(a, 16, 10, 2560, 640, 1, gate_types[i], 20u);
+        test_moe_types(a, 16, 10, 2560, 640, 3, gate_types[i], 42u);
+        test_moe_types(a, 8, 6, 256, 256, 8, gate_types[i], 20u);
+        test_moe_q8_rows(a, 16, 10, 2560, 640, 3, gate_types[i], 42u);
+        test_moe_q8_rows(a, 8, 6, 256, 256, 8, gate_types[i], 20u);
+        a->used = used;
+    }
+    g_moe_sh_gate = sg; g_moe_sh_up = su; g_moe_sh_down = sd;
+    printf("all qwen4 int8 activation tests passed\n");
+}
+#endif
 
 #ifndef __APPLE__
 /* Cross the former 64 MiB output-tile limit with odd output strides. Reuse
@@ -4447,6 +4620,13 @@ int main(void) {
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
 #ifndef __APPLE__
+    g_act_q8 = getenv("DS4_TEST_QWEN4_Q8") != NULL;
+    if (g_act_q8) {
+        unsetenv("DS4_QWEN4_F32_ACT");
+        test_act_q8(&arena);
+        return 0;
+    }
+    setenv("DS4_QWEN4_F32_ACT", "1", 1);
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {
         test_dense_mm_large(&arena, 1u);

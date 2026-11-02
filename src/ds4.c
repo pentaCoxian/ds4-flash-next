@@ -59026,6 +59026,17 @@ static bool qwen4_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor
     return qwen4_gemv_rows(out, m, w, x, n_tok, 0u);
 }
 
+/* CUDA rounds an activation that several projections read to int8 once,
+ * until the next call (NULL ends it); the rest round their own. */
+static bool qwen4_q8_input(const ds4_gpu_tensor *x, uint32_t n_tok, uint32_t in_dim) {
+#if !defined(__APPLE__)
+    return ds4_gpu_qwen4_q8_input(x, n_tok, in_dim) != 0;
+#else
+    (void)x; (void)n_tok; (void)in_dim;
+    return true;
+#endif
+}
+
 /* The MTP draft only needs its argmax, and the tokenizer assigns ids in
  * merge order, so the frequent tokens sit at low ids: DS4_QWEN4_MTP_DRAFT_ROWS
  * scores the draft over that leading prefix of the output head only.  The
@@ -59608,8 +59619,10 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
             l->lin_qkv->abs_offset, l->lin_gate->abs_offset, DS4_N_EMBD,
             l->lin_qkv->dim[1], l->lin_gate->dim[1], g->mixed, T) != 0;
     }
-    if (!paired && !(qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) &&
-          qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T))) {
+    if (!paired && !(qwen4_q8_input(g->mixed, T, DS4_N_EMBD) &&
+          qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) &&
+          qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T) &&
+          qwen4_q8_input(NULL, 0, 0))) {
         return false;
     }
     bool ok;
@@ -59797,7 +59810,8 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
 static bool qwen4_graph_attention_proj(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                        uint32_t il, uint32_t T, bool ane) {
     {
-        bool ok = ane ? qwen4_ane_attn_q(g, m, l, il, T) : qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
+        bool ok = ane ? qwen4_ane_attn_q(g, m, l, il, T)
+                      : qwen4_q8_input(g->mixed, T, DS4_N_EMBD) && qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
         if (ok && qwen4_graph_fused(g, T)) {
             ds4_gpu_tensor *outs[4] = { g->kp, g->vp, g->iq, g->ik };
             const uint64_t offs[4] = { l->attn_k->abs_offset, l->attn_v->abs_offset,
@@ -59812,6 +59826,7 @@ static bool qwen4_graph_attention_proj(ds4_qwen4_gpu_graph *g, const ds4_model *
                  qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
                  qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
         }
+        ok = qwen4_q8_input(NULL, 0, 0) && ok;
         if (!ok) return false;
     }
     return true;
