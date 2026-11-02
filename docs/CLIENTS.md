@@ -84,6 +84,26 @@ Merge the provider into `~/.config/opencode/opencode.json`:
 
 Select `ds4/deepseek-v4-flash` as the model.
 
+## DeepSeek Harness (dsh)
+
+DSH reaches OpenAI-compatible servers through its pi-ai adapter. `./dstar dsh`
+prints the route for a Qwen3.8 server started with `dstar serve`. Add it under
+the `providers` of the `llm-pi-ai` entry in
+`~/.dsh/profiles/<profile>/cordis.patch.yml`, next to the routes already
+there. Then pick `Qwen3.8 Flash Next (dstar)` in DSH, or set
+`agent-default-model` to the `dstar` route.
+
+- pi-ai requires an API key unless the route sends its own `Authorization`
+  header. The route sends a placeholder, which ds4-server ignores.
+- `thinkingFormat: openai` sends `reasoning_effort`. The levels are `off`
+  (`none`), `low`, `medium` and `xhigh`.
+- `timeoutMs` is 30 minutes, because a cold 262K prompt prefills for minutes.
+- DSH needs Node 24.9 or later first on its `PATH`. With an older `node`
+  first, `dsh` exits without printing anything.
+
+Open `http://127.0.0.1:8010/dashboard` beside DSH to watch prefill, decode
+and MTP speed while it works.
+
 ## Codex CLI
 
 Use the Responses API. Add a provider to the Codex configuration:

@@ -7,6 +7,7 @@
 #   ./dstar chat       talk to the model in the terminal
 #   ./dstar doctor     check the machine, the files and the memory limit
 #   ./dstar opencode   print the OpenCode provider block for this server
+#   ./dstar dsh        print the DeepSeek Harness (DSH) route for this server
 #   ./dstar link       make "dstar" a command that works from any directory
 #
 # The other models ds4 runs go through the same launcher: ./dstar models
@@ -82,6 +83,7 @@ usage: dstar <command> [options]
                          interactive chat in the terminal
   doctor [--quant NAME]  check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
+  dsh                    print the DeepSeek Harness (dsh) model route
   link                   link this script into $BIN_DIR, so that "dstar"
                          works from any directory (DSTAR_BIN changes the place)
 
@@ -690,6 +692,56 @@ ds4/qwen3.8-flash-next in OpenCode.
 EOF
 }
 
+# DSH routes requests through its pi-ai adapter (llm-pi-ai), so the server
+# joins as a hand-declared OpenAI-compatible route.  pi-ai wants a key unless
+# the route sends its own Authorization header; ds4-server does not check it.
+cmd_dsh() {
+    cat <<EOF
+Add this route under the providers of the llm-pi-ai entry in a profile's
+~/.dsh/profiles/<profile>/cordis.patch.yml (for example the web profile),
+next to any routes already there:
+
+- id: llm-pi-ai
+  config:
+    providers:
+      dstar:
+        displayName: dstar (this Mac)
+        api: openai-completions
+        baseURL: http://127.0.0.1:$PORT/v1
+        headers:
+          Authorization: Bearer local
+        timeoutMs: 1800000
+        compat:
+          thinkingFormat: openai
+          supportsDeveloperRole: false
+          supportsStore: false
+          supportsReasoningEffort: true
+          maxTokensField: max_tokens
+        models:
+          - id: qwen3.8-flash-next
+            name: Qwen3.8 Flash Next (dstar)
+            contextWindow: 262144
+            maxTokens: 32768
+            input: [text, image]
+            reasoningEfforts:
+              off: none
+              low: low
+              medium: medium
+              xhigh: xhigh
+
+To make it the default model, also set:
+
+- id: agent-default-model
+  config:
+    provider: dstar
+    model: qwen3.8-flash-next
+
+Set contextWindow to the context dstar serve started with. DSH needs Node
+24.9 or later first on the PATH it runs with. Live metrics while it works:
+http://127.0.0.1:$PORT/dashboard
+EOF
+}
+
 case ${1:-help} in
     pull) shift; cmd_pull "$@" ;;
     serve) shift; cmd_serve "$@" ;;
@@ -697,6 +749,7 @@ case ${1:-help} in
     models) other_models ;;
     doctor) shift; cmd_doctor "$@" ;;
     opencode) shift; cmd_opencode ;;
+    dsh) shift; cmd_dsh ;;
     link) cmd_link ;;
     help|-h|--help) usage ;;
     *) usage >&2; exit 1 ;;

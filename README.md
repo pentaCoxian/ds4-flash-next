@@ -170,8 +170,9 @@ it prints the line to add. Then:
 ```sh
 dstar doctor     # what your Mac fits: memory, files, the context per quant
 dstar pull       # 69 GB: the model, the MTP block, the vision encoder
-dstar serve      # server on http://127.0.0.1:8010/v1
+dstar serve      # server on http://127.0.0.1:8010/v1, live metrics on /dashboard
 dstar opencode   # provider block for OpenCode
+dstar dsh        # model route for the DeepSeek Harness (dsh)
 ```
 
 Running the installer again updates to the latest release; the models stay
@@ -200,6 +201,7 @@ it prints the `sudo sysctl` line that unlocks the larger one. MTP and vision are
 | `dstar chat` | talk to the model in the terminal |
 | `dstar doctor` | check the machine, the files, the memory limit and which contexts fit |
 | `dstar opencode` | print the provider block for `~/.config/opencode/opencode.json` |
+| `dstar dsh` | print the model route for a DeepSeek Harness profile's `cordis.patch.yml` ([details](docs/CLIENTS.md#deepseek-harness-dsh)) |
 | `dstar link` | link the launcher into `~/.local/bin`, so `dstar` works from any directory |
 | `dstar models` | list the other models ds4 runs |
 | `dstar pull NAME` | download one of them into `./gguf` |
