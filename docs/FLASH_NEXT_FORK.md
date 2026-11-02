@@ -269,8 +269,10 @@ numbers at a short context, on one code prompt for IQ3_S; the M3 Max ones
 are in the README.
 
 **iq3m** is IQ3_XXS with the routed down experts of layers 29, 30, 31 and 35
-taken from Q2_0, copied byte for byte (`dstar pull --quant iq3m` splices it
-with `gguf-tools/mixed/gguf_mix.py`). Those four were chosen by swapping each
+taken from Q2_0, copied byte for byte (`dstar pull --quant iq3m` downloads
+it from
+[pentacoxian-dev/Qwen3.8-Flash-Next-GSQ-RCO-M64-GGUF](https://huggingface.co/pentacoxian-dev/Qwen3.8-Flash-Next-GSQ-RCO-M64-GGUF);
+with `DSTAR_MIX_REPO=` it splices it with `gguf-tools/mixed/gguf_mix.py`). Those four were chosen by swapping each
 of the 18 IQ4_NL down layers on its own and measuring KL against IQ3_S over
 2048-token sequences of C code, English and Japanese (`DS4_QWEN_TENSOR_MIX`
 does the swap at load time): they move it least, while layer 47 alone costs
@@ -279,8 +281,9 @@ Q2_0 0.438) and top-1 agreement at 85.5% (85.7%, 78.9%), in 0.88 GiB less.
 
 **iq3m8** is iq3m with the low-rank down and up projections of its
 hyper-connection mixers, 194 tensors that ISTA keeps in BF16, requantized to
-Q8_0 (`dstar pull --quant iq3m8` runs `gguf-tools/mixed/gguf_requant_q8.py`
-on iq3m and checks the SHA-256 of the result). Those projections are 1.2 of
+Q8_0 (`dstar pull --quant iq3m8` downloads it from the same repository; with
+`DSTAR_HC8_REPO=` it runs `gguf-tools/mixed/gguf_requant_q8.py` on iq3m;
+either way it checks the SHA-256 of the result). Those projections are 1.2 of
 the 4.3 GiB a decode token reads. On the same six sequences the KL is 0.011
 against iq3m and 0.1795 against IQ3_S (iq3m 0.1835), NLL 1.338 against
 1.343; at 6 bits it was still 0.023, at 4 bits plain rounding broke it

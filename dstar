@@ -35,6 +35,11 @@ MTP_REPO=paperniuk/Qwen3.8-Flash-Next-MTP-block
 MTP_FILE=Qwen3.8-Flash-Next-MTP-block.gguf
 VISION_REPO=ggml-org/Qwen3.8-Flash-Next-GGUF
 VISION_FILE=mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
+# iq3m and iq3m8 are downloaded from here. Set DSTAR_MIX_REPO= or
+# DSTAR_HC8_REPO= (empty) to build them from ISTA's files instead.
+M64_REPO=pentacoxian-dev/Qwen3.8-Flash-Next-GSQ-RCO-M64-GGUF
+DSTAR_MIX_REPO=${DSTAR_MIX_REPO-$M64_REPO}
+DSTAR_HC8_REPO=${DSTAR_HC8_REPO-$M64_REPO}
 
 usage() {
     cat <<EOF
@@ -45,9 +50,10 @@ usage: dstar <command> [options]
                          one quant (q2 by default, 67 GB; iq3 76 GB; iq3s
                          83 GB), the 1.5 GB MTP block, the 0.6 GB vision
                          encoder. A second quant reuses the 27 GB n-gram
-                         table of the first. iq3m is built here from the
-                         iq3 and q2 files (or fetched from DSTAR_MIX_REPO),
-                         iq3m8 from iq3m (or fetched from DSTAR_HC8_REPO)
+                         table of the first. iq3m and iq3m8 (46 GB) come
+                         from $M64_REPO;
+                         with DSTAR_MIX_REPO= or DSTAR_HC8_REPO= (empty)
+                         they are built here from the iq3 and q2 files
   pull NAME              download another model into ./gguf (see: dstar models)
   models                 list the other models ds4 can run
   serve [options]        start the server on http://$HOST:$PORT/v1
@@ -186,8 +192,9 @@ other_models() {
     exec sh "./$dl" "$@"
 }
 
-# iq3m: from DSTAR_MIX_REPO when it is set, else spliced here from the iq3 and
-# q2 first shards (pulled first when missing), without requantizing.
+# iq3m: from DSTAR_MIX_REPO (M64_REPO unless set empty), else spliced here
+# from the iq3 and q2 first shards (pulled first when missing), without
+# requantizing.
 build_mix() {
     [ -f "$F_SHARD1" ] && { echo "have  $F_SHARD1"; return; }
     if [ -n "${DSTAR_MIX_REPO:-}" ]; then
@@ -218,9 +225,9 @@ check_mix() {
         die "$F_SHARD1 does not have the expected SHA-256; delete it and pull again"
 }
 
-# iq3m8: from DSTAR_HC8_REPO when it is set, else requantized here from the
-# iq3m first shard (built first when missing): the 194 BF16 low-rank mixer
-# projections become Q8_0, every other tensor is copied.
+# iq3m8: from DSTAR_HC8_REPO (M64_REPO unless set empty), else requantized
+# here from the iq3m first shard (built first when missing): the 194 BF16
+# low-rank mixer projections become Q8_0, every other tensor is copied.
 build_hc8() {
     [ -f "$F_SHARD1" ] && { echo "have  $F_SHARD1"; return; }
     if [ -n "${DSTAR_HC8_REPO:-}" ]; then
