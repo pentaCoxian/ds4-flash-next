@@ -41,6 +41,7 @@ better and is slower. `--quant` picks one, in `dstar pull` and in
 |---|---|---|---|---|
 | 64 GB | Q2_0, the fastest | `q2` (default) | 35 GiB | 262K; up to 524K |
 | 64 GB | IQ3_XXS with four layers from Q2_0, better answers | `iq3m` | 43 GiB | 262K, with the Neural Engine |
+| 64 GB | `iq3m` with 8-bit hyper-connection mixers, the same answers faster | `iq3m8` | 42 GiB | 262K, with the Neural Engine |
 | 64 GB | IQ3_XXS | `iq3` | 44 GiB | 262K, without the Neural Engine |
 | 96 GB or more | IQ3_S, the best file | `iq3s` | 51 GiB | 262K; up to 524K from 128 GB |
 
@@ -49,7 +50,11 @@ KL to the best file, 0.18 against 0.44 for Q2_0, and much better Japanese)
 with the routed down experts of four layers taken from Q2_0, which leaves
 room at 262K for the Neural Engine to prefill a quarter faster. Q2_0
 decodes about 10% faster. `dstar pull --quant iq3m` builds it from the
-`iq3` and `q2` files. ISTA's LiveCodeBench scores are 81.1, 86.3 and 86.9
+`iq3` and `q2` files. `iq3m8` is `iq3m` with the low-rank projections of its
+hyper-connection mixers in Q8_0 instead of BF16: KL 0.011 against `iq3m`
+and no further from IQ3_S, 0.6 GiB less, and about 10% faster decoding on
+an M3 Max (`dstar pull --quant iq3m8` requantizes it from `iq3m` in about
+15 seconds; it needs numpy). ISTA's LiveCodeBench scores are 81.1, 86.3 and 86.9
 for Q2_0, IQ3_XXS and IQ3_S; speeds are in
 [The larger quants](docs/FLASH_NEXT_FORK.md#the-larger-quants).
 `dstar doctor` prints the largest context each quant can hold on your Mac.

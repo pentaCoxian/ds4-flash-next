@@ -259,6 +259,7 @@ Q2_0 when there are several.
 |---|---|---|---|---|---|---|---|
 | `q2` | Q2_0 | 35.0 GiB | 89.07 | 81.14 | 35 tok/s | 39 to 47 | 262K |
 | `iq3m` | IQ3_XXS, four layers from Q2_0 | 42.9 GiB | | | | | 262K |
+| `iq3m8` | `iq3m`, hyper-connection mixers in Q8_0 | 42.4 GiB | | | | | 262K |
 | `iq3` | IQ3_XXS | 43.8 GiB | 92.57 | 86.29 | 29 tok/s | 35 | 262K |
 | `iq3s` | IQ3_S | 51.0 GiB | 93.26 | 86.86 | 26 tok/s | 32 to 34 | 32K |
 
@@ -274,6 +275,19 @@ of the 18 IQ4_NL down layers on its own and measuring KL against IQ3_S over
 does the swap at load time): they move it least, while layer 47 alone costs
 +0.07 on Japanese. Together they keep the mean KL at 0.1835 (IQ3_XXS 0.1834,
 Q2_0 0.438) and top-1 agreement at 85.5% (85.7%, 78.9%), in 0.88 GiB less.
+
+**iq3m8** is iq3m with the low-rank down and up projections of its
+hyper-connection mixers, 194 tensors that ISTA keeps in BF16, requantized to
+Q8_0 (`dstar pull --quant iq3m8` runs `gguf-tools/mixed/gguf_requant_q8.py`
+on iq3m and checks the SHA-256 of the result). Those projections are 1.2 of
+the 4.3 GiB a decode token reads. On the same six sequences the KL is 0.011
+against iq3m and 0.1795 against IQ3_S (iq3m 0.1835), NLL 1.338 against
+1.343; at 6 bits it was still 0.023, at 4 bits plain rounding broke it
+(0.259 against IQ3_S). With the Q8_0 hyper-connection kernels, M3 Max, 8K
+prompts, best of three: 46.1 and 47.8 tok/s plain decode against iq3m's 43.9
+and 42.0 on the same build (agent and Japanese), 53.0 and 52.4 with MTP
+against 50.6 and 50.9, prefill unchanged. Older builds load it but prefill
+at half speed.
 
 These files keep the experts in IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS and
 many dense projections in IQ3_S, quants that stock ds4 does not load. This

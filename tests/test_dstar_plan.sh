@@ -79,6 +79,19 @@ expect "a built iq3m is the default" "IQ3_XXS_M64-00001-of-00002.gguf"
 expect "iq3m at 57344 MiB picks 262K" "--ctx 262144 "
 expect "iq3m at 262K uses the Neural Engine" "DS4_ANE=1"
 expect "iq3m at 262K prefills 2048 rows" "--prefill-chunk 2048 "
+
+# iq3m8, iq3m with 8-bit mixers, wins over iq3m once it is on disk and
+# fits the same plan; the n-gram shard of any quant serves it.
+mkdir -p "$MODELS/IQ3_XXS_M64_HC8"
+: > "$MODELS/IQ3_XXS_M64_HC8/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS_M64_HC8-00001-of-00002.gguf"
+serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344
+expect "a built iq3m8 is the default" "IQ3_XXS_M64_HC8-00001-of-00002.gguf"
+expect "iq3m8 at 57344 MiB picks 262K" "--ctx 262144 "
+expect "iq3m8 at 262K uses the Neural Engine" "DS4_ANE=1"
+expect "iq3m8 reads a shared n-gram shard" "DS4_QWEN_NGRAM_GGUF=.*-00002-of-00002.gguf"
+serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344 DSTAR_QUANT=iq3m
+expect "DSTAR_QUANT=iq3m still picks iq3m" "IQ3_XXS_M64-00001-of-00002.gguf"
+rm -r "$MODELS/IQ3_XXS_M64_HC8"
 rm -r "$MODELS/IQ3_XXS_M64"
 
 if [ "$REAL_GB" -gt 64 ]; then
