@@ -213,6 +213,7 @@ it rather than the chip name:
 | The M5's 1024-thread GDN front and the MXFP4 expert rows of the MTP block (M3 Ultra and M5 settings) | 0.2 ms per MTP cycle | `DS4_QWEN4_GDN_FRONT_THREADS=256`, `DS4_QWEN4_MOE_MV_SPECIALIZE=0` |
 | The IQ2_XXS routed experts in decode through the lane layout of the other codebook types instead of the generic row dots (9 of iq3m's 48 layers) | 22% less GPU time in those layers' expert gate/up, 2.8% of all routed-expert kernels; greedy output unchanged | `DS4_QWEN4_MOE_IQ2XXS_GRID=0` |
 | Single-token decode keeps the shared expert in the routed-expert kernels' extra slot when its gate and up rows differ in type (31 of iq3m's 48 layers), instead of four dense dispatches per layer; MTP verify rows stay dense | plain decode +3 to +7% (8K agent and Japanese prompts), greedy output unchanged | `DS4_QWEN4_SHEXP_SLOT_MIXED=0` |
+| The Q2_0 and IQ4_NL routed down rows of decode and verify batches and the MoE reduce (with its residual combine) in one dispatch: a threadgroup owns 16 output rows across all slots, one SIMD group per slot, and sums them in the reduce's order | down + reduce 13-15% faster at one token (cold experts), 48 dispatches fewer per token; output bit-identical | `DS4_QWEN4_MOE_DOWN_REDUCE=0` |
 
 M4 shares the family and has not been timed. Other settings tuned for the
 M3 Ultra did not carry over to the M3 Max: eight GDN scan groups and 32-key

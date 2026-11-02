@@ -2270,6 +2270,54 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     const char *dname = dtype == 20u ? "iq4_nl" : dtype == 42u ? "q2_0" : dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
     check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
+    if ((dtype == 42u || dtype == 20u) && (F % 64u) == 0 && (E % 16u) == 0 && n_out <= 12u) {
+        /* the fused down + reduce gives the bits of the two dispatches, with
+         * the shared expert in its down slot and from a dense output */
+        setenv("DS4_QWEN4_MOE_DOWN_REDUCE", "1", 1);
+        const uint64_t nr = (uint64_t)T * 4 * E;
+        float *out_a = download(gout, (uint64_t)T * E), *R_a = download(gR, nr);
+        ds4_gpu_tensor *gout2 = upload(NULL, (uint64_t)T * E), *gR2 = upload(R0, nr);
+        require_ok(ds4_gpu_qwen4_moe_down_reduce_tensor(gout2, gmid, gsel, gw, gsg, NULL, gR2, ginj, a->base, a->size,
+                                                        down_off, dtype, NE, T, slots, F, E, sd_off,
+                                                        q8 ? g_moe_sh_down : 0u, 4) == 1, "fused down reduce");
+        float *out_b = download(gout2, (uint64_t)T * E), *R_b = download(gR2, nr);
+        snprintf(name, sizeof(name), "moe %s T=%u fused down+reduce, shared slot: out", dname, T);
+        check_exact_f32(name, out_b, out_a, (uint64_t)T * E);
+        snprintf(name, sizeof(name), "moe %s T=%u fused down+reduce, shared slot: residual", dname, T);
+        check_exact_f32(name, R_b, R_a, nr);
+        /* dense shared output: routed rows only in mid, the shared expert's
+         * down output (here its slot's values) in a buffer of its own */
+        float *mid_all = download(gmid, (uint64_t)T * n_out * F), *part_all = download(gpart, (uint64_t)T * n_out * E);
+        float *mid_r = malloc((uint64_t)T * slots * F * sizeof(float)), *sh = malloc((uint64_t)T * E * sizeof(float));
+        for (uint32_t t = 0; t < T; t++) {
+            memcpy(mid_r + (uint64_t)t * slots * F, mid_all + (uint64_t)t * n_out * F, (uint64_t)slots * F * sizeof(float));
+            memcpy(sh + (uint64_t)t * E, part_all + ((uint64_t)t * n_out + slots) * E, E * sizeof(float));
+        }
+        ds4_gpu_tensor *gmid_r = upload(mid_r, (uint64_t)T * slots * F), *gsh = upload(sh, (uint64_t)T * E);
+        ds4_gpu_tensor *gpart_r = upload(NULL, (uint64_t)T * slots * E);
+        ds4_gpu_tensor *gout3 = upload(NULL, (uint64_t)T * E), *gR3 = upload(R0, nr);
+        ds4_gpu_tensor *gout4 = upload(NULL, (uint64_t)T * E), *gR4 = upload(R0, nr);
+        require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart_r, gmid_r, gsel, a->base, a->size, down_off, dtype, NE, T, slots,
+                                                 F, E, 0, UINT32_MAX), "down without shared slot");
+        require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout3, gpart_r, gw, gsg, gsh, gR3, ginj, T, slots, slots, E, 4),
+                   "reduce with a dense shared output");
+        require_ok(ds4_gpu_qwen4_moe_down_reduce_tensor(gout4, gmid_r, gsel, gw, gsg, gsh, gR4, ginj, a->base, a->size,
+                                                        down_off, dtype, NE, T, slots, F, E, 0, UINT32_MAX, 4) == 1,
+                   "fused down reduce with a dense shared output");
+        float *out_c = download(gout3, (uint64_t)T * E), *R_c = download(gR3, nr);
+        float *out_d = download(gout4, (uint64_t)T * E), *R_d = download(gR4, nr);
+        snprintf(name, sizeof(name), "moe %s T=%u fused down+reduce, dense shared: out", dname, T);
+        check_exact_f32(name, out_d, out_c, (uint64_t)T * E);
+        snprintf(name, sizeof(name), "moe %s T=%u fused down+reduce, dense shared: residual", dname, T);
+        check_exact_f32(name, R_d, R_c, nr);
+        printf("  moe %s E=%u F=%u slots=%u T=%u: fused down+reduce bit-exact\n", dname, E, F, slots, T);
+        free(out_a); free(R_a); free(out_b); free(R_b); free(out_c); free(R_c); free(out_d); free(R_d);
+        free(mid_all); free(part_all); free(mid_r); free(sh);
+        ds4_gpu_tensor_free(gout2); ds4_gpu_tensor_free(gR2); ds4_gpu_tensor_free(gmid_r); ds4_gpu_tensor_free(gsh);
+        ds4_gpu_tensor_free(gpart_r); ds4_gpu_tensor_free(gout3); ds4_gpu_tensor_free(gR3);
+        ds4_gpu_tensor_free(gout4); ds4_gpu_tensor_free(gR4);
+        unsetenv("DS4_QWEN4_MOE_DOWN_REDUCE");
+    }
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: mid (+shared)", tier_name, E, F, slots, T);
     check_tensor(name, gmid, mid, (uint64_t)T * n_out * F, 2e-5);
@@ -3792,13 +3840,25 @@ typedef struct {
     arena_t *a;
     uint64_t gate_off, up_off, down_off;
     uint32_t type, T, i, nsel;
-    int down;   /* 0 mid, 1 down, 2 reduce */
-    ds4_gpu_tensor *x, *mid, *part, **sel, *wts, *sgate, *out, *R, *inj;
+    int down;   /* 0 mid, 1 down, 2 reduce, 3 down + reduce (fused where it applies) */
+    uint64_t sh_off;
+    ds4_gpu_tensor *x, *mid, *part, **sel, *wts, *sgate, *out, *R, *inj, *mid11, *part11;
 } moe_cold_ctx;
 
 static int bench_moe_cold_fn(void *ud) {
     moe_cold_ctx *c = ud;
     ds4_gpu_tensor *sel = c->sel[c->i++ % c->nsel];
+    if (c->down == 3) {
+        /* routed rows of the case's type, an IQ4_NL shared expert in the slot */
+        const int fused = ds4_gpu_qwen4_moe_down_reduce_tensor(c->out, c->mid11, sel, c->wts, c->sgate, NULL, c->R,
+                                                               c->inj, c->a->base, c->a->size, c->down_off, c->type,
+                                                               MOE_COLD_NE, c->T, 10, 640, 2560, c->sh_off, 20u, 4);
+        if (fused >= 0) return fused;
+        return ds4_gpu_qwen4_moe_down_tensor(c->part11, c->mid11, sel, c->a->base, c->a->size, c->down_off, c->type,
+                                             MOE_COLD_NE, c->T, 10, 640, 2560, c->sh_off, 20u) &&
+               ds4_gpu_qwen4_moe_reduce_tensor(c->out, c->part11, c->wts, c->sgate, NULL, c->R, c->inj, c->T, 10, 11,
+                                               2560, 4);
+    }
     if (c->down == 2)
         return ds4_gpu_qwen4_moe_reduce_tensor(c->out, c->part, c->wts, c->sgate, NULL, c->R, c->inj, c->T, 10, 11,
                                                2560, 4);
@@ -3825,6 +3885,7 @@ static void bench_moe_cold(arena_t *a) {
         { "mid iq2_xxs", 16u, 0 }, { "mid iq2_xs", 17u, 0 }, { "mid iq2_s", 22u, 0 },
         { "mid iq3_xxs", 18u, 0 }, { "mid iq3_s", 21u, 0 },
         { "down q2_0", 42u, 1 }, { "down iq4_nl", 20u, 1 }, { "reduce", 0u, 2 },
+        { "dred q2_0", 42u, 3 }, { "dred iq4_nl", 20u, 3 },
     };
     const uint32_t nsel = 64;
     const char *only = getenv("QWEN4_BENCH_ONLY");
@@ -3855,6 +3916,8 @@ static void bench_moe_cold(arena_t *a) {
         c.out = upload(NULL, (uint64_t)T * 2560);
         c.R = upload(rand_vec((uint64_t)T * 4 * 2560, 1.0f), (uint64_t)T * 4 * 2560);
         c.inj = upload(rand_vec((uint64_t)T * 4 * DS4_QWEN4_HC_CHUNKS * 4, 0.1f), (uint64_t)T * 4 * DS4_QWEN4_HC_CHUNKS * 4);
+        c.mid11 = upload(rand_vec((uint64_t)T * 11 * 640, 0.1f), (uint64_t)T * 11 * 640);
+        c.part11 = upload(NULL, (uint64_t)T * 11 * 2560);
         for (uint32_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
             if (only && only[0] && !strstr(cases[k].name, only)) continue;
             const uint64_t used0 = a->used;
@@ -3870,6 +3933,7 @@ static void bench_moe_cold(arena_t *a) {
             if (c.down == 2) {
             } else if (c.down) {
                 c.down_off = arena_random(a, ebytes * MOE_COLD_NE, &rng);
+                if (c.down == 3) c.sh_off = arena_random(a, (uint64_t)2560 * (640 / 32) * 18, &rng);
             } else {
                 c.gate_off = arena_random(a, ebytes * MOE_COLD_NE, &rng);
                 c.up_off = arena_random(a, ebytes * MOE_COLD_NE, &rng);
@@ -3908,6 +3972,7 @@ static void bench_moe_cold(arena_t *a) {
                 }
             }
             const double bytes = c.down == 2 ? (double)T * 4 * (10 + 1 + 4 + 4) * 2560 :
+                                 c.down == 3 ? (double)T * 10 * ebytes + 2560.0 * 20 * 18 :
                                  (double)T * 10 * ebytes * (c.down ? 1 : 2);
             for (uint32_t v = 0; v < n_var; v++) {
                 printf("  cold moe %-12s T=%u %-12s %7.1f us %6.1f GB/s (%.2f MB)\n", cases[k].name, T,

@@ -59829,6 +59829,18 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
                                           shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0;
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
+        /* the down rows and the reduce in one dispatch where it applies */
+        if (ok) {
+            const int fused = ds4_gpu_qwen4_moe_down_reduce_tensor(
+                g->blk, g->mid, g->selected, g->weights, g->sh_gate_logit, shared_dense ? g->sh_out : NULL,
+                g->R, g->inj, m->map, m->size, l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
+                DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP, DS4_N_EMBD,
+                shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
+                shared_dense ? UINT32_MAX : l->ffn_down_shexp->type, DS4_N_HC);
+            if (fused >= 0) return fused > 0;
+        }
+#endif
         ok = ok &&
              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,

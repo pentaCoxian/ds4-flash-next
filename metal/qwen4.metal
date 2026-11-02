@@ -3797,7 +3797,35 @@ kernel void kernel_qwen4_moe_mid_q2_0(
 
 /* down rows are short (640 inputs, ten blocks): eight lanes share a row and
  * the four lane groups of a SIMD group take QWEN4_Q2_0_DOWN_NR rows each,
- * every lane reusing its 16 inputs across its group's rows. */
+ * every lane reusing its 16 inputs across its group's rows.
+ * qwen4_down_group: the NR rows from row0 of one lane group (lane 0..7);
+ * every lane ends with the row sums. */
+static inline void qwen4_down_group(device const block_q2_0 *, device const char *db, uint row_bytes, uint row0,
+                                    uint out_rows, device const float *m, uint in_dim, uint lane,
+                                    thread float *v) {
+    constexpr uint NR = QWEN4_Q2_0_DOWN_NR;
+    device const block_q2_0 *dr[NR];
+    for (uint r = 0; r < NR; r++) {
+        dr[r] = (device const block_q2_0 *)(db + (uint64_t)min(row0 + r, out_rows - 1u) * row_bytes);
+    }
+    const uint nchunks = in_dim / 16u;
+    float acc[NR] = {0.0f};
+    float4 yl[4];
+    for (uint c = lane; c < nchunks; c += 8u) {
+        ds4q_q2_0_load_y(m + c * 16u, yl);
+        const uint ib = c / 4u;
+        const short il = (short)((c % 4u) * 16u);
+        for (uint r = 0; r < NR; r++) acc[r] += ds4q_q2_0_dot(dr[r] + ib, yl, il);
+    }
+    for (uint r = 0; r < NR; r++) {
+        float x = acc[r];
+        x += simd_shuffle_xor(x, 4);
+        x += simd_shuffle_xor(x, 2);
+        x += simd_shuffle_xor(x, 1);
+        v[r] = x;
+    }
+}
+
 kernel void kernel_qwen4_moe_down_q2_0(
         constant ds4_metal_args_qwen4_moe & args,
         device const char    *down_base,
@@ -3836,25 +3864,10 @@ kernel void kernel_qwen4_moe_down_q2_0(
     device const char *db = (shared ? sh_down : down_base) + ebase;
     const uint grp = tiisg / 8u, lane = tiisg % 8u;
     const uint row0 = sg_row0 + grp * NR;
-    device const block_q2_0 *dr[NR];
+    float v[NR];
+    qwen4_down_group((device const block_q2_0 *)db, db, row_bytes, row0, args.out_rows, m, args.in_dim, lane, v);
     for (uint r = 0; r < NR; r++) {
-        dr[r] = (device const block_q2_0 *)(db + (uint64_t)min(row0 + r, args.out_rows - 1u) * row_bytes);
-    }
-    const uint nchunks = args.in_dim / 16u;
-    float acc[NR] = {0.0f};
-    float4 yl[4];
-    for (uint c = lane; c < nchunks; c += 8u) {
-        ds4q_q2_0_load_y(m + c * 16u, yl);
-        const uint ib = c / 4u;
-        const short il = (short)((c % 4u) * 16u);
-        for (uint r = 0; r < NR; r++) acc[r] += ds4q_q2_0_dot(dr[r] + ib, yl, il);
-    }
-    for (uint r = 0; r < NR; r++) {
-        float v = acc[r];
-        v += simd_shuffle_xor(v, 4);
-        v += simd_shuffle_xor(v, 2);
-        v += simd_shuffle_xor(v, 1);
-        if (lane == 0 && row0 + r < args.out_rows) out[row0 + r] = v;
+        if (lane == 0 && row0 + r < args.out_rows) out[row0 + r] = v[r];
     }
 }
 
@@ -3941,6 +3954,34 @@ template [[host_name("kernel_qwen4_moe_mid_iq2_xxs")]] kernel qwen4_moe_mid_grid
  * take QWEN4_IQ4_NL_DOWN_NR rows each. */
 #define QWEN4_IQ4_NL_DOWN_NR 4
 
+static inline void qwen4_down_group(device const block_iq4_nl *, device const char *db, uint row_bytes, uint row0,
+                                    uint out_rows, device const float *m, uint in_dim, uint lane,
+                                    thread float *v) {
+    constexpr uint NR = QWEN4_IQ4_NL_DOWN_NR;
+    device const block_iq4_nl *dr[NR];
+    for (uint r = 0; r < NR; r++) {
+        dr[r] = (device const block_iq4_nl *)(db + (uint64_t)min(row0 + r, out_rows - 1u) * row_bytes);
+    }
+    const uint nchunks = in_dim / 16u;
+    float acc[NR] = {0.0f};
+    for (uint c = lane; c < nchunks; c += 8u) {
+        device const float4 *y = (device const float4 *)(m + c * 16u);
+        const float4 y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+        for (uint r = 0; r < NR; r++) {
+            float4x4 w;
+            ds4q_dequantize_iq4_nl(dr[r] + c / 2u, (short)(c % 2u), w);
+            acc[r] += dot(w[0], y0) + dot(w[1], y1) + dot(w[2], y2) + dot(w[3], y3);
+        }
+    }
+    for (uint r = 0; r < NR; r++) {
+        float x = acc[r];
+        x += simd_shuffle_xor(x, 4);
+        x += simd_shuffle_xor(x, 2);
+        x += simd_shuffle_xor(x, 1);
+        v[r] = x;
+    }
+}
+
 kernel void kernel_qwen4_moe_down_iq4_nl(
         constant ds4_metal_args_qwen4_moe & args,
         device const char    *down_base,
@@ -3978,27 +4019,10 @@ kernel void kernel_qwen4_moe_down_iq4_nl(
     device const char *db = (shared ? sh_down : down_base) + ebase;
     const uint grp = tiisg / 8u, lane = tiisg % 8u;
     const uint row0 = sg_row0 + grp * NR;
-    device const block_iq4_nl *dr[NR];
+    float v[NR];
+    qwen4_down_group((device const block_iq4_nl *)db, db, row_bytes, row0, args.out_rows, m, args.in_dim, lane, v);
     for (uint r = 0; r < NR; r++) {
-        dr[r] = (device const block_iq4_nl *)(db + (uint64_t)min(row0 + r, args.out_rows - 1u) * row_bytes);
-    }
-    const uint nchunks = args.in_dim / 16u;
-    float acc[NR] = {0.0f};
-    for (uint c = lane; c < nchunks; c += 8u) {
-        device const float4 *y = (device const float4 *)(m + c * 16u);
-        const float4 y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
-        for (uint r = 0; r < NR; r++) {
-            float4x4 w;
-            ds4q_dequantize_iq4_nl(dr[r] + c / 2u, (short)(c % 2u), w);
-            acc[r] += dot(w[0], y0) + dot(w[1], y1) + dot(w[2], y2) + dot(w[3], y3);
-        }
-    }
-    for (uint r = 0; r < NR; r++) {
-        float v = acc[r];
-        v += simd_shuffle_xor(v, 4);
-        v += simd_shuffle_xor(v, 2);
-        v += simd_shuffle_xor(v, 1);
-        if (lane == 0 && row0 + r < args.out_rows) out[row0 + r] = v;
+        if (lane == 0 && row0 + r < args.out_rows) out[row0 + r] = v[r];
     }
 }
 
@@ -4292,6 +4316,99 @@ kernel void kernel_qwen4_moe_reduce(
         for (uint s = 0; s < args.n_hc; s++) r[s * args.dim + d] += wgt[s] * acc;
     }
 }
+
+/* Decode down rows and the MoE reduce in one dispatch.  A threadgroup owns
+ * QWEN4_DOWN_REDUCE_ROWS output rows of one token across every slot: its
+ * SIMD groups take the slots in turn and compute their rows as
+ * kernel_qwen4_moe_down_q2_0 and _iq4_nl do (qwen4_down_group, or the
+ * generic row dot for a shared expert of another type) into threadgroup
+ * memory, then the rows are summed in kernel_qwen4_moe_reduce's order with
+ * its residual combine.  One dispatch per layer fewer, the same sums. */
+#define QWEN4_DOWN_REDUCE_ROWS 16
+#define QWEN4_DOWN_REDUCE_SLOTS 12
+
+struct ds4_metal_args_qwen4_moe_down_reduce {
+    ds4_metal_args_qwen4_moe moe;
+    uint32_t shared_src;    /* as ds4_metal_args_qwen4_moe_reduce */
+    uint32_t n_hc;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+template <typename block_t, uint WT>
+kernel void kernel_qwen4_moe_down_reduce(
+        constant ds4_metal_args_qwen4_moe_down_reduce & a,
+        device const char    *down_base,
+        device const int32_t *selected,
+        device const float   *mid,
+        device const char    *sh_down,
+        device const float   *weights,
+        device const float   *shared_gate,
+        device float         *out,
+        device float         *R,
+        device const float   *inj,
+        device const float   *shared,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    constexpr uint NR = 4;
+    static_assert(QWEN4_Q2_0_DOWN_NR == NR && QWEN4_IQ4_NL_DOWN_NR == NR, "16 rows per SIMD group");
+    threadgroup float tile[QWEN4_DOWN_REDUCE_SLOTS][QWEN4_DOWN_REDUCE_ROWS];
+    threadgroup float wgt[8];
+    const uint tok = tgpig.z;
+    if (tok >= a.moe.n_tokens) return;
+    const uint n_slots = a.moe.n_slots, n_out = n_slots + a.moe.has_shared;
+    const uint dim = a.moe.out_rows, row_base = tgpig.x * QWEN4_DOWN_REDUCE_ROWS;
+    if (a.n_hc && tiitg < a.n_hc) {
+        wgt[tiitg] = qwen4_hc_inject_weight(inj + (uint64_t)tok * a.n_hc * QWEN4_HC_CHUNKS * a.n_hc, a.n_hc, tiitg);
+    }
+    const uint nsg = ntg.x / 32u, grp = tiisg / 8u, lane = tiisg % 8u;
+    const bool generic_shared = a.moe.has_shared && a.moe.shared_type != WT;
+    const uint n_typed = generic_shared ? n_slots : n_out;
+    for (uint s = sgitg; s < n_typed; s += nsg) {
+        const bool sh = s == n_slots;
+        const uint64_t ebase = sh ? 0 :
+            (uint64_t)(uint)selected[(uint64_t)tok * n_slots + s] * a.moe.expert_bytes;
+        device const char *db = (sh ? sh_down : down_base) + ebase;
+        float v[NR];
+        qwen4_down_group((device const block_t *)db, db, sh ? a.moe.shared_row_bytes : a.moe.row_bytes,
+                         row_base + grp * NR, dim, mid + ((uint64_t)tok * n_out + s) * a.moe.in_dim,
+                         a.moe.in_dim, lane, v);
+        if (lane == 0) {
+            for (uint r = 0; r < NR; r++) tile[s][grp * NR + r] = v[r];
+        }
+    }
+    if (generic_shared) {
+        device const float *m = mid + ((uint64_t)tok * n_out + n_slots) * a.moe.in_dim;
+        for (uint i = sgitg; i < QWEN4_DOWN_REDUCE_ROWS; i += nsg) {
+            const uint r = min(row_base + i, dim - 1u);
+            const float v = qwen4_row_dot(sh_down + (uint64_t)r * a.moe.shared_row_bytes, m,
+                                          a.moe.shared_type, a.moe.in_dim, tiisg);
+            if (tiisg == 0) tile[n_slots][i] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint d = row_base + tiitg;
+    if (tiitg >= QWEN4_DOWN_REDUCE_ROWS || d >= dim) return;
+    float acc = 0.0f;
+    for (uint s = 0; s < n_slots; s++) acc += weights[(uint64_t)tok * n_slots + s] * tile[s][tiitg];
+    if (a.shared_src == 1) {
+        acc += qwen4_sigmoid(shared_gate[tok]) * tile[n_slots][tiitg];
+    } else if (a.shared_src == 2) {
+        acc += qwen4_sigmoid(shared_gate[tok]) * shared[(uint64_t)tok * dim + d];
+    }
+    out[(uint64_t)tok * dim + d] = acc;
+    if (a.n_hc) {
+        device float *r = R + (uint64_t)tok * dim * a.n_hc;
+        for (uint s = 0; s < a.n_hc; s++) r[s * dim + d] += wgt[s] * acc;
+    }
+}
+
+typedef decltype(kernel_qwen4_moe_down_reduce<block_q2_0, 42u>) qwen4_moe_down_reduce_t;
+template [[host_name("kernel_qwen4_moe_down_reduce_q2_0")]]   kernel qwen4_moe_down_reduce_t kernel_qwen4_moe_down_reduce<block_q2_0, 42u>;
+template [[host_name("kernel_qwen4_moe_down_reduce_iq4_nl")]] kernel qwen4_moe_down_reduce_t kernel_qwen4_moe_down_reduce<block_iq4_nl, 20u>;
 
 /* --- prefill: expert-grouped GEMMs -------------------------------------- */
 
