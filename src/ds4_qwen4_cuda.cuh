@@ -499,13 +499,32 @@ __device__ __forceinline__ float value_mixed(const uint8_t *b, unsigned j) {
     return dl * (float)grid * ((signs >> k) & 1 ? -1.f : 1.f);
 }
 
+/* Eight bytes from a 2-byte aligned address, in two or three aligned words:
+ * the blocks of most formats are only 2-byte aligned (Q6_K's are 210 bytes).
+ * The third word may reach two bytes past the eight, inside the allocation. */
+__device__ __forceinline__ uint64_t bytes8(const uint8_t *p) {
+    const uintptr_t a = (uintptr_t)p;
+    const uint32_t *w = (const uint32_t *)(a & ~(uintptr_t)3);
+    const uint32_t w0 = __ldg(w), w1 = __ldg(w + 1);
+    if (!(a & 3)) return w0 | (uint64_t)w1 << 32;
+    const uint32_t w2 = __ldg(w + 2);
+    return __funnelshift_r(w0, w1, 16) | (uint64_t)__funnelshift_r(w1, w2, 16) << 32;
+}
+
+__device__ __forceinline__ unsigned u16_at(const uint8_t *p) { return __ldg((const uint16_t *)p); }
+
+/* byte k of v */
+__device__ __forceinline__ unsigned byte_k(uint64_t v, unsigned k) { return (unsigned)(v >> (8 * k)) & 255; }
+
+#define QWEN_NIBBLES 0x0f0f0f0f0f0f0f0full
+
 /* Weights 8g..8g+7 of a row, decoded together: the eight share one codebook
  * entry and sign byte (IQ types) or one scale (K-quants, IQ4, Q2_0, Q5_0), so
  * the row dots give each lane whole groups instead of single weights. */
 template<unsigned TYPE>
 __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) {
     if (TYPE == 1 || TYPE == 30) {   /* F16, BF16: one 16-byte load */
-        const uint4 v = *(const uint4 *)(row + 16 * g);
+        const uint4 v = __ldg((const uint4 *)(row + 16 * g));
         const unsigned u[4] = { v.x, v.y, v.z, v.w };
         #pragma unroll
         for (unsigned k = 0; k < 4; k++) {
@@ -521,27 +540,28 @@ __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) 
     if (TYPE == 8) {           /* Q8_0: 4 groups per 32-weight block */
         const uint8_t *b = (const uint8_t *)row + (g / 4) * 34;
         const float d = half_at(b);
+        const uint64_t q = bytes8(b + 2 + 8 * (g % 4));
         #pragma unroll
-        for (unsigned k = 0; k < 8; k++) w[k] = (float)(int8_t)b[2 + 8 * (g % 4) + k] * d;
+        for (unsigned k = 0; k < 8; k++) w[k] = (float)(int8_t)byte_k(q, k) * d;
         return;
     }
     if (TYPE == 42) {          /* Q2_0: 8 groups per 64-weight block */
-        const uint8_t *b = (const uint8_t *)row + (g / 8) * 18, *q = b + 2 + (g % 8) * 2;
+        const uint8_t *b = (const uint8_t *)row + (g / 8) * 18;
+        const unsigned q = u16_at(b + 2 + (g % 8) * 2);
         const float d = half_at(b);
         #pragma unroll
-        for (unsigned k = 0; k < 8; k++) w[k] = (float)((int)((q[k / 4] >> (2 * (k % 4))) & 3) - 1) * d;
+        for (unsigned k = 0; k < 8; k++) w[k] = (float)((int)((q >> (2 * k)) & 3) - 1) * d;
         return;
     }
     if (TYPE == 20 || TYPE == 6) {   /* IQ4_NL, Q5_0: 4 groups per 32-weight block */
         const unsigned q = g % 4;
         const uint8_t *b = (const uint8_t *)row + (g / 4) * (TYPE == 20 ? 18 : 22);
-        const uint8_t *qs = b + (TYPE == 20 ? 2 : 6) + 8 * (q & 1);
+        const uint64_t lo = (bytes8(b + (TYPE == 20 ? 2 : 6) + 8 * (q & 1)) >> (4 * (q >> 1))) & QWEN_NIBBLES;
         const float d = half_at(b);
         #pragma unroll
         for (unsigned k = 0; k < 8; k++) {
-            const unsigned lo = (qs[k] >> (4 * (q >> 1))) & 15;
-            if (TYPE == 20) w[k] = d * (float)iq4nl_values[lo];
-            else w[k] = d * (float)((int)(lo | (((b[2 + q] >> k) & 1) << 4)) - 16);
+            if (TYPE == 20) w[k] = d * (float)iq4nl_values[byte_k(lo, k)];
+            else w[k] = d * (float)((int)(byte_k(lo, k) | (((b[2 + q] >> k) & 1) << 4)) - 16);
         }
         return;
     }
@@ -551,49 +571,46 @@ __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) 
         unsigned sc, mn;
         scale_min_k4(b + 4, ib, sc, mn);
         const float d = half_at(b) * sc, m = half_at(b + 2) * mn;
-        const uint8_t *qs = b + (TYPE == 12 ? 16 : 48) + 32 * (j0 / 64) + j0 % 32;
+        uint64_t q = (bytes8(b + (TYPE == 12 ? 16 : 48) + 32 * (j0 / 64) + j0 % 32) >> (4 * (ib & 1))) & QWEN_NIBBLES;
+        if (TYPE == 13) q |= ((bytes8(b + 16 + j0 % 32) >> ib) & 0x0101010101010101ull) << 4;
         #pragma unroll
-        for (unsigned k = 0; k < 8; k++) {
-            unsigned q = (qs[k] >> (4 * (ib & 1))) & 15;
-            if (TYPE == 13) q |= ((b[16 + j0 % 32 + k] >> ib) & 1) << 4;
-            w[k] = d * q - m;
-        }
+        for (unsigned k = 0; k < 8; k++) w[k] = d * byte_k(q, k) - m;
         return;
     }
     if (TYPE == 14 || TYPE == 11) {  /* Q6_K, Q3_K: a scale per 16 */
         const unsigned h = j0 / 128, gq = j0 % 128 / 32, e = j0 % 32;
         if (TYPE == 14) {
             const float d = half_at(b + 208) * (float)(int8_t)b[192 + 8 * h + e / 16 + 2 * gq];
+            const uint64_t q = ((bytes8(b + 64 * h + e + 32 * (gq & 1)) >> (4 * (gq >> 1))) & QWEN_NIBBLES) |
+                               (((bytes8(b + 128 + 32 * h + e) >> (2 * gq)) & 0x0303030303030303ull) << 4);
             #pragma unroll
-            for (unsigned k = 0; k < 8; k++)
-                w[k] = d * (float)((int)(((b[64 * h + e + k + 32 * (gq & 1)] >> (4 * (gq >> 1))) & 15) |
-                                         (((b[128 + 32 * h + e + k] >> (2 * gq)) & 3) << 4)) - 32);
+            for (unsigned k = 0; k < 8; k++) w[k] = d * (float)((int)byte_k(q, k) - 32);
         } else {
             const unsigned s = 8 * h + 2 * gq + e / 16;
             const int sc = (int)(((b[96 + s % 8] >> (4 * (s / 8))) & 15) |
                                  (((b[104 + s % 4] >> (2 * (s / 4))) & 3) << 4)) - 32;
             const float d = half_at(b + 108) * (float)sc;
+            const uint64_t q = (bytes8(b + 32 + 32 * h + e) >> (2 * gq)) & 0x0303030303030303ull;
+            const uint64_t hm = (bytes8(b + e) >> (4 * h + gq)) & 0x0101010101010101ull;
             #pragma unroll
-            for (unsigned k = 0; k < 8; k++)
-                w[k] = d * (float)((int)((b[32 + 32 * h + e + k] >> (2 * gq)) & 3) -
-                                   ((b[e + k] >> (4 * h + gq)) & 1 ? 0 : 4));
+            for (unsigned k = 0; k < 8; k++) w[k] = d * (float)((int)byte_k(q, k) - (byte_k(hm, k) ? 0 : 4));
         }
         return;
     }
     if (TYPE == 23) {          /* IQ4_XS: low nibbles are weights 0-15 of a 32, high 16-31 */
-        const unsigned hi = (unsigned)b[2] | ((unsigned)b[3] << 8);
+        const unsigned hi = u16_at(b + 2);
         const int ls = (int)(((b[4 + ib / 2] >> (4 * (ib % 2))) & 15) | (((hi >> (2 * ib)) & 3) << 4)) - 32;
         const float d = half_at(b) * (float)ls;
-        const uint8_t *qs = b + 8 + 16 * ib + 8 * (l & 1);
+        const uint64_t q = (bytes8(b + 8 + 16 * ib + 8 * (l & 1)) >> (4 * (l >> 1))) & QWEN_NIBBLES;
         #pragma unroll
-        for (unsigned k = 0; k < 8; k++) w[k] = d * (float)iq4nl_values[(qs[k] >> (4 * (l >> 1))) & 15];
+        for (unsigned k = 0; k < 8; k++) w[k] = d * (float)iq4nl_values[byte_k(q, k)];
         return;
     }
     uint64_t grid;
     unsigned signs;
     float dl;
     if (TYPE == 17) {
-        const unsigned q = (unsigned)b[2 + 2 * gi] | ((unsigned)b[3 + 2 * gi] << 8);
+        const unsigned q = u16_at(b + 2 + 2 * gi);
         dl = half_at(b) * (.5f + ((b[66 + ib] >> (4 * (l / 2))) & 15)) * .25f;
         grid = iq2xs_grid[q & 511];
         signs = ksigns_iq2xs[q >> 9];
@@ -602,16 +619,16 @@ __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) 
         grid = iq2s_grid[b[2 + gi] | (((b[66 + ib] >> (2 * l)) & 3) << 8)];
         signs = b[34 + gi];
     } else if (TYPE == 18) {
-        const uint8_t *a = b + 66 + 4 * ib;
-        const unsigned aux = (unsigned)a[0] | ((unsigned)a[1] << 8) | ((unsigned)a[2] << 16) | ((unsigned)a[3] << 24);
+        const unsigned aux = u16_at(b + 66 + 4 * ib) | (u16_at(b + 68 + 4 * ib) << 16);
+        const unsigned qi = u16_at(b + 2 + 2 * gi);
         dl = half_at(b) * (.5f + (aux >> 28)) * .5f;
-        grid = iq3xxs_grid[b[2 + 2 * gi]] | ((uint64_t)iq3xxs_grid[b[3 + 2 * gi]] << 32);
+        grid = iq3xxs_grid[qi & 255] | ((uint64_t)iq3xxs_grid[qi >> 8] << 32);
         signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
     } else {                   /* IQ3_S */
         dl = half_at(b) * (float)(1 + 2 * ((b[106 + ib / 2] >> (4 * (ib % 2))) & 15));
-        const unsigned qh = b[66 + ib] >> (2 * l);
-        grid = iq3s_grid[b[2 + 2 * gi] | ((qh & 1) << 8)] |
-               ((uint64_t)iq3s_grid[b[3 + 2 * gi] | (((qh >> 1) & 1) << 8)] << 32);
+        const unsigned qh = b[66 + ib] >> (2 * l), qi = u16_at(b + 2 + 2 * gi);
+        grid = iq3s_grid[(qi & 255) | ((qh & 1) << 8)] |
+               ((uint64_t)iq3s_grid[(qi >> 8) | (((qh >> 1) & 1) << 8)] << 32);
         signs = b[74 + gi];
     }
     #pragma unroll
@@ -814,59 +831,58 @@ static uint64_t expert_row_bytes(unsigned type, unsigned K) {
     return row_bytes(type, type == 10 ? ((uint64_t)K + 255) / 256 * 256 : K);
 }
 
+/* A token's routing in one warp: each lane holds 16 of the (at most 512)
+ * expert probabilities in registers, so the softmax and the NS argmax rounds
+ * take shuffles instead of block barriers (26 to 3 us per token on a V100).
+ * Ties go to the lower expert, and the weights are normalized in selection
+ * order, as before.  A second warp takes the shared expert's gate dot
+ * meanwhile, with the row dot's wide loads: its row is cold in memory. */
 __global__ void router(int *selected, float *weights, const float *logits,
         const float *x, const char *gate, float *shared_gate,
         unsigned NE, unsigned NS, unsigned K, unsigned type) {
-    const unsigned t = blockIdx.x, tid = threadIdx.x;
-    __shared__ float p[512], maxima[256], red[32];
-    __shared__ unsigned ids[256];
-    float mx = -FLT_MAX;
-    for (unsigned e = tid; e < NE; e += 256) mx = fmaxf(mx, logits[(uint64_t)t * NE + e]);
-    maxima[tid] = mx;
-    __syncthreads();
-    for (unsigned stride = 128; stride; stride /= 2) {
-        if (tid < stride) maxima[tid] = fmaxf(maxima[tid], maxima[tid + stride]);
-        __syncthreads();
+    const unsigned t = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (warp) {
+        if (K) {
+            const float v = dot_any(gate, x + (uint64_t)t * K, K, type);
+            if (!lane) shared_gate[t] = v;
+        }
+        return;
     }
-    mx = maxima[0];
+    float p[16], mx = -FLT_MAX;
+    #pragma unroll
+    for (unsigned i = 0; i < 16; i++) {
+        const unsigned e = lane + 32 * i;
+        p[i] = e < NE ? logits[(uint64_t)t * NE + e] : -FLT_MAX;
+        mx = fmaxf(mx, p[i]);
+    }
+    for (unsigned d = 16; d; d >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, d));
     float ps = 0;
-    for (unsigned e = tid; e < NE; e += 256) { p[e] = expf(logits[(uint64_t)t * NE + e] - mx); ps += p[e]; }
-    const float total = block_sum(ps, red);
-    for (unsigned e = tid; e < NE; e += 256) p[e] /= total;
-    if (K) {
-        float v = 0;
-        for (unsigned i = tid; i < K; i += 256) v += scalar(gate, i, type) * x[(uint64_t)t * K + i];
-        v = block_sum(v, red);
-        if (!tid) shared_gate[t] = v;
+    #pragma unroll
+    for (unsigned i = 0; i < 16; i++) {
+        p[i] = lane + 32 * i < NE ? expf(p[i] - mx) : 0;
+        ps += p[i];
     }
-    __syncthreads();
+    const float total = sum(ps);
+    #pragma unroll
+    for (unsigned i = 0; i < 16; i++) p[i] = lane + 32 * i < NE ? p[i] / total : -1;
+    float mine = 0, denom = 0;
     for (unsigned s = 0; s < NS; s++) {
         float best = -1;
         unsigned id = UINT_MAX;
-        for (unsigned e = tid; e < NE; e += 256) if (p[e] > best) { best = p[e]; id = e; }
-        maxima[tid] = best; ids[tid] = id;
-        __syncthreads();
-        for (unsigned stride = 128; stride; stride /= 2) {
-            if (tid < stride && (maxima[tid + stride] > maxima[tid] ||
-                (maxima[tid + stride] == maxima[tid] && ids[tid + stride] < ids[tid]))) {
-                maxima[tid] = maxima[tid + stride]; ids[tid] = ids[tid + stride];
-            }
-            __syncthreads();
+        #pragma unroll
+        for (unsigned i = 0; i < 16; i++) if (p[i] > best) { best = p[i]; id = lane + 32 * i; }
+        for (unsigned d = 16; d; d >>= 1) {
+            const float ob = __shfl_xor_sync(0xffffffff, best, d);
+            const unsigned oi = __shfl_xor_sync(0xffffffff, id, d);
+            if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
         }
-        if (!tid) {
-            selected[(uint64_t)t * NS + s] = ids[0];
-            weights[(uint64_t)t * NS + s] = maxima[0];
-            p[ids[0]] = -1;
-        }
-        __syncthreads();
+        #pragma unroll
+        for (unsigned i = 0; i < 16; i++) if (lane + 32 * i == id) p[i] = -1;
+        if (!lane) selected[(uint64_t)t * NS + s] = id;
+        if (lane == s) mine = best;
+        denom += best;
     }
-    if (tid < NS) {
-        float denom = 0;
-        for (unsigned s = 0; s < NS; s++) denom += weights[(uint64_t)t * NS + s];
-        red[tid] = denom;
-    }
-    __syncthreads();
-    if (tid < NS) weights[(uint64_t)t * NS + tid] /= red[tid];
+    if (lane < NS) weights[(uint64_t)t * NS + lane] = mine / denom;
 }
 
 /* The shared expert's gate and up rows may differ in type (31 of iq3m's 48
@@ -1445,36 +1461,44 @@ __global__ void matvec_q8(float *out, const char *w, const float *x,
     }
 }
 
-/* A single token's row shared by W warps (8/W rows per block), each warp a
- * contiguous W-th of the row's groups, summed in a fixed order.  Short wide
- * matrices (the hc down projections' 320 rows of 10240, the router's 512,
- * the GDN gates' 48) otherwise give each SM a few warps that wait on memory
- * one row at a time. */
-template<unsigned TYPE, unsigned W>
+/* Decode and verify rows (T <= ROWS) with each weight row shared by W
+ * warps (8/W rows per block), each warp a contiguous W-th of the row's
+ * groups, summed in a fixed order.  W depends on the matrix alone, so a
+ * token's sums do not depend on how many rows the batch has: an MTP verify
+ * row gets the bits of plain decode.  Short wide matrices (the hc down
+ * projections' 320 rows of 10240, the router's 512, the GDN gates' 48)
+ * otherwise give each SM a few warps that wait on memory one row at a time. */
+template<unsigned TYPE, unsigned W, unsigned ROWS>
 __global__ void matvec_split(float *out, const char *w, const float *x,
-        unsigned K, unsigned M, uint64_t stride) {
-    __shared__ float part[8];
+        unsigned T, unsigned K, unsigned M, uint64_t stride) {
+    __shared__ float part[8][ROWS];
     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x & 31;
     const unsigned row = blockIdx.x * (8 / W) + warp / W, piece = warp % W;
     const unsigned G = K / 8, g0 = G * piece / W, g1 = G * (piece + 1) / W;
-    float acc = 0;
+    float acc[ROWS] = {};
     if (row < M) {
         const char *wr = w + (uint64_t)row * stride;
         for (unsigned g = g0 + lane; g < g1; g += 32) {
             float v[8];
             group8<TYPE>(wr, g, v);
-            const float4 a = *(const float4 *)(x+8*g), b = *(const float4 *)(x+8*g+4);
-            acc += v[0]*a.x; acc += v[1]*a.y; acc += v[2]*a.z; acc += v[3]*a.w;
-            acc += v[4]*b.x; acc += v[5]*b.y; acc += v[6]*b.z; acc += v[7]*b.w;
+            #pragma unroll
+            for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+                const float4 a = *(const float4 *)(x+(uint64_t)t*K+8*g), b = *(const float4 *)(x+(uint64_t)t*K+8*g+4);
+                acc[t] += v[0]*a.x; acc[t] += v[1]*a.y; acc[t] += v[2]*a.z; acc[t] += v[3]*a.w;
+                acc[t] += v[4]*b.x; acc[t] += v[5]*b.y; acc[t] += v[6]*b.z; acc[t] += v[7]*b.w;
+            }
         }
     }
-    acc = sum(acc);
-    if (!lane) part[warp] = acc;
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) {
+        const float v = sum(acc[t]);
+        if (!lane) part[warp][t] = v;
+    }
     __syncthreads();
-    if (row < M && !piece && !lane) {
+    if (row < M && !piece && lane < T) {
         float v = 0;
-        for (unsigned p = 0; p < W; p++) v += part[warp + p];
-        out[row] = v;
+        for (unsigned p = 0; p < W; p++) v += part[warp + p][lane];
+        out[(uint64_t)lane * M + row] = v;
     }
 }
 
@@ -1483,21 +1507,26 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     const dim3 grid((M + 3) / 4, T);
     const uint64_t stride = row_bytes(type, K);
     if (!stride) return 0;
-    if (T == 1 && grouped(type) && !(K % 8) && !((uintptr_t)x & 15) &&
+    if (T <= 8 && grouped(type) && !(K % 8) && !((uintptr_t)x & 15) &&
         ((type != 1 && type != 30) || (!(stride % 16) && !((uintptr_t)w & 15)))) {
         /* about 2560 warps in flight over the V100's 80 SMs */
         const unsigned W = M >= 2560 ? 1 : M >= 1280 ? 2 : M >= 640 ? 4 : 8;
+#define QWEN_SPLIT_ROWS(TYPE, R) \
+        if (W == 1) matvec_split<TYPE,1,R><<<(M+7)/8,256,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride); \
+        else if (W == 2) matvec_split<TYPE,2,R><<<(M+3)/4,256,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride); \
+        else if (W == 4) matvec_split<TYPE,4,R><<<(M+1)/2,256,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride); \
+        else matvec_split<TYPE,8,R><<<M,256,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
 #define QWEN_SPLIT(TYPE) case TYPE: \
-        if (W == 1) matvec_split<TYPE,1><<<(M+7)/8,256,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); \
-        else if (W == 2) matvec_split<TYPE,2><<<(M+3)/4,256,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); \
-        else if (W == 4) matvec_split<TYPE,4><<<(M+1)/2,256,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); \
-        else matvec_split<TYPE,8><<<M,256,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); \
+        if (T == 1) { QWEN_SPLIT_ROWS(TYPE,1); } \
+        else if (T <= 4) { QWEN_SPLIT_ROWS(TYPE,4); } \
+        else { QWEN_SPLIT_ROWS(TYPE,8); } \
         return launched();
         switch (type) {
         QWEN_GROUPED_TYPES(QWEN_SPLIT)
         default: break;
         }
 #undef QWEN_SPLIT
+#undef QWEN_SPLIT_ROWS
     }
     if (type == 8 && T <= 8 && !((uintptr_t)x&15)) {
 #define QWEN_Q8_ROWS(N) matvec_q8<N><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride)
@@ -1836,22 +1865,35 @@ __global__ void vis_add(float *x, const float *add, const float *bias, unsigned 
     x[i] = t;
 }
 
-__global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamma,
-                        const char *wi, unsigned type, unsigned E, unsigned hc,
-                        unsigned ni, float eps) {
+/* Decode-sized hyper-connection norm (T <= 8) and its inject partials, the
+ * inject rows' type a template argument so a thread's loads issue together
+ * (read one by one through scalar(), the cold rows cost 13 us a call).  With
+ * COMBINE it first adds the block output weighted by the previous injection
+ * to R and writes the sum to next: hc_combine and the norm in one pass. */
+template<unsigned TYPE, bool COMBINE>
+__global__ void hc_norm_rows(float *xn, float *inj, float *next, const float *R, const float *blk,
+                             const float *oldinj, const float *gamma, const char *wi, unsigned E,
+                             unsigned hc, unsigned ni, float eps) {
     const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
     const unsigned tid = threadIdx.x, dim = E * hc;
     const uint64_t base = ((uint64_t)tok * hc + stream) * E;
+    const float *b = COMBINE ? blk + (uint64_t)tok * E : NULL;
+    const float w = COMBINE ? injection(oldinj + (uint64_t)tok * hc * hc * 8, hc, stream) : 0;
     __shared__ float red[32];
     float ss = 0;
-    for (unsigned i = tid; i < E; i += blockDim.x) ss += R[base + i] * R[base + i];
+    for (unsigned i = tid; i < E; i += blockDim.x) {
+        const float r = COMBINE ? R[base + i] + w * b[i] : R[base + i];
+        ss += r * r;
+    }
     const float inv = rsqrtf(block_sum(ss, red) / E + eps);
     float acc[4] = {};
     const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per);
     for (unsigned i = chunk * per + tid; i < end; i += blockDim.x) {
-        const float v = R[base + i] * inv * gamma[stream * E + i];
+        const float r = COMBINE ? R[base + i] + w * b[i] : R[base + i];
+        if (COMBINE) next[base + i] = r;
+        const float v = r * inv * gamma[stream * E + i];
         xn[base + i] = v;
-        for (unsigned j = 0; j < ni; j++) acc[j] += scalar(wi, j * dim + stream * E + i, type) * v;
+        for (unsigned j = 0; j < ni; j++) acc[j] += value<TYPE>(wi, j * dim + stream * E + i) * v;
     }
     for (unsigned j = 0; j < ni; j++) {
         const float v = block_sum(acc[j], red);
@@ -1928,6 +1970,43 @@ __global__ void hc_mix(float *out, const float *xn, const float *lo,
     v += __shfl_xor_sync(0xffffffff, v, 8);
     v += __shfl_xor_sync(0xffffffff, v, 16);
     if (!lane) out[(uint64_t)tok * E + d] = v / hc;
+}
+
+/* The gate mix of up to ROWS decode or verify rows: a lane decodes its slice
+ * of the hc up rows once and applies it to every row's activations, where
+ * hc_mix's per-row blocks read the 3.5 MB of up rows again for each row.
+ * Each row's sums keep hc_mix's order, so a verify row gets decode's bits. */
+template<unsigned TYPE, unsigned ROWS>
+__global__ void hc_mix_rows(float *out, const float *xn, const float *lo, const char *up,
+                            unsigned T, unsigned E, unsigned hc, unsigned rank, uint64_t rb) {
+    const unsigned d = blockIdx.x * 4 + threadIdx.x / 32;
+    __shared__ __align__(16) float activated[ROWS][512];
+    for (unsigned i = threadIdx.x; i < T * rank; i += blockDim.x) activated[i / rank][i % rank] = silu(lo[i] / hc);
+    __syncthreads();
+    if (d >= E) return;
+    const unsigned lane = threadIdx.x & 31, stream = lane / 8, l = lane % 8;
+    float a[ROWS] = {};
+    if (stream < hc) {
+        const char *row = up + ((uint64_t)stream * E + d) * rb;
+        for (unsigned r = l * 4; r < rank; r += 32) {
+            const float4 w = value4<TYPE>(row, r, NULL, NULL);
+            #pragma unroll
+            for (unsigned t = 0; t < ROWS; t++) if (t < T) {
+                const float4 v = *(const float4 *)(activated[t] + r);
+                a[t] += w.x*v.x; a[t] += w.y*v.y; a[t] += w.z*v.z; a[t] += w.w*v.w;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned t = 0; t < ROWS; t++) {
+        if (t >= T) break;
+        float at = a[t];
+        for (unsigned off = 1; off <= 4; off *= 2) at += __shfl_xor_sync(0xffffffff, at, off);
+        float v = stream < hc ? sigmoid(at) * xn[((uint64_t)t * hc + stream) * E + d] : 0;
+        v += __shfl_xor_sync(0xffffffff, v, 8);
+        v += __shfl_xor_sync(0xffffffff, v, 16);
+        if (!lane) out[(uint64_t)t * E + d] = v / hc;
+    }
 }
 
 __device__ float injection(const float *inj, unsigned hc, unsigned stream) {
@@ -2218,8 +2297,13 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
 #undef QWEN_HC_NORM
         return launched();
     }
-    hc_norm<<<dim3(hc * 8, T), 128, 0, cuda_decode_stream()>>>((float *)xn->ptr,
-        ni ? (float *)inj->ptr : NULL, (const float *)R->ptr, (const float *)gamma, wi, type, E, hc, ni, eps);
+#define QWEN_HC_ROWS(TYPE) hc_norm_rows<TYPE,false><<<dim3(hc*8,T),128,0,cuda_decode_stream()>>>((float *)xn->ptr, \
+        ni ? (float *)inj->ptr : NULL,NULL,(const float *)R->ptr,NULL,NULL,(const float *)gamma,wi,E,hc,ni,eps)
+    if (type == 0) { QWEN_HC_ROWS(0); }
+    else if (type == 1) { QWEN_HC_ROWS(1); }
+    else if (type == 30) { QWEN_HC_ROWS(30); }
+    else { QWEN_HC_ROWS(8); }
+#undef QWEN_HC_ROWS
     return launched();
 }
 
@@ -2231,13 +2315,24 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
         !tensor(xn, (uint64_t)T * E * hc * 4) || !tensor(lo, (uint64_t)T * rank * 4)) return 0;
     const char *w = weight(map, size, offset, row_bytes(type, rank) * E * hc);
     if (!w || (type != 0 && type != 1 && type != 8 && type != 30)) return 0;
-#define QWEN_HC(TYPE) hc_mix<TYPE><<<dim3((E + 3) / 4, T),128,0,cuda_decode_stream()>>>((float *)out->ptr, \
+    /* hc_mix's alignment rule for the float4 reads of F32 and F16 rows */
+    const uint64_t urb = row_bytes(type, rank);
+    const bool rows = T <= 8 && !(rank % 4) && rank <= 512 &&
+        (type == 0 ? !((uintptr_t)w & 15) && !(urb % 16) : type == 1 ? !((uintptr_t)w & 7) && !(urb % 8) : true);
+#define QWEN_HC_ROWS(TYPE, R) hc_mix_rows<TYPE,R><<<(E + 3) / 4,128,0,cuda_decode_stream()>>>((float *)out->ptr, \
+        (const float *)xn->ptr,(const float *)lo->ptr,w,T,E,hc,rank,row_bytes(TYPE,rank))
+#define QWEN_HC(TYPE) \
+    if (rows && T == 1) { QWEN_HC_ROWS(TYPE,1); } \
+    else if (rows && T <= 4) { QWEN_HC_ROWS(TYPE,4); } \
+    else if (rows) { QWEN_HC_ROWS(TYPE,8); } \
+    else hc_mix<TYPE><<<dim3((E + 3) / 4, T),128,0,cuda_decode_stream()>>>((float *)out->ptr, \
         (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
     if (type == 0) { QWEN_HC(0); }
     else if (type == 1) { QWEN_HC(1); }
     else if (type == 30) { QWEN_HC(30); }
     else { QWEN_HC(8); }
 #undef QWEN_HC
+#undef QWEN_HC_ROWS
     return launched();
 }
 
@@ -2417,7 +2512,7 @@ extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_ten
         !tensor(sel, (uint64_t)T*NS*4) || !tensor(weights, (uint64_t)T*NS*4) || !tensor(logits, (uint64_t)T*NE*4)) return 0;
     const char *wg = K ? weight(map, size, off, row_bytes(type, K)) : NULL;
     if (K && (!wg || !tensor(x, (uint64_t)T*K*4) || !tensor(sg, (uint64_t)T*4))) return 0;
-    router<<<T,256,0,cuda_decode_stream()>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+    router<<<T,64,0,cuda_decode_stream()>>>((int *)sel->ptr, (float *)weights->ptr, (const float *)logits->ptr,
         K ? (const float *)x->ptr : NULL, wg, K ? (float *)sg->ptr : NULL, NE, NS, K, type);
     return launched();
 }
@@ -2546,6 +2641,22 @@ extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const 
     const uint64_t bytes = (uint64_t)T*E*hc*4;
     if (!qwen4_cuda::tensor(next,bytes) || !qwen4_cuda::tensor(R,bytes) || next->ptr == R->ptr ||
         !inj || !oldinj || inj->ptr == oldinj->ptr) return 0;
+    if (T <= 8 && ni && hc <= 8 && ni <= 4 && qwen4_cuda::tensor(xn,bytes) && qwen4_cuda::tensor(blk,(uint64_t)T*E*4) &&
+        qwen4_cuda::tensor(oldinj,(uint64_t)T*hc*hc*8*4) && qwen4_cuda::tensor(inj,(uint64_t)T*hc*8*ni*4) &&
+        (type == 0 || type == 1 || type == 8 || type == 30)) {
+        using namespace qwen4_cuda;
+        const char *gamma = weight(map,size,go,(uint64_t)E*hc*4), *wi = weight(map,size,io,row_bytes(type,(uint64_t)E*hc)*ni);
+        if (!gamma || !wi) return 0;
+#define QWEN_HC_COMBINE(TYPE) hc_norm_rows<TYPE,true><<<dim3(hc*8,T),128,0,cuda_decode_stream()>>>((float *)xn->ptr, \
+        (float *)inj->ptr,(float *)next->ptr,(const float *)R->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr, \
+        (const float *)gamma,wi,E,hc,ni,eps)
+        if (type == 0) { QWEN_HC_COMBINE(0); }
+        else if (type == 1) { QWEN_HC_COMBINE(1); }
+        else if (type == 30) { QWEN_HC_COMBINE(30); }
+        else { QWEN_HC_COMBINE(8); }
+#undef QWEN_HC_COMBINE
+        return launched();
+    }
     if (!cuda_ok(cudaMemcpyAsync(next->ptr,R->ptr,bytes,cudaMemcpyDeviceToDevice,cuda_decode_stream()),"Qwen HC copy")) return 0;
     return ds4_gpu_qwen4_hc_combine_tensor(next,blk,oldinj,T,E,hc) &&
            ds4_gpu_qwen4_hc_norm_tensor(xn,inj,next,map,size,go,io,type,T,E,hc,ni,eps);
