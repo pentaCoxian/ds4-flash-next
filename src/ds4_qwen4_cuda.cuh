@@ -516,6 +516,28 @@ __device__ __forceinline__ unsigned u16_at(const uint8_t *p) { return __ldg((con
 /* byte k of v */
 __device__ __forceinline__ unsigned byte_k(uint64_t v, unsigned k) { return (unsigned)(v >> (8 * k)) & 255; }
 
+/* byte k of v as a float, exactly and at full rate: 0x4B0000qq is the float
+ * 8388608 + q (the integer conversion runs at a quarter of the rate on Volta) */
+__device__ __forceinline__ float byte_f(uint64_t v, unsigned k) {
+    return __int_as_float(__byte_perm((unsigned)(v >> (k >= 4 ? 32 : 0)), 0x4B000000u, 0x7440u | (k & 3))) - 8388608.f;
+}
+
+/* four IQ4_NL levels of four nibbles held one per byte: the low three bits
+ * of each index, packed as __byte_perm's selector nibbles, pick from the
+ * negative and the positive half of the table, the fourth bit between them */
+__device__ __forceinline__ int iq4nl4(unsigned n) {
+    const unsigned n7 = n & 0x07070707u, x = n7 | (n7 >> 4), sel4 = (x & 0xffu) | ((x >> 8) & 0xff00u);
+    const unsigned lo = __byte_perm(0xbfad9881u, 0xf6eaddcfu, sel4);   /* -127 -104 -83 -65 -49 -35 -22 -10 */
+    const unsigned hi = __byte_perm(0x26190d01u, 0x71594535u, sel4);   /* 1 13 25 38 53 69 89 113 */
+    const unsigned sel = ((n >> 3) & 0x01010101u) * 0xffu;
+    return (int)((lo & ~sel) | (hi & sel));
+}
+
+/* signed byte k of v as a float */
+__device__ __forceinline__ float sbyte_f(uint64_t v, unsigned k) {
+    return byte_f(v ^ 0x8080808080808080ull, k) - 128.f;
+}
+
 #define QWEN_NIBBLES 0x0f0f0f0f0f0f0f0full
 
 /* Weights 8g..8g+7 of a row, decoded together: the eight share one codebook
@@ -542,7 +564,7 @@ __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) 
         const float d = half_at(b);
         const uint64_t q = bytes8(b + 2 + 8 * (g % 4));
         #pragma unroll
-        for (unsigned k = 0; k < 8; k++) w[k] = (float)(int8_t)byte_k(q, k) * d;
+        for (unsigned k = 0; k < 8; k++) w[k] = sbyte_f(q, k) * d;
         return;
     }
     if (TYPE == 42) {          /* Q2_0: 8 groups per 64-weight block */
@@ -558,9 +580,10 @@ __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) 
         const uint8_t *b = (const uint8_t *)row + (g / 4) * (TYPE == 20 ? 18 : 22);
         const uint64_t lo = (bytes8(b + (TYPE == 20 ? 2 : 6) + 8 * (q & 1)) >> (4 * (q >> 1))) & QWEN_NIBBLES;
         const float d = half_at(b);
+        const uint64_t lv = TYPE == 20 ? (uint32_t)iq4nl4((uint32_t)lo) | (uint64_t)(uint32_t)iq4nl4((uint32_t)(lo >> 32)) << 32 : 0;
         #pragma unroll
         for (unsigned k = 0; k < 8; k++) {
-            if (TYPE == 20) w[k] = d * (float)iq4nl_values[byte_k(lo, k)];
+            if (TYPE == 20) w[k] = d * sbyte_f(lv, k);
             else w[k] = d * (float)((int)(byte_k(lo, k) | (((b[2 + q] >> k) & 1) << 4)) - 16);
         }
         return;
@@ -574,7 +597,7 @@ __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) 
         uint64_t q = (bytes8(b + (TYPE == 12 ? 16 : 48) + 32 * (j0 / 64) + j0 % 32) >> (4 * (ib & 1))) & QWEN_NIBBLES;
         if (TYPE == 13) q |= ((bytes8(b + 16 + j0 % 32) >> ib) & 0x0101010101010101ull) << 4;
         #pragma unroll
-        for (unsigned k = 0; k < 8; k++) w[k] = d * byte_k(q, k) - m;
+        for (unsigned k = 0; k < 8; k++) w[k] = d * byte_f(q, k) - m;
         return;
     }
     if (TYPE == 14 || TYPE == 11) {  /* Q6_K, Q3_K: a scale per 16 */
@@ -584,7 +607,7 @@ __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) 
             const uint64_t q = ((bytes8(b + 64 * h + e + 32 * (gq & 1)) >> (4 * (gq >> 1))) & QWEN_NIBBLES) |
                                (((bytes8(b + 128 + 32 * h + e) >> (2 * gq)) & 0x0303030303030303ull) << 4);
             #pragma unroll
-            for (unsigned k = 0; k < 8; k++) w[k] = d * (float)((int)byte_k(q, k) - 32);
+            for (unsigned k = 0; k < 8; k++) w[k] = d * (byte_f(q, k) - 32.f);
         } else {
             const unsigned s = 8 * h + 2 * gq + e / 16;
             const int sc = (int)(((b[96 + s % 8] >> (4 * (s / 8))) & 15) |
@@ -602,8 +625,9 @@ __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) 
         const int ls = (int)(((b[4 + ib / 2] >> (4 * (ib % 2))) & 15) | (((hi >> (2 * ib)) & 3) << 4)) - 32;
         const float d = half_at(b) * (float)ls;
         const uint64_t q = (bytes8(b + 8 + 16 * ib + 8 * (l & 1)) >> (4 * (l >> 1))) & QWEN_NIBBLES;
+        const uint64_t lv = (uint32_t)iq4nl4((uint32_t)q) | (uint64_t)(uint32_t)iq4nl4((uint32_t)(q >> 32)) << 32;
         #pragma unroll
-        for (unsigned k = 0; k < 8; k++) w[k] = d * (float)iq4nl_values[byte_k(q, k)];
+        for (unsigned k = 0; k < 8; k++) w[k] = d * sbyte_f(lv, k);
         return;
     }
     uint64_t grid;
@@ -631,9 +655,10 @@ __device__ __forceinline__ void group8(const char *row, unsigned g, float w[8]) 
                ((uint64_t)iq3s_grid[(qi >> 8) | (((qh >> 1) & 1) << 8)] << 32);
         signs = b[74 + gi];
     }
+    /* the sign as a flipped sign bit gives -(dl*g), the product's own bits */
     #pragma unroll
     for (unsigned k = 0; k < 8; k++)
-        w[k] = dl * (float)((grid >> (8 * k)) & 255) * ((signs >> k) & 1 ? -1.f : 1.f);
+        w[k] = __int_as_float(__float_as_int(dl * byte_f(grid, k)) ^ (((signs >> k) & 1) << 31));
 }
 
 /* the types group8 decodes */
@@ -885,6 +910,204 @@ __global__ void router(int *selected, float *weights, const float *logits,
     if (lane < NS) weights[(uint64_t)t * NS + lane] = mine / denom;
 }
 
+/* Decode with int8 activations (decode and verify rows of the routed
+ * experts): the activations are rounded to int8 per 32 values, as llama.cpp
+ * does, and eight weights become two words of int8 for two dp4a, where the
+ * FP32 dot spends a conversion, a scale and an FMA on every weight; the
+ * expert rows are as fast as their memory allows only this way on Volta.
+ * group8i gives the eight weights of group g and their scale d, and for the
+ * K-quants with a minimum m, so that the group's sum is d*q.x - m*sum(x). */
+__device__ __forceinline__ int sign4(unsigned bits) {   /* 0xff where bit k of the nibble is set */
+    return (int)__vcmpne4(((bits & 15) * 0x01010101u) & 0x08040201u, 0);
+}
+__device__ __forceinline__ int signed4(unsigned g, unsigned bits) {
+    const int s = sign4(bits);
+    return (int)__vsub4(g ^ (unsigned)s, (unsigned)s);
+}
+
+__host__ __device__ constexpr bool grouped_i8(unsigned type) {
+    return type == 6 || type == 8 || type == 11 || type == 12 || type == 13 || type == 14 || type == 16 ||
+           type == 17 || type == 18 || type == 20 || type == 21 || type == 22 || type == 23 || type == 42;
+}
+
+template<unsigned TYPE>
+__device__ __forceinline__ void group8i(const char *row, unsigned g, int &w0, int &w1, float &d, float &m,
+        const uint64_t *grid_table = NULL, const uint8_t *sign_table = NULL) {
+    m = 0;
+    if (TYPE == 8) {
+        const uint8_t *b = (const uint8_t *)row + (g / 4) * 34;
+        const uint64_t q = bytes8(b + 2 + 8 * (g % 4));
+        w0 = (int)(uint32_t)q; w1 = (int)(uint32_t)(q >> 32); d = half_at(b);
+        return;
+    }
+    if (TYPE == 42) {
+        const uint8_t *b = (const uint8_t *)row + (g / 8) * 18;
+        const unsigned q = u16_at(b + 2 + (g % 8) * 2);
+        const unsigned lo = (q & 3) | ((q >> 2) & 3) << 8 | ((q >> 4) & 3) << 16 | ((q >> 6) & 3) << 24;
+        const unsigned hi = ((q >> 8) & 3) | ((q >> 10) & 3) << 8 | ((q >> 12) & 3) << 16 | ((q >> 14) & 3) << 24;
+        w0 = (int)__vsub4(lo, 0x01010101u); w1 = (int)__vsub4(hi, 0x01010101u); d = half_at(b);
+        return;
+    }
+    if (TYPE == 20 || TYPE == 6) {
+        const unsigned q = g % 4;
+        const uint8_t *b = (const uint8_t *)row + (g / 4) * (TYPE == 20 ? 18 : 22);
+        const uint64_t lo = (bytes8(b + (TYPE == 20 ? 2 : 6) + 8 * (q & 1)) >> (4 * (q >> 1))) & QWEN_NIBBLES;
+        d = half_at(b);
+        if (TYPE == 20) { w0 = iq4nl4((unsigned)lo); w1 = iq4nl4((unsigned)(lo >> 32)); return; }
+        const unsigned h = b[2 + q];   /* the fifth bits of these eight weights */
+        const unsigned h0 = ((h & 15) * 0x00204081u) & 0x01010101u, h1 = (((h >> 4) & 15) * 0x00204081u) & 0x01010101u;
+        w0 = (int)__vsub4((unsigned)lo | h0 << 4, 0x10101010u);
+        w1 = (int)__vsub4((unsigned)(lo >> 32) | h1 << 4, 0x10101010u);
+        return;
+    }
+    const uint8_t *b = (const uint8_t *)row + (g / 32) * row_bytes(TYPE, 256);
+    const unsigned gi = g % 32, ib = gi / 4, l = gi % 4, j0 = gi * 8;
+    if (TYPE == 12 || TYPE == 13) {
+        unsigned sc, mn;
+        scale_min_k4(b + 4, ib, sc, mn);
+        d = half_at(b) * sc; m = half_at(b + 2) * mn;
+        uint64_t q = (bytes8(b + (TYPE == 12 ? 16 : 48) + 32 * (j0 / 64) + j0 % 32) >> (4 * (ib & 1))) & QWEN_NIBBLES;
+        if (TYPE == 13) q |= ((bytes8(b + 16 + j0 % 32) >> ib) & 0x0101010101010101ull) << 4;
+        w0 = (int)(uint32_t)q; w1 = (int)(uint32_t)(q >> 32);
+        return;
+    }
+    if (TYPE == 14) {
+        const unsigned h = j0 / 128, gq = j0 % 128 / 32, e = j0 % 32;
+        d = half_at(b + 208) * (float)(int8_t)b[192 + 8 * h + e / 16 + 2 * gq];
+        const uint64_t q = ((bytes8(b + 64 * h + e + 32 * (gq & 1)) >> (4 * (gq >> 1))) & QWEN_NIBBLES) |
+                           (((bytes8(b + 128 + 32 * h + e) >> (2 * gq)) & 0x0303030303030303ull) << 4);
+        w0 = (int)__vsub4((uint32_t)q, 0x20202020u); w1 = (int)__vsub4((uint32_t)(q >> 32), 0x20202020u);
+        return;
+    }
+    if (TYPE == 11) {
+        const unsigned h = j0 / 128, gq = j0 % 128 / 32, e = j0 % 32, s = 8 * h + 2 * gq + e / 16;
+        d = half_at(b + 108) * (float)((int)(((b[96 + s % 8] >> (4 * (s / 8))) & 15) |
+                                            (((b[104 + s % 4] >> (2 * (s / 4))) & 3) << 4)) - 32);
+        const uint64_t q = (bytes8(b + 32 + 32 * h + e) >> (2 * gq)) & 0x0303030303030303ull;
+        const uint64_t lo4 = (~(bytes8(b + e) >> (4 * h + gq)) & 0x0101010101010101ull) << 2;   /* 4 where the high bit is clear */
+        w0 = (int)__vsub4((uint32_t)q, (uint32_t)lo4); w1 = (int)__vsub4((uint32_t)(q >> 32), (uint32_t)(lo4 >> 32));
+        return;
+    }
+    if (TYPE == 23) {
+        const unsigned hi = u16_at(b + 2);
+        d = half_at(b) * (float)((int)(((b[4 + ib / 2] >> (4 * (ib % 2))) & 15) | (((hi >> (2 * ib)) & 3) << 4)) - 32);
+        const uint64_t q = (bytes8(b + 8 + 16 * ib + 8 * (l & 1)) >> (4 * (l >> 1))) & QWEN_NIBBLES;
+        w0 = iq4nl4((uint32_t)q); w1 = iq4nl4((uint32_t)(q >> 32));
+        return;
+    }
+    uint64_t grid;
+    unsigned signs;
+    if (TYPE == 16) {          /* IQ2_XXS: 8 grid indices and 4 x 7 sign bits with a scale per 32 */
+        const unsigned ids = u16_at(b + 2 + 8 * ib) | (u16_at(b + 4 + 8 * ib) << 16);
+        const unsigned ss = u16_at(b + 6 + 8 * ib) | (u16_at(b + 8 + 8 * ib) << 16);
+        d = half_at(b) * (.5f + (ss >> 28)) * .25f;
+        /* the constant-memory tables serialize a warp's different entries */
+        grid = grid_table ? grid_table[(ids >> (8 * l)) & 255] : cuda_iq2xxs_grid[(ids >> (8 * l)) & 255];
+        signs = sign_table ? sign_table[(ss >> (7 * l)) & 127] : cuda_ksigns_iq2xs[(ss >> (7 * l)) & 127];
+    } else if (TYPE == 17) {
+        const unsigned q = u16_at(b + 2 + 2 * gi);
+        d = half_at(b) * (.5f + ((b[66 + ib] >> (4 * (l / 2))) & 15)) * .25f;
+        grid = iq2xs_grid[q & 511];
+        signs = ksigns_iq2xs[q >> 9];
+    } else if (TYPE == 22) {
+        d = half_at(b) * (.5f + ((b[74 + ib] >> (4 * (l / 2))) & 15)) * .25f;
+        grid = iq2s_grid[b[2 + gi] | (((b[66 + ib] >> (2 * l)) & 3) << 8)];
+        signs = b[34 + gi];
+    } else if (TYPE == 18) {
+        const unsigned aux = u16_at(b + 66 + 4 * ib) | (u16_at(b + 68 + 4 * ib) << 16);
+        const unsigned qi = u16_at(b + 2 + 2 * gi);
+        d = half_at(b) * (.5f + (aux >> 28)) * .5f;
+        grid = iq3xxs_grid[qi & 255] | ((uint64_t)iq3xxs_grid[qi >> 8] << 32);
+        signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+    } else {                   /* IQ3_S */
+        d = half_at(b) * (float)(1 + 2 * ((b[106 + ib / 2] >> (4 * (ib % 2))) & 15));
+        const unsigned qh = b[66 + ib] >> (2 * l), qi = u16_at(b + 2 + 2 * gi);
+        grid = iq3s_grid[(qi & 255) | ((qh & 1) << 8)] |
+               ((uint64_t)iq3s_grid[(qi >> 8) | (((qh >> 1) & 1) << 8)] << 32);
+        signs = b[74 + gi];
+    }
+    w0 = signed4((uint32_t)grid, signs); w1 = signed4((uint32_t)(grid >> 32), signs >> 4);
+}
+
+/* Round rows of n activations (n a multiple of 32) to int8 with a scale per
+ * 32: one warp per 32 values. */
+__global__ void quantize_q8(int8_t *q, float *d, const float *x, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = x[i];
+    float amax = fabsf(v);
+    for (unsigned o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    const float s = amax / 127.f;
+    q[i] = (int8_t)__float2int_rn(s > 0 ? v / s : 0.f);
+    if (!(threadIdx.x & 31)) d[i / 32] = s;
+}
+
+/* a warp's dot of an n-weight row with int8 activations xq (scales xd) */
+template<unsigned TYPE>
+__device__ __forceinline__ float doti(const char *row, const int8_t *xq, const float *xd, unsigned n,
+        const uint64_t *grid_table = NULL, const uint8_t *sign_table = NULL) {
+    float acc = 0;
+    for (unsigned g = threadIdx.x & 31; g < n / 8; g += 32) {
+        int w0, w1; float d, m;
+        group8i<TYPE>(row, g, w0, w1, d, m, grid_table, sign_table);
+        const int2 x = *(const int2 *)(xq + 8 * g);
+        const int s = __dp4a(w0, x.x, __dp4a(w1, x.y, 0));
+        if (TYPE == 12 || TYPE == 13) {
+            const int sx = __dp4a(0x01010101, x.x, __dp4a(0x01010101, x.y, 0));
+            acc += xd[g / 4] * (d * (float)s - m * (float)sx);
+        } else {
+            acc += xd[g / 4] * d * (float)s;
+        }
+    }
+    return sum(acc);
+}
+
+__device__ __forceinline__ float doti_any(const char *row, const int8_t *xq, const float *xd, unsigned n, unsigned type) {
+#define QWEN_DOTI(TYPE) case TYPE: return doti<TYPE>(row, xq, xd, n);
+    switch (type) {
+    QWEN_DOTI(6) QWEN_DOTI(8) QWEN_DOTI(11) QWEN_DOTI(12) QWEN_DOTI(13) QWEN_DOTI(14) QWEN_DOTI(16)
+    QWEN_DOTI(17) QWEN_DOTI(18) QWEN_DOTI(20) QWEN_DOTI(21) QWEN_DOTI(22) QWEN_DOTI(23) QWEN_DOTI(42)
+    default: return 0;
+    }
+#undef QWEN_DOTI
+}
+
+/* moe_mv with int8 activations: xq/xd hold the rows the FP32 kernel reads
+ * from x, rounded per 32. */
+template<unsigned TYPE, bool DOWN>
+__global__ void moe_mv_q8(float *out, const int8_t *xq, const float *xd, const int *selected,
+        const char *w0, const char *w1, const char *sh0, const char *sh1,
+        unsigned shared_type, unsigned shared_up_type, unsigned NE, unsigned NS, unsigned K, unsigned M,
+        uint64_t rb, uint64_t srb, uint64_t surb) {
+    const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, slot = blockIdx.y, t = blockIdx.z;
+    __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
+    __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
+    if (TYPE == 16) {
+        for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) grid_table[i] = cuda_iq2xxs_grid[i];
+        for (unsigned i = threadIdx.x; i < 128; i += blockDim.x) sign_table[i] = cuda_ksigns_iq2xs[i];
+        __syncthreads();
+    }
+    if (row >= M) return;
+    const bool shared = slot == NS;
+    const unsigned stride = NS + (shared_type != UINT_MAX);
+    const uint64_t pair = (uint64_t)t * stride + slot, xrow = DOWN ? pair : t;
+    const int8_t *xt = xq + xrow * K;
+    const float *dt = xd + xrow * (K / 32);
+    float a = 0, b = 0;
+    if (shared) {
+        a = doti_any(sh0 + row * srb, xt, dt, K, shared_type);
+        if (!DOWN) b = doti_any(sh1 + row * surb, xt, dt, K, shared_up_type);
+    } else {
+        const int e = selected[(uint64_t)t * NS + slot];
+        if (e >= 0 && (unsigned)e < NE) {
+            const uint64_t off = ((uint64_t)e * M + row) * rb;
+            a = doti<TYPE>(w0 + off, xt, dt, K, grid_table, sign_table);
+            if (!DOWN) b = doti<TYPE>(w1 + off, xt, dt, K, grid_table, sign_table);
+        }
+    }
+    if (!(threadIdx.x & 31)) out[pair * M + row] = DOWN ? a : silu(a) * b;
+}
+
 /* The shared expert's gate and up rows may differ in type (31 of iq3m's 48
  * layers); its slot reads them as shared_type and shared_up_type. */
 template<unsigned TYPE, bool DOWN>
@@ -938,6 +1161,30 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         unsigned type, unsigned st, unsigned sut, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K), surb = row_bytes(sut, K);
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
+    /* DS4_QWEN4_EXPERTS_Q8=1: int8 activations where every weight type of
+     * the layer has an int8 decoder.  On two V100s with iq3m8 it saves 0.5 ms
+     * a token for a KL of 0.012 against the FP32 dot (top-1 95.7%): not yet
+     * the release path, the rows still read their blocks a few bytes at a
+     * time; staged rows should make it pay. */
+    static const bool q8 = getenv("DS4_QWEN4_EXPERTS_Q8") != NULL;
+    if (q8 && grouped_i8(type) && (st == UINT_MAX || (grouped_i8(st) && grouped_i8(sut))) && !(K % 32)) {
+        const uint64_t n = (down ? (uint64_t)T * (NS + (st != UINT_MAX)) : T) * K, qbytes = (n + 15) / 16 * 16;
+        int8_t *xq = (int8_t *)tmp_alloc(qbytes + n / 32 * 4, "Qwen int8 activations");
+        if (!xq) return 0;
+        float *xd = (float *)(xq + qbytes);
+        quantize_q8<<<(unsigned)((n + 255) / 256),256,0,cuda_decode_stream()>>>(xq, xd, x, n);
+        if (!launched()) return 0;
+#define QWEN_MOE_Q8(TYPE) case TYPE: \
+        if (down) moe_mv_q8<TYPE, true><<<grid,128,0,cuda_decode_stream()>>>(out,xq,xd,sel,w0,w1,s0,s1,st,sut,NE,NS,K,M,rb,srb,surb); \
+        else moe_mv_q8<TYPE, false><<<grid,128,0,cuda_decode_stream()>>>(out,xq,xd,sel,w0,w1,s0,s1,st,sut,NE,NS,K,M,rb,srb,surb); break;
+        switch (type) {
+        QWEN_MOE_Q8(6) QWEN_MOE_Q8(8) QWEN_MOE_Q8(11) QWEN_MOE_Q8(12) QWEN_MOE_Q8(13) QWEN_MOE_Q8(14) QWEN_MOE_Q8(16)
+        QWEN_MOE_Q8(17) QWEN_MOE_Q8(18) QWEN_MOE_Q8(20) QWEN_MOE_Q8(21) QWEN_MOE_Q8(22) QWEN_MOE_Q8(23) QWEN_MOE_Q8(42)
+        default: return 0;
+        }
+#undef QWEN_MOE_Q8
+        return launched();
+    }
 #define QWEN_MOE(TYPE) case TYPE: \
     if (down) moe_mv<TYPE, true><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,sut,NE,NS,K,M,rb,srb,surb); \
     else moe_mv<TYPE, false><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,sut,NE,NS,K,M,rb,srb,surb); break
@@ -1509,8 +1756,11 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     if (!stride) return 0;
     if (T <= 8 && grouped(type) && !(K % 8) && !((uintptr_t)x & 15) &&
         ((type != 1 && type != 30) || (!(stride % 16) && !((uintptr_t)w & 15)))) {
-        /* about 2560 warps in flight over the V100's 80 SMs */
-        const unsigned W = M >= 2560 ? 1 : M >= 1280 ? 2 : M >= 640 ? 4 : 8;
+        /* about 2560 warps in flight over the V100's 80 SMs, and at least
+         * four per row of 4096 weights or more: their warps otherwise wait on
+         * memory through 16 and more groups one after the other */
+        unsigned W = M >= 2560 ? 1 : M >= 1280 ? 2 : M >= 640 ? 4 : 8;
+        if (K >= 4096 && W < 4) W = 4;
 #define QWEN_SPLIT_ROWS(TYPE, R) \
         if (W == 1) matvec_split<TYPE,1,R><<<(M+7)/8,256,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride); \
         else if (W == 2) matvec_split<TYPE,2,R><<<(M+3)/4,256,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride); \
