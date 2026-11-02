@@ -176,6 +176,13 @@ chip name, so an M3, M4 or M5 runs them too:
   the n-gram read behind the first layer, the sampler, images in agent
   sessions, contexts beyond 262K with YaRN, `--power` for Qwen3.8.
 - The Q6_K decoder and the read ahead in the expert prompt tile.
+- 8-bit K/V cache rows for Qwen3.8's attention layers, an f16 scale per 32
+  values: 3.05 GiB less at 262K, enough for every 64 GB plan to prefill in
+  2048-row chunks with the Neural Engine. Against an f16 cache the model
+  moves by KL 0.006 (top-1 agreement 97.3%), a third of what iq3m's layer
+  swap moves it, and its KL against IQ3_S stays 0.18. Rounding only K or
+  only V moves it almost as much as both. `DS4_QWEN4_KV_F16=1` keeps f16,
+  the CUDA layout.
 - For DeepSeek V4 with `--ssd-streaming`: the early commit of the routed
   experts and the single simdgroup rows of the narrow Q8_0 projection.
 
@@ -272,11 +279,11 @@ fork dequantizes them on the CPU bit for bit as llama.cpp does and has Metal
 kernels for them, checked against that reference by `make test-quant-types`
 and `make test-qwen4-kernels`.
 
-**IQ3_XXS on 64 GB.** With the indexer key ring and the vision encoder
-loaded only for images, `dstar serve` gives it the full 262K, planned at
-55.6 GiB with 1024-row prefill chunks (55.0 measured with 2048, other apps
-included). That leaves no room for the Neural Engine, which is what iq3m is
-for. Close the browser first; longer contexts do not fit.
+**IQ3_XXS on 64 GB.** With the indexer key ring, the vision encoder loaded
+only for images and the 8-bit K/V cache, `dstar serve` gives it the full
+262K, planned at 54.8 GiB with 2048-row prefill chunks and the Neural
+Engine; iq3m plans 53.9 GiB. Close the browser first; longer contexts do not
+fit.
 
 **IQ3_S is for 96 GB and more.** With MTP and vision it plans about 56 GiB
 at 32K and 60 GiB at 131K. On a 64 GB Mac it therefore runs with a 32K
@@ -368,6 +375,7 @@ send `"temperature": 0` or a `seed`.
 | `DS4_METAL_MIXED_MV_NT_MAX=N` | cap the multi-token matvecs of the mixed types at N tokens (`8` restores the M1 path on M3) |
 | `DS4_QWEN4_ROUTER_SG=0/1` | the one-simdgroup router off or on, on any chip |
 | `DS4_QWEN4_HC_NORM_DOWN=0/1` | the fused hc norm + down (and FFN-side combine) off or on, on any chip |
+| `DS4_QWEN4_KV_F16=1` | f16 K/V cache rows instead of 8-bit (checkpoints convert between the two on load) |
 | `make qwen4-mv-bench` | `speed-bench/qwen4_mv_bench`: GB/s of a file's dense matvecs per weight type, for 1 to 3 tokens |
 
 Compare variants in alternating runs: on a Mac in use, tokens per second of

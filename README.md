@@ -56,15 +56,16 @@ for Q2_0, IQ3_XXS and IQ3_S; speeds are in
 
 **On 64 GB the GPU memory limit has to be raised for the IQ3 files and the
 longest contexts.** macOS lets the GPU use about three quarters of the
-memory by default, 48 GiB of 64: enough for Q2_0 at 262K. When a context
-does not fit, `dstar serve` takes a smaller one and prints the line to run:
+memory by default, 48 GiB of 64: enough for Q2_0 at 262K, and at 524K in
+1024-row chunks. When a context does not fit, `dstar serve` takes a smaller
+one and prints the line to run:
 
 ```sh
-sudo sysctl iogpu.wired_limit_mb=57344    # iq3m and iq3 at 262K; 61440 for q2 at 524K
+sudo sysctl iogpu.wired_limit_mb=57344    # iq3m and iq3 at 262K
 ```
 
 The setting is lost at every reboot. With iq3m at 262K the server plans
-55.6 GiB of the 64 (54.4 measured, other apps included), so close the
+53.9 GiB of the 64 (the K/V cache is 8-bit), so close the
 browser first.
 
 Below 64 GB nothing has been tried. Qwen3.8 has no SSD streaming in ds4, so
@@ -100,6 +101,10 @@ with its temperature:
 | `iq3m`, 1024-row chunks with the Neural Engine | 585 to 607 tok/s | 47 to 52 tok/s |
 | `iq3`, 1024-row chunks | 450 to 505 tok/s | 47 to 53 tok/s |
 | `q2`, 2048-row chunks with the Neural Engine | about 610 tok/s at 32K | about 59 tok/s at 32K |
+
+With the 8-bit K/V cache, `dstar` now gives iq3 and iq3m 2048-row chunks
+with the Neural Engine at 262K too; on this M3 Max that prefills about 2%
+faster than iq3m's 1024-row chunks above.
 
 The M3 has its own settings for a few kernels, see
 [Which Macs gain](docs/FLASH_NEXT_FORK.md#which-macs-gain). Other chips run

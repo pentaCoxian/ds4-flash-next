@@ -3416,6 +3416,8 @@ int ds4_gpu_qwen4_gdn_prep_tensor(
 /* snap_state/snap2_state (optional) receive the state right after tokens
  * snap_tok/snap2_tok; two points serve the 3-row MTP verifier */
 void ds4_gpu_qwen4_set_verify_rows_exact(bool on);
+/* 8-bit K/V cache rows (Metal): set before the graph allocates its caches */
+void ds4_gpu_qwen4_set_kv_q8(bool on);
 int ds4_gpu_qwen4_gdn_scan_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,

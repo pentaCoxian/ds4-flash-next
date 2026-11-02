@@ -44,10 +44,12 @@ reject() {
 }
 
 # A 64 GB Mac at its default limit (three quarters of the RAM) holds q2 at
-# 262K in 1024-row chunks; iq3 needs the limit raised.
+# 262K in 2048-row chunks with the Neural Engine (8-bit K/V rows); iq3 needs
+# the limit raised.
 serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=0
 expect "64 GB default limit holds q2 at 262K" "--ctx 262144 "
-expect "64 GB default limit prefills q2 in 1024 rows" "--prefill-chunk 1024 "
+expect "64 GB default limit prefills q2 in 2048 rows" "--prefill-chunk 2048 "
+expect "64 GB default limit runs q2 with the Neural Engine" "DS4_ANE=1"
 serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=0 DSTAR_QUANT=iq3
 expect "64 GB default limit says how to fit iq3" "sudo sysctl iogpu.wired_limit_mb="
 
@@ -60,11 +62,11 @@ expect "q2 at 262K uses the Neural Engine" "DS4_ANE=1"
 serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344 -- --no-ane
 reject "--no-ane keeps the Neural Engine off" "DS4_ANE=1"
 
-# iq3 holds 262K too, in 1024-row chunks without the Neural Engine.
+# iq3 holds 262K too, now in 2048-row chunks with the Neural Engine.
 serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344 DSTAR_QUANT=iq3
 expect "iq3 at 57344 MiB picks 262K" "--ctx 262144 "
-expect "iq3 at 262K prefills 1024 rows" "--prefill-chunk 1024 "
-reject "iq3 at 262K leaves the Neural Engine off" "DS4_ANE=1"
+expect "iq3 at 262K prefills 2048 rows" "--prefill-chunk 2048 "
+expect "iq3 at 262K uses the Neural Engine" "DS4_ANE=1"
 serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344 DSTAR_QUANT=iq3 -- --ctx 131k
 expect "iq3 at 131K uses the Neural Engine" "DS4_ANE=1"
 
@@ -76,6 +78,7 @@ serve DSTAR_RAM_GB=64 DSTAR_WIRED_LIMIT_MB=57344
 expect "a built iq3m is the default" "IQ3_XXS_M64-00001-of-00002.gguf"
 expect "iq3m at 57344 MiB picks 262K" "--ctx 262144 "
 expect "iq3m at 262K uses the Neural Engine" "DS4_ANE=1"
+expect "iq3m at 262K prefills 2048 rows" "--prefill-chunk 2048 "
 rm -r "$MODELS/IQ3_XXS_M64"
 
 if [ "$REAL_GB" -gt 64 ]; then

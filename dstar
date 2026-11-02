@@ -261,8 +261,8 @@ parse_ctx() {
 # GPU memory plan, in MiB, as ds4 prints it ("memory: ... planned"): the
 # main weights (MODEL_GIB), the 1.40 GiB MTP block, the prefill buffers
 # (3.06 GiB for 2048-row chunks, 1.69 for 1024), 0.9 GiB for the Neural
-# Engine's surfaces and state copy when it runs, 26.9 KB of KV cache per
-# context token, and 2 GiB of headroom under the wired limit.  The vision
+# Engine's surfaces and state copy when it runs, 14.6 KB of KV cache per
+# context token (8-bit K/V rows), and 2 GiB of headroom under the wired limit.  The vision
 # encoder maps only while it encodes and takes experts out of residency
 # when it needs the room, so it is not reserved.  Measured on an M3 Max
 # under the 64 GB emulation: the GPU's peak in-use memory stays below the
@@ -281,7 +281,7 @@ ANE_GIB=0
 buffers_gib() { [ "$CHUNK" = 2048 ] && echo 3.06 || echo 1.69; }
 need_mib() {
     awk -v c="$1" -v w="$MODEL_GIB" -v m="$MTP_GIB" -v f="$(buffers_gib)" -v a="$ANE_GIB" \
-        'BEGIN { printf "%d", (w + m + f + a + c * 2.5635e-5 + 2) * 1024 }'
+        'BEGIN { printf "%d", (w + m + f + a + c * 1.3962e-5 + 2) * 1024 }'
 }
 
 wired_limit() { echo "${DSTAR_WIRED_LIMIT_MB:-$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)}"; }

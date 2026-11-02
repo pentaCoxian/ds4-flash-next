@@ -5621,6 +5621,17 @@ void ds4_gpu_qwen4_set_verify_rows_exact(bool on) {
     g_qwen4_verify_rows_exact = on;
 }
 
+/* K/V cache rows of Qwen3.8 attention: f16, or 8-bit with an f16 scale per
+ * 32 values (qwen4_kv_load in metal/qwen4.metal); the graph sets it before
+ * allocating its caches. */
+static bool g_qwen4_kv_q8;
+void ds4_gpu_qwen4_set_kv_q8(bool on) {
+    g_qwen4_kv_q8 = on;
+}
+static uint64_t qwen4_kv_row_bytes(uint64_t kv_dim) {
+    return g_qwen4_kv_q8 ? kv_dim + kv_dim / 16u : kv_dim * 2u;
+}
+
 static int16_t ds4_gpu_mv_ext_nsg(void) {
     return (int16_t)ds4_gpu_env_u64("DS4_METAL_MV_EXT_NSG", 2u, 1u, 8u);
 }
@@ -48663,6 +48674,14 @@ enum {
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE_NT2,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_STORE_NT3,
+    QWEN4_K_ATTN_PREP_Q8,
+    QWEN4_K_ATTN_PREP_ROWS_Q8,
+    QWEN4_K_ATTN_DECODE_NPT8_Q8,
+    QWEN4_K_ATTN_DECODE_NPT4_Q8,
+    QWEN4_K_ATTN_DECODE_NPT1_Q8,
+    QWEN4_K_ATTN_DECODE_ROWS_NPT8_Q8,
+    QWEN4_K_ATTN_DECODE_ROWS_NPT4_Q8,
+    QWEN4_K_ATTN_MM_Q8,
     QWEN4_K_COUNT,
 };
 
@@ -48806,6 +48825,14 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_gate_mix_bf16_rows_store",
     "kernel_qwen4_hc_gate_mix_bf16_rows_store_nt2",
     "kernel_qwen4_hc_gate_mix_bf16_rows_store_nt3",
+    "kernel_qwen4_attn_prep_q8",
+    "kernel_qwen4_attn_prep_rows_q8",
+    "kernel_qwen4_attn_decode_npt8_q8",
+    "kernel_qwen4_attn_decode_npt4_q8",
+    "kernel_qwen4_attn_decode_npt1_q8",
+    "kernel_qwen4_attn_decode_rows_npt8_q8",
+    "kernel_qwen4_attn_decode_rows_npt4_q8",
+    "kernel_qwen4_attn_mm_q8",
 };
 
 typedef struct {
@@ -49729,7 +49756,7 @@ int ds4_gpu_qwen4_attn_prep_tensor(
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
     const uint64_t iq_bytes = (uint64_t)n_tokens * n_idx_head * idx_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
+    const uint64_t cache_bytes = (uint64_t)cache_cap * qwen4_kv_row_bytes((uint64_t)n_head_kv * head_dim);
     qwen4_bind b[15];
     if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
         idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > 64 || (n_rot % 2) != 0 ||
@@ -49755,7 +49782,7 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         !qwen4_bind_tensor(&b[14], pos3, (uint64_t)cache_cap * 16u, "rope positions")) {
         return 0;
     }
-    return qwen4_dispatch(QWEN4_K_ATTN_PREP, &args, sizeof(args), b, 15,
+    return qwen4_dispatch(g_qwen4_kv_q8 ? QWEN4_K_ATTN_PREP_Q8 : QWEN4_K_ATTN_PREP, &args, sizeof(args), b, 15,
                           MTLSizeMake(n_head + n_head_kv + n_idx_head + 1u, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
@@ -49897,7 +49924,7 @@ int ds4_gpu_qwen4_attn_decode_tensor(
         { n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel ? 1u : 0u, sel_stride, scale,
           n_splits, keys_per_split, 0, 0 };
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
+    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * qwen4_kv_row_bytes((uint64_t)n_head_kv * head_dim);
     const uint64_t part_bytes = (uint64_t)n_tokens * n_head * n_splits * (2u + head_dim) * sizeof(float);
     qwen4_bind b[8];
     if (n_tokens == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 || n_head / n_head_kv > 12 ||
@@ -49929,11 +49956,12 @@ int ds4_gpu_qwen4_attn_decode_tensor(
      * relative to one-token continuation; large prefills retain matrix tiles. */
     if (n_splits == 1 && n_tokens > 8u && head_dim == 256u && n_head / n_head_kv <= 16u &&
         getenv("DS4_QWEN4_NO_ATTN_MM") == NULL) {
-        return qwen4_dispatch(QWEN4_K_ATTN_MM, &args, sizeof(args), b, 7,
+        return qwen4_dispatch(g_qwen4_kv_q8 ? QWEN4_K_ATTN_MM_Q8 : QWEN4_K_ATTN_MM, &args, sizeof(args), b, 7,
                               MTLSizeMake(n_head_kv, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
     }
-    const int kd = head_dim == 256u ? QWEN4_K_ATTN_DECODE_NPT8 :
-                   head_dim == 128u ? QWEN4_K_ATTN_DECODE_NPT4 : QWEN4_K_ATTN_DECODE_NPT1;
+    const int kd = g_qwen4_kv_q8 ?
+        (head_dim == 256u ? QWEN4_K_ATTN_DECODE_NPT8_Q8 : head_dim == 128u ? QWEN4_K_ATTN_DECODE_NPT4_Q8 : QWEN4_K_ATTN_DECODE_NPT1_Q8) :
+        (head_dim == 256u ? QWEN4_K_ATTN_DECODE_NPT8 : head_dim == 128u ? QWEN4_K_ATTN_DECODE_NPT4 : QWEN4_K_ATTN_DECODE_NPT1);
     const int km = head_dim == 256u ? QWEN4_K_ATTN_MERGE_NPT8 :
                    head_dim == 128u ? QWEN4_K_ATTN_MERGE_NPT4 : QWEN4_K_ATTN_MERGE_NPT1;
     if (!qwen4_dispatch(kd, &args, sizeof(args), b, 8,
@@ -50057,7 +50085,7 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
         !qwen4_bind_rows(&b[11], table, entry0, n_rows)) {
         return 0;
     }
-    return qwen4_dispatch_resident(QWEN4_K_ATTN_PREP_ROWS, &args, sizeof(args), b, 12,
+    return qwen4_dispatch_resident(g_qwen4_kv_q8 ? QWEN4_K_ATTN_PREP_ROWS_Q8 : QWEN4_K_ATTN_PREP_ROWS, &args, sizeof(args), b, 12,
                                    MTLSizeMake(n_head + n_head_kv + n_idx_head + 1u, n_rows, 1), MTLSizeMake(32, 1, 1), 0,
                                    res, qwen4_rows_resident(res, rows, n_rows));
 }
@@ -50166,7 +50194,9 @@ int ds4_gpu_qwen4_attn_decode_rows_tensor(
         return 0;
     }
     const bool npt8 = head_dim == 256u;
-    if (!qwen4_dispatch_resident(npt8 ? QWEN4_K_ATTN_DECODE_ROWS_NPT8 : QWEN4_K_ATTN_DECODE_ROWS_NPT4,
+    const int kr = g_qwen4_kv_q8 ? (npt8 ? QWEN4_K_ATTN_DECODE_ROWS_NPT8_Q8 : QWEN4_K_ATTN_DECODE_ROWS_NPT4_Q8) :
+                                   (npt8 ? QWEN4_K_ATTN_DECODE_ROWS_NPT8 : QWEN4_K_ATTN_DECODE_ROWS_NPT4);
+    if (!qwen4_dispatch_resident(kr,
                                  &args, sizeof(args), b, 7,
                                  MTLSizeMake(QWEN4_ATTN_MAX_SPLITS, n_head_kv, n_rows),
                                  MTLSizeMake(32 * QWEN4_ATTN_NSG, 1, 1), 0,

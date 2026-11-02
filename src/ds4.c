@@ -40070,6 +40070,23 @@ static uint32_t qwen4_ik_cache_rows(uint32_t ctx_cap, uint32_t cap_tokens) {
     return ctx_cap;
 }
 
+/* K/V rows of the attention layers: on Metal 8-bit values with an f16
+ * scale per 32 (metal/qwen4.metal qwen4_kv_load), 47% of the f16 rows' bytes
+ * (3.05 GiB less at 262K); DS4_QWEN4_KV_F16=1 keeps f16, the CUDA layout. */
+static bool qwen4_kv_q8(void) {
+#if defined(__APPLE__)
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4_KV_F16") == NULL;
+    return v != 0;
+#else
+    return false;
+#endif
+}
+static uint64_t qwen4_kv_row_bytes(bool q8) {
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    return q8 ? kv_dim + kv_dim / 16u : kv_dim * 2u;
+}
+
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
@@ -40085,11 +40102,12 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4()) {
-        /* per-token f16 K/V and raw indexer keys per attention layer, pooled
-         * block keys, rope positions; transients scale with the prefill chunk */
+        /* per-token K/V (8-bit on Metal) and raw indexer keys per attention
+         * layer, pooled block keys, rope positions; transients scale with the
+         * prefill chunk */
         const uint64_t T = prefill_chunk ? prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
         const uint64_t blocks = ctx / 4u + 1u, E = DS4_N_EMBD, hc_dim = E * DS4_N_HC;
-        const uint64_t kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+        const uint64_t kv_row = 2ull * qwen4_kv_row_bytes(backend == DS4_BACKEND_METAL && qwen4_kv_q8());
         uint32_t n_attn = 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) n_attn += !ds4_qwen4_layer_is_linear(il);
         m.prefill_cap = (uint32_t)T;
@@ -58551,6 +58569,9 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                               ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
+#ifdef DS4_HAS_QWEN4_METAL
+    ds4_gpu_qwen4_set_kv_q8(qwen4_kv_q8());
+#endif
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
     const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
@@ -58665,8 +58686,8 @@ private_state:
                 ok = g->snap_lin_state[il] && g->snap_lin_hist[il];
             }
         } else {
-            g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-            g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
+            g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_row_bytes(qwen4_kv_q8()));
+            g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_row_bytes(qwen4_kv_q8()));
             g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)g->ik_rows * DS4_N_INDEXER_HEAD_DIM);
             g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
             ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] && g->layer_ik_cache[il] && g->layer_block_key[il];
@@ -64129,7 +64150,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 }
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
-static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool ik_tail);
+static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool ik_tail, bool kv_q8);
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
@@ -64145,7 +64166,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         const uint32_t rows = (uint32_t)s->checkpoint.len;
         const uint32_t mtp_rows = s->qwen4_graph.mtp_pos < rows ? s->qwen4_graph.mtp_pos : rows;
         bytes += qwen4_payload_tensor_bytes(rows, mtp_rows,
-                                            s->qwen4_graph.ik_rows < s->qwen4_graph.ctx_cap);
+                                            s->qwen4_graph.ik_rows < s->qwen4_graph.ctx_cap, qwen4_kv_q8());
         return bytes;
 #endif
     }
@@ -64291,15 +64312,19 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
  * family tag so a DeepSeek payload is never read as a Qwen one.  A ring
  * cache (qwen4_ik_cache_rows) writes only the last QWEN4_IK_TAIL raw indexer
  * key rows, under the TAIL tag; every session reads both layouts, since a
- * continuation pools no key from before them. */
+ * continuation pools no key from before them.  8-bit K/V rows (qwen4_kv_q8)
+ * add DS4_QWEN4_PAYLOAD_KV_Q8 to the tag, and a session whose rows are the
+ * other layout converts them as it loads. */
 #define DS4_QWEN4_PAYLOAD_TAG 0x51573802u
 #define DS4_QWEN4_PAYLOAD_TAG_TAIL 0x51573803u
+#define DS4_QWEN4_PAYLOAD_KV_Q8 0x4u
 
 /* The cached keys carry their rotation, so a checkpoint only fits a session
  * with the same YaRN factor: fold the factor into the tag.  Without YaRN the
  * tag is unchanged and older checkpoints still load. */
-static uint32_t qwen4_payload_tag(bool ik_tail) {
-    const uint32_t tag = ik_tail ? DS4_QWEN4_PAYLOAD_TAG_TAIL : DS4_QWEN4_PAYLOAD_TAG;
+static uint32_t qwen4_payload_tag(bool ik_tail, bool kv_q8) {
+    const uint32_t tag = (ik_tail ? DS4_QWEN4_PAYLOAD_TAG_TAIL : DS4_QWEN4_PAYLOAD_TAG) |
+                         (kv_q8 ? DS4_QWEN4_PAYLOAD_KV_Q8 : 0u);
     uint32_t bits = 0;
     if (!g_qwen4_rope_yarn) return tag;
     memcpy(&bits, &g_qwen4_rope_factor, sizeof(bits));
@@ -64318,8 +64343,56 @@ static uint64_t qwen4_payload_lin_hist_bytes(void) {
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     return (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
 }
-static uint64_t qwen4_payload_kv_bytes(uint32_t rows) {
-    return (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+static uint64_t qwen4_payload_kv_bytes(uint32_t rows, bool kv_q8) {
+    return (uint64_t)rows * qwen4_kv_row_bytes(kv_q8);
+}
+
+/* K/V rows written in the other layout: through the host, f16 to 8-bit
+ * rounded as metal/qwen4.metal qwen4_kv_store rounds them, or back */
+static int qwen4_payload_read_kv_converted(FILE *fp, ds4_gpu_tensor *t, uint32_t rows, bool file_q8,
+                                           uint8_t *buf, uint64_t cap, uint64_t *remaining,
+                                           char *err, size_t errlen) {
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t in_row = qwen4_kv_row_bytes(file_q8), out_row = qwen4_kv_row_bytes(!file_q8);
+    const uint64_t chunk = cap / (in_row + out_row);
+    if (chunk == 0 || (uint64_t)rows * out_row > ds4_gpu_tensor_bytes(t)) {
+        payload_set_err(err, errlen, "session K/V cache is smaller than the payload");
+        return 1;
+    }
+    uint8_t *out = buf + chunk * in_row;
+    for (uint64_t r0 = 0; r0 < rows; r0 += chunk) {
+        const uint64_t n = rows - r0 < chunk ? rows - r0 : chunk;
+        if (payload_read_bytes(fp, buf, n * in_row, remaining, err, errlen) != 0) return 1;
+        for (uint64_t r = 0; r < n; r++) {
+            const uint8_t *src = buf + r * in_row;
+            uint8_t *dst = out + r * out_row;
+            if (file_q8) {
+                const int8_t *q = (const int8_t *)src;
+                const uint16_t *sc = (const uint16_t *)(src + kv_dim);
+                uint16_t *h = (uint16_t *)dst;
+                for (uint64_t i = 0; i < kv_dim; i++) h[i] = f32_to_f16((float)q[i] * f16_to_f32(sc[i / 32u]));
+            } else {
+                const uint16_t *h = (const uint16_t *)src;
+                int8_t *q = (int8_t *)dst;
+                uint16_t *sc = (uint16_t *)(dst + kv_dim);
+                for (uint64_t g = 0; g < kv_dim / 32u; g++) {
+                    float a = 0.0f;
+                    for (uint32_t i = 0; i < 32u; i++) a = fmaxf(a, fabsf(f16_to_f32(h[g * 32u + i])));
+                    sc[g] = f32_to_f16(a / 127.0f);
+                    const float d = f16_to_f32(sc[g]), id = d > 0.0f ? 1.0f / d : 0.0f;
+                    for (uint32_t i = 0; i < 32u; i++) {
+                        const float v = rintf(f16_to_f32(h[g * 32u + i]) * id);
+                        q[g * 32u + i] = (int8_t)(v > 127.0f ? 127.0f : v < -127.0f ? -127.0f : v);
+                    }
+                }
+            }
+        }
+        if (ds4_gpu_tensor_write(t, r0 * out_row, out, n * out_row) == 0) {
+            payload_set_err(err, errlen, "failed to restore accelerator session tensor");
+            return 1;
+        }
+    }
+    return 0;
 }
 static uint64_t qwen4_payload_ik_bytes(uint32_t rows) {
     return (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
@@ -64331,14 +64404,14 @@ static uint64_t qwen4_payload_ple_hist_bytes(void) {
     return (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * DS4_N_EMBD * DS4_N_HC * sizeof(float);
 }
 
-static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool ik_tail) {
+static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool ik_tail, bool kv_q8) {
     uint64_t bytes = sizeof(uint32_t);   /* mtp_rows */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
             bytes += qwen4_payload_lin_state_bytes() + qwen4_payload_lin_hist_bytes();
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            bytes += 2u * qwen4_payload_kv_bytes(n) + qwen4_payload_ik_bytes(qwen4_payload_ik_rows(n, ik_tail)) +
+            bytes += 2u * qwen4_payload_kv_bytes(n, kv_q8) + qwen4_payload_ik_bytes(qwen4_payload_ik_rows(n, ik_tail)) +
                      qwen4_payload_block_key_bytes(n);
         }
     }
@@ -64377,7 +64450,7 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
         DS4_N_HEAD_DIM,
         DS4_N_INDEXER_HEAD_DIM,
         DS4_N_VOCAB,
-        qwen4_payload_tag(g->ik_rows < g->ctx_cap),
+        qwen4_payload_tag(g->ik_rows < g->ctx_cap, qwen4_kv_q8()),
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -64400,9 +64473,9 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
             }
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, qwen4_payload_kv_bytes(n),
+            rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, qwen4_payload_kv_bytes(n, qwen4_kv_q8()),
                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
+            if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n, qwen4_kv_q8()),
                                                         buf, DS4_SESSION_IO_CHUNK, err, errlen);
             /* the last ik rows of a ring, in row order */
             const uint32_t nik = qwen4_payload_ik_rows(n, g->ik_rows < g->ctx_cap);
@@ -64445,11 +64518,18 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
         return 1;
     }
-    if (h[12] != qwen4_payload_tag(false) && h[12] != qwen4_payload_tag(true)) {
+    bool file_tail = false, file_q8 = false, tag_ok = false;
+    for (int t = 0; t < 4 && !tag_ok; t++) {
+        if (h[12] == qwen4_payload_tag((t & 1) != 0, (t & 2) != 0)) {
+            tag_ok = true;
+            file_tail = (t & 1) != 0;
+            file_q8 = (t & 2) != 0;
+        }
+    }
+    if (!tag_ok) {
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or YaRN factor");
         return 1;
     }
-    const bool file_tail = h[12] == qwen4_payload_tag(true);
     if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {
         payload_set_err(err, errlen, "KV checkpoint is longer than this session's context");
         return 1;
@@ -64501,10 +64581,13 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
             }
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            rc = payload_read_tensor_span(fp, g->layer_k_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                          buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                                       buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            for (int kv = 0; rc == 0 && kv < 2; kv++) {
+                ds4_gpu_tensor *t = kv ? g->layer_v_cache[il] : g->layer_k_cache[il];
+                rc = file_q8 == qwen4_kv_q8() ?
+                    payload_read_tensor_span(fp, t, 0, qwen4_payload_kv_bytes(n, file_q8),
+                                             buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen) :
+                    qwen4_payload_read_kv_converted(fp, t, n, file_q8, buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            }
             /* keep the rows a continuation pools: all of them in a full cache,
              * the last QWEN4_IK_TAIL at their ring slots in a ring */
             const uint32_t nfile = qwen4_payload_ik_rows(n, file_tail);
