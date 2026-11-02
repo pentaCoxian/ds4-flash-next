@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <float.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -40,6 +41,12 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <sys/sysctl.h>
+#endif
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
@@ -10198,6 +10205,71 @@ static void server_image_cache_put(server_image_cache *cache,
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
+/* Live metrics for the dashboard (GET /dashboard and /dashboard/metrics):
+ * each slot's request as it runs, the last finished requests and totals.
+ * Generation threads update them at request start, every prefill chunk, every
+ * decode step and request end; client threads read them under the same lock.
+ * No prompt or output text is kept. */
+#define SERVER_METRICS_RECENT 32
+
+typedef enum { METRICS_IDLE, METRICS_PREFILL, METRICS_DECODE } metrics_phase;
+
+typedef struct {
+    metrics_phase phase;
+    char api[12];
+    bool tools;
+    bool thinking;          /* the request asked for reasoning */
+    bool in_thinking;       /* decode is inside the reasoning block */
+    double t_start;
+    double t_decode;        /* 0 until the first decode step */
+    double prefill_s;
+    int prompt_tokens;
+    int cached_tokens;
+    int prefill_done;
+    int prefill_total;
+    double prefill_tps;     /* last chunk */
+    double prefill_avg_tps;
+    int gen_tokens;
+    int max_tokens;
+    double decode_tps;      /* over the last half second or more */
+    double rate_t;
+    int rate_gen;
+    uint64_t spec_cycles0, spec_accepted0;
+    uint64_t spec_cycles, spec_accepted;
+} metrics_slot;
+
+typedef struct {
+    double t_end;
+    char api[12];
+    bool tools;
+    bool cancelled;
+    int prompt_tokens;
+    int cached_tokens;
+    int gen_tokens;
+    double prefill_s;
+    double decode_s;
+    uint64_t spec_cycles;
+    uint64_t spec_accepted;
+} metrics_done;
+
+typedef struct {
+    bool ready;             /* false in unit-test servers: every hook returns */
+    pthread_mutex_t mu;
+    double t0;
+    char model_file[160];
+    bool mtp;
+    metrics_slot *slots;
+    uint64_t requests;
+    uint64_t cancelled;
+    uint64_t prompt_tokens;
+    uint64_t cached_tokens;
+    uint64_t gen_tokens;
+    double busy_s;
+    metrics_done recent[SERVER_METRICS_RECENT];
+    int recent_n;
+    int recent_next;
+} server_metrics;
+
 struct server {
     ds4_engine *engine;
     ds4_tp *tp_leader;
@@ -10235,7 +10307,279 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    server_metrics metrics;
 };
+
+static void metrics_init(server *s, const char *model_path, bool mtp) {
+    server_metrics *m = &s->metrics;
+    pthread_mutex_init(&m->mu, NULL);
+    m->t0 = now_sec();
+    const char *base = model_path ? strrchr(model_path, '/') : NULL;
+    snprintf(m->model_file, sizeof(m->model_file), "%s", base ? base + 1 : model_path ? model_path : "");
+    m->mtp = mtp;
+    m->slots = xmalloc((size_t)s->slot_count * sizeof(*m->slots));
+    memset(m->slots, 0, (size_t)s->slot_count * sizeof(*m->slots));
+    m->ready = true;
+}
+
+static void metrics_free(server *s) {
+    server_metrics *m = &s->metrics;
+    if (!m->ready) return;
+    m->ready = false;
+    free(m->slots);
+    m->slots = NULL;
+    pthread_mutex_destroy(&m->mu);
+}
+
+static const char *metrics_api_name(const request *r) {
+    if (r->api == API_RESPONSES) return "responses";
+    if (r->api == API_ANTHROPIC) return "messages";
+    return r->kind == REQ_CHAT ? "chat" : "completion";
+}
+
+static void metrics_begin(server *s, server_slot *slot, const request *r,
+                          int prompt_tokens, int cached_tokens, double t0) {
+    server_metrics *m = &s->metrics;
+    if (!m->ready || !slot) return;
+    uint64_t cycles = 0, accepted = 0;
+    ds4_session_spec_stats(slot->session, &cycles, &accepted);
+    pthread_mutex_lock(&m->mu);
+    metrics_slot *ms = &m->slots[slot->id];
+    memset(ms, 0, sizeof(*ms));
+    ms->phase = METRICS_PREFILL;
+    snprintf(ms->api, sizeof(ms->api), "%s", metrics_api_name(r));
+    ms->tools = r->has_tools;
+    ms->thinking = ds4_think_mode_enabled(r->think_mode);
+    ms->t_start = t0;
+    ms->prompt_tokens = prompt_tokens;
+    ms->cached_tokens = cached_tokens;
+    ms->prefill_total = prompt_tokens > cached_tokens ? prompt_tokens - cached_tokens : 0;
+    ms->spec_cycles0 = ms->spec_cycles = cycles;
+    ms->spec_accepted0 = ms->spec_accepted = accepted;
+    pthread_mutex_unlock(&m->mu);
+}
+
+static void metrics_prefill(server *s, server_slot *slot, int done, int total,
+                            double chunk_tps, double avg_tps) {
+    server_metrics *m = &s->metrics;
+    if (!m->ready || !slot) return;
+    pthread_mutex_lock(&m->mu);
+    metrics_slot *ms = &m->slots[slot->id];
+    if (ms->phase == METRICS_PREFILL) {
+        ms->prefill_done = done;
+        ms->prefill_total = total;
+        if (chunk_tps > 0.0) ms->prefill_tps = chunk_tps;
+        ms->prefill_avg_tps = avg_tps;
+    }
+    pthread_mutex_unlock(&m->mu);
+}
+
+/* also called when a tool-error continuation decodes again */
+static void metrics_decode_start(server *s, server_slot *slot, int max_tokens, double t) {
+    server_metrics *m = &s->metrics;
+    if (!m->ready || !slot) return;
+    pthread_mutex_lock(&m->mu);
+    metrics_slot *ms = &m->slots[slot->id];
+    if (ms->phase != METRICS_IDLE) {
+        if (ms->t_decode == 0.0) {
+            ms->prefill_s = t - ms->t_start;
+            ms->prefill_done = ms->prefill_total;
+        }
+        ms->phase = METRICS_DECODE;
+        ms->t_decode = t;
+        ms->rate_t = t;
+        ms->rate_gen = 0;
+        ms->gen_tokens = 0;
+        ms->max_tokens = max_tokens;
+    }
+    pthread_mutex_unlock(&m->mu);
+}
+
+static void metrics_decode(server *s, server_slot *slot, int completion, bool in_thinking) {
+    server_metrics *m = &s->metrics;
+    if (!m->ready || !slot) return;
+    uint64_t cycles = 0, accepted = 0;
+    ds4_session_spec_stats(slot->session, &cycles, &accepted);
+    const double now = now_sec();
+    pthread_mutex_lock(&m->mu);
+    metrics_slot *ms = &m->slots[slot->id];
+    if (ms->phase == METRICS_DECODE) {
+        ms->gen_tokens = completion;
+        ms->in_thinking = in_thinking;
+        if (now - ms->rate_t >= 0.5) {
+            ms->decode_tps = (double)(completion - ms->rate_gen) / (now - ms->rate_t);
+            ms->rate_t = now;
+            ms->rate_gen = completion;
+        }
+        ms->spec_cycles = cycles;
+        ms->spec_accepted = accepted;
+    }
+    pthread_mutex_unlock(&m->mu);
+}
+
+static void metrics_end(server *s, server_slot *slot, bool cancelled) {
+    server_metrics *m = &s->metrics;
+    if (!m->ready || !slot) return;
+    const double now = now_sec();
+    pthread_mutex_lock(&m->mu);
+    metrics_slot *ms = &m->slots[slot->id];
+    if (ms->phase != METRICS_IDLE) {
+        metrics_done *d = &m->recent[m->recent_next];
+        memset(d, 0, sizeof(*d));
+        d->t_end = now;
+        memcpy(d->api, ms->api, sizeof(d->api));
+        d->tools = ms->tools;
+        d->cancelled = cancelled;
+        d->prompt_tokens = ms->prompt_tokens;
+        d->cached_tokens = ms->cached_tokens;
+        d->gen_tokens = ms->gen_tokens;
+        d->prefill_s = ms->t_decode > 0.0 ? ms->prefill_s : now - ms->t_start;
+        d->decode_s = ms->t_decode > 0.0 ? now - ms->t_decode : 0.0;
+        d->spec_cycles = ms->spec_cycles - ms->spec_cycles0;
+        d->spec_accepted = ms->spec_accepted - ms->spec_accepted0;
+        m->recent_next = (m->recent_next + 1) % SERVER_METRICS_RECENT;
+        if (m->recent_n < SERVER_METRICS_RECENT) m->recent_n++;
+        m->requests++;
+        if (cancelled) m->cancelled++;
+        m->prompt_tokens += (uint64_t)ms->prompt_tokens;
+        m->cached_tokens += (uint64_t)ms->cached_tokens;
+        m->gen_tokens += (uint64_t)ms->gen_tokens;
+        m->busy_s += now - ms->t_start;
+        ms->phase = METRICS_IDLE;
+    }
+    pthread_mutex_unlock(&m->mu);
+}
+
+/* System-wide GPU load and the GPU driver's memory, from the accelerator's
+ * performance statistics (what ioreg and Activity Monitor show).  The load
+ * counts every process, so other apps' GPU work shows up here too. */
+static bool server_gpu_sample(int *util_pct, uint64_t *in_use, uint64_t *alloc) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(0, IOServiceMatching("IOAccelerator"), &it) != KERN_SUCCESS) return false;
+    bool ok = false;
+    io_registry_entry_t e;
+    while (!ok && (e = IOIteratorNext(it)) != 0) {
+        CFMutableDictionaryRef props = NULL;
+        if (IORegistryEntryCreateCFProperties(e, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+            CFTypeRef perf = CFDictionaryGetValue(props, CFSTR("PerformanceStatistics"));
+            if (perf && CFGetTypeID(perf) == CFDictionaryGetTypeID()) {
+                CFTypeRef u = CFDictionaryGetValue((CFDictionaryRef)perf, CFSTR("Device Utilization %"));
+                CFTypeRef iu = CFDictionaryGetValue((CFDictionaryRef)perf, CFSTR("In use system memory"));
+                CFTypeRef al = CFDictionaryGetValue((CFDictionaryRef)perf, CFSTR("Alloc system memory"));
+                int64_t v = 0;
+                if (u && CFGetTypeID(u) == CFNumberGetTypeID() &&
+                    CFNumberGetValue((CFNumberRef)u, kCFNumberSInt64Type, &v)) {
+                    *util_pct = (int)v;
+                    ok = true;
+                }
+                if (iu && CFGetTypeID(iu) == CFNumberGetTypeID() &&
+                    CFNumberGetValue((CFNumberRef)iu, kCFNumberSInt64Type, &v)) *in_use = (uint64_t)v;
+                if (al && CFGetTypeID(al) == CFNumberGetTypeID() &&
+                    CFNumberGetValue((CFNumberRef)al, kCFNumberSInt64Type, &v)) *alloc = (uint64_t)v;
+            }
+            CFRelease(props);
+        }
+        IOObjectRelease(e);
+    }
+    IOObjectRelease(it);
+    return ok;
+#else
+    (void)util_pct; (void)in_use; (void)alloc;
+    return false;
+#endif
+}
+
+static void server_memory_limits(uint64_t *ram, uint64_t *wired_limit) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0) *ram = mem;
+    int mb = 0;
+    len = sizeof(mb);
+    if (sysctlbyname("iogpu.wired_limit_mb", &mb, &len, NULL, 0) == 0 && mb > 0) {
+        *wired_limit = (uint64_t)mb << 20;
+    } else if (*ram) {
+        *wired_limit = *ram / 4 * 3;    /* the system default */
+    }
+#else
+    (void)ram; (void)wired_limit;
+#endif
+}
+
+static void send_metrics(server *s, int fd) {
+    server_metrics *m = &s->metrics;
+    if (!m->ready) {
+        http_error(fd, s->enable_cors, 404, "metrics are not available");
+        return;
+    }
+    int gpu_util = -1;
+    uint64_t gpu_in_use = 0, gpu_alloc = 0, ram = 0, wired_limit = 0;
+    const bool have_gpu = server_gpu_sample(&gpu_util, &gpu_in_use, &gpu_alloc);
+    server_memory_limits(&ram, &wired_limit);
+    const double now = now_sec();
+    buf b = {0};
+    buf_puts(&b, "{\"server\":{\"model\":");
+    json_escape(&b, server_model_id_from_engine(s->engine));
+    buf_puts(&b, ",\"file\":");
+    pthread_mutex_lock(&m->mu);
+    json_escape(&b, m->model_file);
+    buf_printf(&b, ",\"ctx\":%d,\"mtp\":%s,\"slots\":%d,\"uptime_s\":%.1f}",
+               s->ctx_size, m->mtp ? "true" : "false", s->slot_count, now - m->t0);
+    if (have_gpu) {
+        buf_printf(&b, ",\"gpu\":{\"util_pct\":%d,\"in_use\":%" PRIu64 ",\"alloc\":%" PRIu64
+                       ",\"wired_limit\":%" PRIu64 ",\"ram\":%" PRIu64 "}",
+                   gpu_util, gpu_in_use, gpu_alloc, wired_limit, ram);
+    } else {
+        buf_puts(&b, ",\"gpu\":null");
+    }
+    buf_printf(&b, ",\"totals\":{\"requests\":%" PRIu64 ",\"cancelled\":%" PRIu64
+                   ",\"prompt_tokens\":%" PRIu64 ",\"cached_tokens\":%" PRIu64
+                   ",\"gen_tokens\":%" PRIu64 ",\"busy_s\":%.1f}",
+               m->requests, m->cancelled, m->prompt_tokens, m->cached_tokens, m->gen_tokens, m->busy_s);
+    buf_puts(&b, ",\"slots\":[");
+    for (int i = 0; i < s->slot_count; i++) {
+        const metrics_slot *ms = &m->slots[i];
+        static const char *phases[] = { "idle", "prefill", "decode" };
+        const double decode_s = ms->t_decode > 0.0 ? now - ms->t_decode : 0.0;
+        buf_printf(&b, "%s{\"id\":%d,\"phase\":\"%s\"", i ? "," : "", i, phases[ms->phase]);
+        if (ms->phase != METRICS_IDLE) {
+            buf_printf(&b, ",\"api\":\"%s\",\"tools\":%s,\"thinking\":%s,\"in_thinking\":%s"
+                           ",\"elapsed_s\":%.2f,\"prompt_tokens\":%d,\"cached_tokens\":%d"
+                           ",\"prefill_done\":%d,\"prefill_total\":%d,\"prefill_tps\":%.1f"
+                           ",\"prefill_avg_tps\":%.1f,\"prefill_s\":%.2f,\"gen_tokens\":%d,\"max_tokens\":%d"
+                           ",\"decode_tps\":%.2f,\"decode_avg_tps\":%.2f"
+                           ",\"spec_cycles\":%" PRIu64 ",\"spec_accepted\":%" PRIu64,
+                       ms->api, ms->tools ? "true" : "false", ms->thinking ? "true" : "false",
+                       ms->in_thinking ? "true" : "false", now - ms->t_start,
+                       ms->prompt_tokens, ms->cached_tokens, ms->prefill_done, ms->prefill_total,
+                       ms->prefill_tps, ms->prefill_avg_tps, ms->prefill_s, ms->gen_tokens, ms->max_tokens,
+                       ms->decode_tps, decode_s > 0.0 ? ms->gen_tokens / decode_s : 0.0,
+                       ms->spec_cycles - ms->spec_cycles0, ms->spec_accepted - ms->spec_accepted0);
+        }
+        buf_puts(&b, "}");
+    }
+    buf_puts(&b, "],\"recent\":[");
+    for (int k = 0; k < m->recent_n; k++) {
+        const int i = (m->recent_next - 1 - k + 2 * SERVER_METRICS_RECENT) % SERVER_METRICS_RECENT;
+        const metrics_done *d = &m->recent[i];
+        buf_printf(&b, "%s{\"ago_s\":%.1f,\"api\":\"%s\",\"tools\":%s,\"cancelled\":%s"
+                       ",\"prompt_tokens\":%d,\"cached_tokens\":%d,\"gen_tokens\":%d"
+                       ",\"prefill_s\":%.3f,\"decode_s\":%.3f"
+                       ",\"spec_cycles\":%" PRIu64 ",\"spec_accepted\":%" PRIu64 "}",
+                   k ? "," : "", now - d->t_end, d->api, d->tools ? "true" : "false",
+                   d->cancelled ? "true" : "false", d->prompt_tokens, d->cached_tokens, d->gen_tokens,
+                   d->prefill_s, d->decode_s, d->spec_cycles, d->spec_accepted);
+    }
+    pthread_mutex_unlock(&m->mu);
+    buf_puts(&b, "]}\n");
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+}
+
+static const char ds4_dashboard_html[] =
+#include "ds4_dashboard_html.h"
+    ;
 
 static void server_inference_lock(server *s) {
     pthread_mutex_lock(&s->inference_mu);
@@ -12887,6 +13231,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->last_current = current;
     p->last_t = now;
     p->seen = true;
+    if (p->srv) metrics_prefill(p->srv, p->slot, display_current, display_total, chunk_tps, avg_tps);
     char flags[64];
     log_flags(flags, sizeof(flags), p->responses_protocol,
               p->has_tools, false, false, false);
@@ -13853,6 +14198,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         .request_job = j,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
+    metrics_begin(s, slot, &j->req, prompt_tokens, cached, t0);
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
@@ -14165,6 +14511,7 @@ decode_again:
     int stop_token = -1;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    metrics_decode_start(s, slot, max_tokens, decode_t0);
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -14448,6 +14795,7 @@ decode_again:
                 }
             }
 
+            metrics_decode(s, slot, completion, thinking.inside);
             if (completion >= next_decode_log) {
                 log_decode_progress(j->req.kind, prompt_tokens, completion,
                                     responses_protocol,
@@ -15001,6 +15349,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
+    metrics_end(s, slot, job_cancelled(j));
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
@@ -15538,6 +15887,17 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/dashboard") || !strcmp(hr.path, "/dashboard/"))) {
+        http_response(fd, s->enable_cors, 200, "text/html; charset=utf-8", ds4_dashboard_html);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/dashboard/metrics")) {
+        send_metrics(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -15751,6 +16111,7 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
     }
 }
 static void server_close_resources(server *s) {
+    metrics_free(s);
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -16229,6 +16590,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    metrics_init(&s, cfg.engine.model_path, ds4_engine_mtp_draft_tokens(engine) > 0);
 
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
@@ -16313,6 +16675,7 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    server_log(DS4_LOG_DEFAULT, "ds4-server: live metrics on http://%s:%d/dashboard", cfg.host, cfg.port);
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);

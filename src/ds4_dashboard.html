@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ds4 live</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11,11,11,0.10);
+  --series: #2a78d6;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --critical: #d03b3b;
+  --idle: #898781;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255,255,255,0.10);
+    --series: #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --ring: rgba(255,255,255,0.10);
+  --series: #3987e5;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 1120px; margin: 0 auto; padding: 20px 16px 40px; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 16px; }
+h1 { font-size: 18px; font-weight: 600; margin: 0; }
+.sub { color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 12px; border-radius: 999px;
+  background: var(--surface); box-shadow: inset 0 0 0 1px var(--ring);
+  font-weight: 600; font-size: 13px; white-space: nowrap;
+}
+.pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+.pill[data-phase="prefill"] i { background: var(--series); }
+.pill[data-phase="decode"] i { background: var(--good); }
+.pill[data-phase="down"] i { background: var(--critical); }
+.card {
+  background: var(--surface); border-radius: 12px;
+  box-shadow: inset 0 0 0 1px var(--ring);
+  padding: 16px; min-width: 0;
+}
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.hero { grid-column: span 2; }
+@media (max-width: 420px) { .hero { grid-column: auto; } }
+.label { color: var(--ink-2); font-size: 13px; }
+.value { font-size: 26px; font-weight: 600; margin-top: 2px; }
+.hero .value { font-size: 52px; line-height: 1.1; }
+.value small { font-size: 14px; font-weight: 500; color: var(--ink-2); margin-left: 4px; }
+.note { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.meter { height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--series) 18%, var(--surface)); margin-top: 8px; overflow: hidden; }
+.meter b { display: block; height: 100%; width: 0; border-radius: 3px; background: var(--series); transition: width .4s; }
+.meter[data-level="warning"] b { background: var(--warning); }
+.meter[data-level="critical"] b { background: var(--critical); }
+.req { display: grid; gap: 12px; margin-bottom: 12px; }
+.req h2, .card h2 { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
+.req .row { display: flex; flex-wrap: wrap; gap: 4px 16px; color: var(--ink-2); font-size: 13px; }
+.req .row b { color: var(--ink); font-weight: 600; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: 160px; touch-action: none; }
+.chart .tip {
+  position: absolute; pointer-events: none; display: none;
+  background: var(--surface); box-shadow: 0 2px 8px rgba(0,0,0,.15), inset 0 0 0 1px var(--ring);
+  border-radius: 8px; padding: 6px 10px; font-size: 12px; white-space: nowrap;
+}
+.chart .tip strong { font-size: 14px; display: block; }
+.chart .tip span { color: var(--ink-2); }
+details { margin-top: 8px; color: var(--ink-2); font-size: 12px; }
+summary { cursor: pointer; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 13px; }
+th { text-align: right; font-weight: 500; color: var(--ink-2); padding: 6px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+tr:last-child td { border-bottom: 0; }
+.empty { color: var(--muted); padding: 12px 0; }
+footer { color: var(--muted); font-size: 12px; margin-top: 12px; }
+.stale main > *:not(header) { opacity: .5; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="grow">
+      <h1>ds4 live</h1>
+      <div class="sub" id="model">connecting</div>
+    </div>
+    <span class="pill" id="pill" data-phase="idle"><i></i><span id="phase">Idle</span></span>
+  </header>
+
+  <section class="tiles">
+    <div class="card hero">
+      <div class="label" id="decode-label">Decode speed</div>
+      <div class="value" id="decode">–<small>tok/s</small></div>
+      <div class="note" id="decode-note">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="label">Prefill speed</div>
+      <div class="value" id="prefill">–</div>
+      <div class="note" id="prefill-note">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="label">Tokens per MTP step</div>
+      <div class="value" id="mtp">–</div>
+      <div class="note" id="mtp-note">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="label">GPU load</div>
+      <div class="value" id="gpu">–</div>
+      <div class="meter" id="gpu-meter"><b></b></div>
+      <div class="note">all processes</div>
+    </div>
+    <div class="card">
+      <div class="label">GPU memory</div>
+      <div class="value" id="mem">–</div>
+      <div class="meter" id="mem-meter"><b></b></div>
+      <div class="note" id="mem-note">&nbsp;</div>
+    </div>
+  </section>
+
+  <section class="req" id="requests"></section>
+
+  <section class="charts">
+    <div class="card chart" id="chart-decode">
+      <h2>Decode speed, tok/s, last 5 minutes</h2>
+      <svg role="img" aria-label="Decode speed over the last 5 minutes"></svg>
+      <div class="tip"></div>
+      <details><summary>Samples</summary><div class="scroll"><table><thead><tr><th>When</th><th></th><th>tok/s</th></tr></thead><tbody></tbody></table></div></details>
+    </div>
+    <div class="card chart" id="chart-gpu">
+      <h2>GPU load, %, last 5 minutes</h2>
+      <svg role="img" aria-label="GPU load over the last 5 minutes"></svg>
+      <div class="tip"></div>
+      <details><summary>Samples</summary><div class="scroll"><table><thead><tr><th>When</th><th></th><th>%</th></tr></thead><tbody></tbody></table></div></details>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Recent requests</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>When</th><th>API</th><th>Prompt</th><th>Cached</th><th>Prefill tok/s</th><th>Output</th><th>Decode tok/s</th><th>Tokens/step</th><th>Time</th></tr></thead>
+        <tbody id="recent"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer id="totals">&nbsp;</footer>
+</main>
+<script>
+"use strict";
+const POLL_MS = 1000, WINDOW_S = 300;
+const samples = [];            /* {t, decode (null when not decoding), gpu (null when unknown)} */
+const $ = (id) => document.getElementById(id);
+const nf = new Intl.NumberFormat("en-US");
+const n1 = (v) => v.toFixed(1);
+const GiB = 1024 * 1024 * 1024;
+
+function fmtTokens(v) {
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (v >= 10000) return Math.round(v / 1000) + "K";
+  return nf.format(v);
+}
+function fmtDur(s) {
+  if (s < 10) return s.toFixed(1) + " s";
+  if (s < 90) return Math.round(s) + " s";
+  if (s < 3600) return Math.floor(s / 60) + " min " + Math.round(s % 60) + " s";
+  return Math.floor(s / 3600) + " h " + Math.round((s % 3600) / 60) + " min";
+}
+function fmtAgo(s) {
+  if (s < 60) return Math.round(s) + " s ago";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  return Math.round(s / 3600) + " h ago";
+}
+function setText(id, text) { const e = $(id); if (e.textContent !== text) e.textContent = text; }
+function setValue(id, text, unit) {
+  const e = $(id);
+  e.textContent = text;
+  if (unit) { const u = document.createElement("small"); u.textContent = unit; e.appendChild(u); }
+}
+function setMeter(id, frac, warnAt, critAt) {
+  const m = $(id);
+  const f = Math.max(0, Math.min(1, frac || 0));
+  m.firstElementChild.style.width = (100 * f).toFixed(1) + "%";
+  m.dataset.level = critAt && f >= critAt ? "critical" : warnAt && f >= warnAt ? "warning" : "";
+}
+function tokensPerStep(cycles, accepted) {
+  return cycles > 0 ? (cycles + accepted) / cycles : null;
+}
+
+let last = null;     /* the previous metrics, for the idle tiles */
+
+function render(m) {
+  const srv = m.server;
+  const parts = [srv.model, srv.file, "context " + fmtTokens(srv.ctx), srv.mtp ? "MTP on" : "MTP off"];
+  if (srv.slots > 1) parts.push(srv.slots + " sessions");
+  parts.push("up " + fmtDur(srv.uptime_s));
+  setText("model", parts.filter(Boolean).join(" · "));
+
+  const active = m.slots.filter((s) => s.phase !== "idle");
+  const decoding = active.filter((s) => s.phase === "decode");
+  const prefilling = active.filter((s) => s.phase === "prefill");
+  const recent = m.recent[0];
+
+  /* status */
+  const pill = $("pill");
+  if (prefilling.length) {
+    const s = prefilling[0];
+    pill.dataset.phase = "prefill";
+    setText("phase", "Prefilling " + (s.prefill_total ? Math.round(100 * s.prefill_done / s.prefill_total) : 0) + "%");
+  } else if (decoding.length) {
+    pill.dataset.phase = "decode";
+    setText("phase", decoding[0].in_thinking ? "Thinking" : "Writing");
+  } else {
+    pill.dataset.phase = "idle";
+    setText("phase", "Idle");
+  }
+
+  /* decode speed: live sum over decoding sessions, else the last reply */
+  let decodeNow = null;
+  if (decoding.length) {
+    decodeNow = decoding.reduce((a, s) => a + (s.decode_tps || s.decode_avg_tps), 0);
+    setText("decode-label", "Decode speed");
+    setValue("decode", n1(decodeNow), "tok/s");
+    const s = decoding[0];
+    setText("decode-note", "average " + n1(s.decode_avg_tps) + " tok/s over " + nf.format(s.gen_tokens) + " tokens");
+  } else if (recent && recent.decode_s > 0 && recent.gen_tokens > 0) {
+    setText("decode-label", "Decode speed, last reply");
+    setValue("decode", n1(recent.gen_tokens / recent.decode_s), "tok/s");
+    setText("decode-note", nf.format(recent.gen_tokens) + " tokens in " + fmtDur(recent.decode_s) + ", " + fmtAgo(recent.ago_s));
+  } else {
+    setText("decode-label", "Decode speed");
+    setValue("decode", "–", "tok/s");
+    setText("decode-note", "no reply yet");
+  }
+
+  /* prefill speed */
+  if (prefilling.length) {
+    const s = prefilling[0];
+    const v = s.prefill_avg_tps || s.prefill_tps;
+    setValue("prefill", v > 0 ? nf.format(Math.round(v)) : "–", "tok/s");
+    setText("prefill-note", nf.format(s.prefill_done) + " of " + nf.format(s.prefill_total) + " new tokens");
+  } else if (recent && recent.prompt_tokens > recent.cached_tokens && recent.prefill_s > 0.05) {
+    const fresh = recent.prompt_tokens - recent.cached_tokens;
+    setValue("prefill", nf.format(Math.round(fresh / recent.prefill_s)), "tok/s");
+    setText("prefill-note", "last prompt: " + nf.format(fresh) + " new tokens in " + fmtDur(recent.prefill_s));
+  } else {
+    setValue("prefill", "–");
+    setText("prefill-note", recent ? "last prompt came from the cache" : "no prompt yet");
+  }
+
+  /* MTP */
+  if (!srv.mtp) {
+    setValue("mtp", "Off");
+    setText("mtp-note", "start with --mtp to draft tokens");
+  } else {
+    const src = decoding[0] || (recent && { spec_cycles: recent.spec_cycles, spec_accepted: recent.spec_accepted });
+    const tps = src ? tokensPerStep(src.spec_cycles, src.spec_accepted) : null;
+    if (tps) {
+      setValue("mtp", tps.toFixed(2));
+      setText("mtp-note", nf.format(src.spec_accepted) + " drafts accepted in " + nf.format(src.spec_cycles) + " steps" + (decoding.length ? "" : ", last reply"));
+    } else {
+      setValue("mtp", "–");
+      setText("mtp-note", "plain decoding (sampled replies do not draft)");
+    }
+  }
+
+  /* GPU */
+  const g = m.gpu;
+  if (g) {
+    setValue("gpu", String(g.util_pct), "%");
+    setMeter("gpu-meter", g.util_pct / 100);
+    const limit = g.wired_limit || g.ram;
+    setValue("mem", n1(g.in_use / GiB), "GiB");
+    setMeter("mem-meter", limit ? g.in_use / limit : 0, 0.97, 0.99);
+    setText("mem-note", limit ? "of " + n1(limit / GiB) + " GiB GPU limit" : "GPU limit unknown");
+  } else {
+    setValue("gpu", "–"); setValue("mem", "–");
+    setText("mem-note", "not available on this backend");
+  }
+
+  renderRequests(active, srv.ctx);
+  renderRecent(m.recent);
+  const t = m.totals;
+  const cachedPct = t.prompt_tokens ? Math.round(100 * t.cached_tokens / t.prompt_tokens) : 0;
+  setText("totals", nf.format(t.requests) + " requests · " + fmtTokens(t.prompt_tokens) + " prompt tokens (" + cachedPct +
+          "% from the cache) · " + fmtTokens(t.gen_tokens) + " generated · busy " + fmtDur(t.busy_s) +
+          (t.cancelled ? " · " + t.cancelled + " cancelled" : ""));
+
+  samples.push({ t: Date.now() / 1000, decode: decodeNow, gpu: g ? g.util_pct : null });
+  const cutoff = Date.now() / 1000 - WINDOW_S;
+  while (samples.length && samples[0].t < cutoff) samples.shift();
+  charts.forEach((c) => c.draw());
+  last = m;
+}
+
+function renderRequests(active, ctx) {
+  const box = $("requests");
+  box.replaceChildren();
+  for (const s of active) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const h = document.createElement("h2");
+    const flags = [s.api, s.tools ? "tools" : "", s.thinking ? "thinking" : ""].filter(Boolean).join(" · ");
+    h.textContent = "Request" + (active.length > 1 ? " in session " + s.id : "") + " · " + flags;
+    card.appendChild(h);
+    const row = document.createElement("div");
+    row.className = "row";
+    const add = (label, value) => {
+      const span = document.createElement("span");
+      span.append(label + " ");
+      const b = document.createElement("b"); b.textContent = value; span.appendChild(b);
+      row.appendChild(span);
+    };
+    add("prompt", nf.format(s.prompt_tokens));
+    add("cached", nf.format(s.cached_tokens));
+    if (s.phase === "prefill") add("prefilled", nf.format(s.prefill_done) + " / " + nf.format(s.prefill_total));
+    else add("prefill", fmtDur(s.prefill_s));
+    if (s.phase === "decode") add("generated", nf.format(s.gen_tokens) + " / " + nf.format(s.max_tokens));
+    add("context", fmtTokens(s.prompt_tokens + (s.gen_tokens || 0)) + " of " + fmtTokens(ctx));
+    add("elapsed", fmtDur(s.elapsed_s));
+    card.appendChild(row);
+    const meter = document.createElement("div");
+    meter.className = "meter";
+    const fill = document.createElement("b");
+    const frac = s.phase === "prefill" ? (s.prefill_total ? s.prefill_done / s.prefill_total : 0)
+                                       : (s.max_tokens ? s.gen_tokens / s.max_tokens : 0);
+    fill.style.width = (100 * Math.min(1, frac)).toFixed(1) + "%";
+    meter.appendChild(fill);
+    meter.setAttribute("role", "progressbar");
+    meter.setAttribute("aria-label", s.phase === "prefill" ? "prefill progress" : "output budget used");
+    meter.setAttribute("aria-valuenow", String(Math.round(100 * frac)));
+    card.appendChild(meter);
+    box.appendChild(card);
+  }
+}
+
+function renderRecent(list) {
+  const body = $("recent");
+  body.replaceChildren();
+  if (!list.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 9; td.className = "empty"; td.style.textAlign = "left";
+    td.textContent = "No finished requests yet.";
+    tr.appendChild(td); body.appendChild(tr);
+    return;
+  }
+  for (const r of list) {
+    const fresh = r.prompt_tokens - r.cached_tokens;
+    const tps = tokensPerStep(r.spec_cycles, r.spec_accepted);
+    const cells = [
+      fmtAgo(r.ago_s),
+      r.api + (r.tools ? " · tools" : "") + (r.cancelled ? " · cancelled" : ""),
+      nf.format(r.prompt_tokens),
+      r.prompt_tokens ? Math.round(100 * r.cached_tokens / r.prompt_tokens) + "%" : "–",
+      fresh > 0 && r.prefill_s > 0.05 ? nf.format(Math.round(fresh / r.prefill_s)) : "–",
+      nf.format(r.gen_tokens),
+      r.decode_s > 0 && r.gen_tokens > 0 ? n1(r.gen_tokens / r.decode_s) : "–",
+      tps ? tps.toFixed(2) : "–",
+      fmtDur(r.prefill_s + r.decode_s),
+    ];
+    const tr = document.createElement("tr");
+    for (const c of cells) { const td = document.createElement("td"); td.textContent = c; tr.appendChild(td); }
+    body.appendChild(tr);
+  }
+}
+
+/* One single-series line chart: 2px line, 10% area wash, hairline grid,
+ * crosshair + tooltip that snaps to the nearest sample. */
+function lineChart(rootId, key, fixedMax, unit) {
+  const root = $(rootId), svg = root.querySelector("svg"), tip = root.querySelector(".tip");
+  const details = root.querySelector("details"), tbody = root.querySelector("tbody");
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (name, attrs) => { const e = document.createElementNS(NS, name); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+  const pad = { l: 36, r: 12, t: 10, b: 22 };
+  let geom = null, hoverX = null;
+
+  function niceMax(v) {
+    if (fixedMax) return fixedMax;
+    const raw = Math.max(v, 10) * 1.1;
+    const step = Math.pow(10, Math.floor(Math.log10(raw)));
+    for (const k of [1, 2, 2.5, 5, 10]) if (k * step >= raw) return k * step;
+    return 10 * step;
+  }
+
+  function draw() {
+    const w = svg.clientWidth || 300, h = svg.clientHeight || 160;
+    svg.setAttribute("viewBox", "0 0 " + w + " " + h);
+    svg.replaceChildren();
+    const now = Date.now() / 1000;
+    const pts = samples.filter((s) => s[key] !== null && s[key] !== undefined);
+    const ymax = niceMax(pts.reduce((a, s) => Math.max(a, s[key]), 0));
+    const x = (t) => pad.l + (w - pad.l - pad.r) * (1 - (now - t) / WINDOW_S);
+    const y = (v) => pad.t + (h - pad.t - pad.b) * (1 - v / ymax);
+    geom = { x, y, w, h, now };
+    for (let i = 0; i <= 4; i++) {
+      const v = ymax * i / 4, yy = y(v);
+      svg.appendChild(el("line", { x1: pad.l, x2: w - pad.r, y1: yy, y2: yy, stroke: i ? "var(--grid)" : "var(--axis)", "stroke-width": 1 }));
+      const lab = el("text", { x: pad.l - 6, y: yy + 4, "text-anchor": "end", "font-size": 11, fill: "var(--muted)" });
+      lab.textContent = Number.isInteger(v) ? String(v) : v.toFixed(1);
+      lab.style.fontVariantNumeric = "tabular-nums";
+      svg.appendChild(lab);
+    }
+    for (const [s, label] of [[WINDOW_S, "5 min ago"], [WINDOW_S / 2, "2.5 min"], [0, "now"]]) {
+      const lab = el("text", { x: x(now - s), y: h - 6, "font-size": 11, fill: "var(--muted)",
+                                "text-anchor": s === WINDOW_S ? "start" : s === 0 ? "end" : "middle" });
+      lab.textContent = label;
+      svg.appendChild(lab);
+    }
+    /* runs of consecutive samples; a gap (not decoding) breaks the line */
+    const runs = [];
+    let run = [];
+    for (const s of samples) {
+      if (s[key] === null || s[key] === undefined) { if (run.length) runs.push(run); run = []; }
+      else run.push(s);
+    }
+    if (run.length) runs.push(run);
+    for (const r of runs) {
+      const d = r.map((s, i) => (i ? "L" : "M") + x(s.t).toFixed(1) + " " + y(s[key]).toFixed(1)).join(" ");
+      if (r.length > 1) {
+        const area = d + " L" + x(r[r.length - 1].t).toFixed(1) + " " + y(0) + " L" + x(r[0].t).toFixed(1) + " " + y(0) + " Z";
+        svg.appendChild(el("path", { d: area, fill: "var(--series)", "fill-opacity": 0.1, stroke: "none" }));
+        svg.appendChild(el("path", { d, fill: "none", stroke: "var(--series)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      } else {
+        svg.appendChild(el("circle", { cx: x(r[0].t), cy: y(r[0][key]), r: 4, fill: "var(--series)", stroke: "var(--surface)", "stroke-width": 2 }));
+      }
+    }
+    const lastPt = pts[pts.length - 1];
+    if (lastPt && now - lastPt.t < 3) {
+      svg.appendChild(el("circle", { cx: x(lastPt.t), cy: y(lastPt[key]), r: 4, fill: "var(--series)", stroke: "var(--surface)", "stroke-width": 2 }));
+    }
+    if (hoverX !== null) showTip(hoverX);
+    if (details.open) fillTable();
+  }
+
+  function nearest(px) {
+    if (!geom) return null;
+    let best = null, bd = Infinity;
+    for (const s of samples) {
+      const d = Math.abs(geom.x(s.t) - px);
+      if (d < bd) { bd = d; best = s; }
+    }
+    return bd < 24 ? best : null;
+  }
+
+  function showTip(px) {
+    const s = nearest(px);
+    const old = svg.querySelector(".xhair");
+    if (old) old.remove();
+    const oldDot = svg.querySelector(".xdot");
+    if (oldDot) oldDot.remove();
+    if (!s) { tip.style.display = "none"; return; }
+    const xx = geom.x(s.t);
+    svg.appendChild(el("line", { class: "xhair", x1: xx, x2: xx, y1: pad.t, y2: geom.h - pad.b, stroke: "var(--axis)", "stroke-width": 1 }));
+    const v = s[key];
+    if (v !== null && v !== undefined) {
+      svg.appendChild(el("circle", { class: "xdot", cx: xx, cy: geom.y(v), r: 4, fill: "var(--series)", stroke: "var(--surface)", "stroke-width": 2 }));
+    }
+    tip.replaceChildren();
+    const strong = document.createElement("strong");
+    strong.textContent = v === null || v === undefined ? "not decoding" : (unit === "%" ? v + "%" : n1(v) + " " + unit);
+    const when = document.createElement("span");
+    when.textContent = fmtAgo(Date.now() / 1000 - s.t);
+    tip.append(strong, when);
+    tip.style.display = "block";
+    const box = root.getBoundingClientRect(), sb = svg.getBoundingClientRect();
+    const left = sb.left - box.left + xx * sb.width / geom.w;
+    tip.style.left = Math.max(8, Math.min(box.width - tip.offsetWidth - 8, left + 12)) + "px";
+    tip.style.top = (sb.top - box.top + 8) + "px";
+  }
+
+  function fillTable() {
+    tbody.replaceChildren();
+    const rows = samples.slice(-30).reverse();
+    for (const s of rows) {
+      const tr = document.createElement("tr");
+      const v = s[key];
+      for (const c of [fmtAgo(Date.now() / 1000 - s.t), "", v === null || v === undefined ? "–" : (unit === "%" ? String(v) : n1(v))]) {
+        const td = document.createElement("td"); td.textContent = c; tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+  }
+
+  const move = (ev) => {
+    const r = svg.getBoundingClientRect();
+    hoverX = (ev.clientX - r.left) * (geom ? geom.w / r.width : 1);
+    showTip(hoverX);
+  };
+  svg.addEventListener("pointermove", move);
+  svg.addEventListener("pointerdown", move);
+  svg.addEventListener("pointerleave", () => { hoverX = null; showTip(-1e9); });
+  details.addEventListener("toggle", () => { if (details.open) fillTable(); });
+  return { draw };
+}
+
+const charts = [
+  lineChart("chart-decode", "decode", 0, "tok/s"),
+  lineChart("chart-gpu", "gpu", 100, "%"),
+];
+window.addEventListener("resize", () => charts.forEach((c) => c.draw()));
+
+async function poll() {
+  try {
+    const r = await fetch("/dashboard/metrics", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const m = await r.json();
+    document.body.classList.remove("stale");
+    render(m);
+  } catch (e) {
+    document.body.classList.add("stale");
+    const pill = $("pill");
+    pill.dataset.phase = "down";
+    setText("phase", "Server not reachable");
+  }
+  setTimeout(poll, POLL_MS);
+}
+poll();
+</script>
+</body>
+</html>

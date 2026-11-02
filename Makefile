@@ -28,7 +28,7 @@ DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework IOSurface
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework IOSurface -framework IOKit
 CORE_OBJS = $(OBJDIR)/ds4.o $(OBJDIR)/ds4_image.o $(OBJDIR)/ds4_distributed.o $(OBJDIR)/ds4_tp.o $(OBJDIR)/ds4_ssd.o $(OBJDIR)/ds4_metal.o $(OBJDIR)/ds4_layer_pack.o $(OBJDIR)/ds4_engram.o $(OBJDIR)/ds4_quants.o
 CPU_CORE_OBJS = $(OBJDIR)/ds4_cpu.o $(OBJDIR)/ds4_image.o $(OBJDIR)/ds4_distributed.o $(OBJDIR)/ds4_tp.o $(OBJDIR)/ds4_ssd.o $(OBJDIR)/ds4_layer_pack.o $(OBJDIR)/ds4_quants.o
 else
@@ -587,8 +587,14 @@ $(OBJDIR)/ds4_prompt_prefix.o: src/ds4_prompt_prefix.c src/ds4_prompt_prefix.h s
 $(OBJDIR)/ds4_gpu_args.o: src/ds4_gpu_args.c src/ds4_gpu_args.h src/ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -c -o $@ src/ds4_gpu_args.c
 
-$(OBJDIR)/ds4_server.o: src/ds4_server.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_help.h src/ds4_kvstore.h src/rax.h
-	$(CC) $(CFLAGS) -c -o $@ src/ds4_server.c
+# The live metrics page, as a C string literal: backslashes, quotes and question
+# marks (no trigraphs under -std=c99) escaped, one literal per line.
+$(OBJDIR)/ds4_dashboard_html.h: src/ds4_dashboard.html
+	@mkdir -p $(OBJDIR)
+	sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/?/\\?/g' -e 's/^/"/' -e 's/$$/\\n"/' $< > $@
+
+$(OBJDIR)/ds4_server.o: src/ds4_server.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_help.h src/ds4_kvstore.h src/rax.h $(OBJDIR)/ds4_dashboard_html.h
+	$(CC) $(CFLAGS) -I$(OBJDIR) -c -o $@ src/ds4_server.c
 
 $(OBJDIR)/ds4_bench.o: src/ds4_bench.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ src/ds4_bench.c
@@ -608,8 +614,8 @@ $(OBJDIR)/ds4_web.o: src/ds4_web.c src/ds4_web.h
 $(OBJDIR)/ds4_kvstore.o: src/ds4_kvstore.c src/ds4_kvstore.h src/ds4.h src/ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ src/ds4_kvstore.c
 
-$(OBJDIR)/ds4_test.o: tests/ds4_test.c src/ds4_server.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_help.h src/ds4_kvstore.h src/rax.h
-	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
+$(OBJDIR)/ds4_test.o: tests/ds4_test.c src/ds4_server.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_help.h src/ds4_kvstore.h src/rax.h $(OBJDIR)/ds4_dashboard_html.h
+	$(CC) $(CFLAGS) -I$(OBJDIR) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 $(OBJDIR)/ds4_agent_test.o: tests/ds4_agent_test.c src/ds4_agent.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_tp.h src/ds4_help.h src/ds4_prompt_prefix.h src/ds4_kvstore.h src/ds4_web.h src/linenoise.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_agent_test.c
@@ -632,8 +638,8 @@ $(OBJDIR)/ds4_cli_cpu.o: src/ds4_cli.c src/ds4.h src/ds4_ssd.h src/ds4_distribut
 $(OBJDIR)/ds4_gpu_args_cpu.o: src/ds4_gpu_args.c src/ds4_gpu_args.h src/ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ src/ds4_gpu_args.c
 
-$(OBJDIR)/ds4_server_cpu.o: src/ds4_server.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_help.h src/ds4_kvstore.h src/rax.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ src/ds4_server.c
+$(OBJDIR)/ds4_server_cpu.o: src/ds4_server.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_help.h src/ds4_kvstore.h src/rax.h $(OBJDIR)/ds4_dashboard_html.h
+	$(CC) $(CFLAGS) -I$(OBJDIR) -DDS4_NO_GPU -c -o $@ src/ds4_server.c
 
 $(OBJDIR)/ds4_bench_cpu.o: src/ds4_bench.c src/ds4.h src/ds4_ssd.h src/ds4_distributed.h src/ds4_help.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ src/ds4_bench.c

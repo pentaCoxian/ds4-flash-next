@@ -28,6 +28,14 @@ relative runtime files such as Metal kernels can be found.
 | `POST /v1/responses` | Responses-style requests and continuations |
 | `POST /v1/completions` | Text completions |
 | `POST /v1/messages` | Anthropic-style messages |
+| `GET /dashboard` | Live metrics page |
+| `GET /dashboard/metrics` | The same metrics as JSON |
+
+The dashboard shows each session's request as it runs (prefill progress and
+speed, decode speed, MTP tokens per step, context), the last 32 finished
+requests, totals since start, and on Metal the GPU's load and memory. The GPU
+load is system-wide, so other applications' GPU work shows up there too. It
+keeps no prompt or output text, and it is reachable wherever the API is.
 
 The Flash and PRO names accepted by the model endpoints are compatibility
 aliases, not separate loaded models. The GGUF passed at startup selects the model.

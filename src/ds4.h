@@ -601,6 +601,7 @@ bool ds4_session_anchor_save(ds4_session *s);
 int ds4_session_anchor_pos(const ds4_session *s);
 bool ds4_session_anchor_restore(ds4_session *s);
 int ds4_session_pos(ds4_session *s);
+void ds4_session_spec_stats(const ds4_session *s, uint64_t *cycles, uint64_t *accepted);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);

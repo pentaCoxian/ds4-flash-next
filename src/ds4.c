@@ -87559,6 +87559,22 @@ int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
 }
 
+/* Speculative decoding so far on this session (Qwen3.8 MTP): verify cycles
+ * and accepted drafts, both zero for other models and plain decoding. */
+void ds4_session_spec_stats(const ds4_session *s, uint64_t *cycles, uint64_t *accepted) {
+    uint64_t c = 0, a = 0;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_QWEN4_GPU)
+    if (s) {
+        c = s->qwen4_spec_cycles;
+        a = s->qwen4_spec_accepted;
+    }
+#else
+    (void)s;
+#endif
+    if (cycles) *cycles = c;
+    if (accepted) *accepted = a;
+}
+
 bool ds4_session_checkpoint_valid(const ds4_session *s) {
     return s && s->checkpoint_valid;
 }
