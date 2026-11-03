@@ -76381,6 +76381,10 @@ static int qwen4_spec_depth(ds4_session *s) {
     const uint64_t every = qwen4_spec_policy_ratio() ? 32u : 128u;
     if (three && n - s->qwen4_cycle_last[3] >= every) return 3;
     if (n - s->qwen4_cycle_last[2] >= every) return 2;
+    /* the first 3-row cycle runs as soon as a 2-row one has been timed: the
+     * M3 Max's ratio otherwise prices it until the probe 128 cycles on (a
+     * V100's int8 rows add 17%, not 37%, and a reply ended before) */
+    if (three && s->qwen4_ratio3 <= 0.0 && s->qwen4_cycle_cost[2] > 0.0) return 3;
     /* A plain step pays for its own next draft, so on an M3 Max it beat a
      * 2-row cycle only below p1 = 0.09, and choosing it on noisy costs lost
      * more than it gained: the default never decodes plainly.  Three rows
@@ -76412,8 +76416,10 @@ static bool qwen4_spec_chain(ds4_session *s, int depth) {
         const double r = (c3 + (s->qwen4_chain_cost > 0.0 ? s->qwen4_chain_cost : 0.07 * c2)) / c2;
         return r < 2.0 && s->qwen4_draft_p > (r - 1.0) / (2.0 - r);
     }
-    /* the next 3-row cycle runs at least every 128 cycles, so chain for it */
+    /* the next 3-row cycle runs at least every 128 cycles, and the first one
+     * once a 2-row cycle has been timed, so chain for them */
     if (s->qwen4_cycle_count - s->qwen4_cycle_last[3] >= 127u) return true;
+    if (s->qwen4_ratio3 <= 0.0 && s->qwen4_cycle_cost[2] > 0.0) return true;
     /* Chain when the third row's expected token, taking the chained drafts'
      * acceptance at this p1, beats what the chain and the extra verify time
      * would commit at the session's rate (an unpromising p2 then still

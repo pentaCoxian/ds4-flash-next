@@ -1153,6 +1153,20 @@ __device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8
     }
 }
 
+/* The int8 sums with every rounding spelled out: fast math may contract a
+ * product and a sum into an FMA in one instantiation of a kernel and not in
+ * another (a row alone, or among a verify's), and a verify row would no
+ * longer get plain decode's bits.  A group's term is d*dot, less m*sum(x)
+ * for the K-quants' minimum. */
+template<unsigned TYPE>
+__device__ __forceinline__ float q8_term(float d, int dot, float m, int sx) {
+    if (TYPE == 12 || TYPE == 13) return __fmaf_rn(d, (float)dot, __fmul_rn(-m, (float)sx));
+    return __fmul_rn(d, (float)dot);
+}
+__device__ __forceinline__ float q8_halves(float d0, int p0, float d1, int p1) {
+    return __fmaf_rn(d0, (float)p0, __fmul_rn(d1, (float)p1));
+}
+
 /* Round rows of n activations (n a multiple of 32) to int8 with a scale per
  * 32: one warp per 32 values.  The divisions are IEEE ones, which fast math
  * would not give: a value then rounds the same on every GPU and in the
@@ -1233,7 +1247,7 @@ __device__ __forceinline__ void doti_rows(float (&acc)[NR][ROWS], const char *co
                 for (unsigned i = 0; i < NR; i++) {
                     const int p0 = __dp4a(q[i][0], xa.x, __dp4a(q[i][1], xa.y, __dp4a(q[i][2], xa.z, __dp4a(q[i][3], xa.w, 0))));
                     const int p1 = __dp4a(q[i][4], xb.x, __dp4a(q[i][5], xb.y, __dp4a(q[i][6], xb.z, __dp4a(q[i][7], xb.w, 0))));
-                    acc[i][j] += s * (d0[i] * (float)p0 + d1[i] * (float)p1);
+                    acc[i][j] = __fmaf_rn(s, q8_halves(d0[i], p0, d1[i], p1), acc[i][j]);
                 }
             }
         } else {
@@ -1260,34 +1274,27 @@ __device__ __forceinline__ void doti_rows(float (&acc)[NR][ROWS], const char *co
                     float a = 0;
                     #pragma unroll
                     for (unsigned o = 0; o < CH; o++)
-                        a += d[i][o] * (float)__dp4a(w0[i][o], x[o].x, __dp4a(w1[i][o], x[o].y, 0)) - m[i][o] * (float)sx[o];
-                    acc[i][j] += s * a;
+                        a = __fadd_rn(a, q8_term<TYPE>(d[i][o], __dp4a(w0[i][o], x[o].x, __dp4a(w1[i][o], x[o].y, 0)),
+                                                       m[i][o], sx[o]));
+                    acc[i][j] = __fmaf_rn(s, a, acc[i][j]);
                 }
             }
         }
     }
 }
 
-/* the expert rows' geometry: the gate and up rows of one output together;
- * four down rows of 640 weights a warp; the codebook types' gate and up
- * rows 32 weights a lane and step.  None depends on the batch. */
-template<unsigned TYPE, bool DOWN> struct moe_geometry {
-    static constexpr unsigned NR = DOWN ? 4 : 2;
-    static constexpr unsigned CH = !DOWN && iq_codebook(TYPE) ? 4 : 1;
+/* the expert rows' geometry: the gate and up rows of one output together,
+ * the codebook types' 32 weights a lane and step; a down row of 640
+ * weights four lanes, eight rows a warp (moe_quad_q8).  None depends on
+ * the batch. */
+template<unsigned TYPE> struct moe_geometry {
+    static constexpr unsigned CH = iq_codebook(TYPE) ? 4 : 1;
 };
 
-template<unsigned TYPE, unsigned ROWS, unsigned NR>
-__device__ __forceinline__ void moe_rows_q8(float (&acc)[NR][ROWS], const char *const (&r)[NR], const int8_t *xq,
-        const float *xd, const unsigned (&xr)[ROWS], unsigned mask, unsigned K, bool down,
-        const void *grid_table = NULL, const uint8_t *sign_table = NULL) {
-    if (down) doti_rows<TYPE, ROWS, NR, moe_geometry<TYPE, true>::CH>(acc, r, xq, xd, xr, mask, K, grid_table, sign_table);
-    else doti_rows<TYPE, ROWS, NR, moe_geometry<TYPE, false>::CH>(acc, r, xq, xd, xr, mask, K, grid_table, sign_table);
-}
-
-template<unsigned ROWS, unsigned NR>
-__device__ __forceinline__ void moe_rows_q8_any(float (&acc)[NR][ROWS], const char *const (&r)[NR], const int8_t *xq,
-        const float *xd, const unsigned (&xr)[ROWS], unsigned mask, unsigned K, bool down, unsigned type) {
-#define QWEN_ROWS_Q8(TYPE) case TYPE: moe_rows_q8<TYPE, ROWS, NR>(acc, r, xq, xd, xr, mask, K, down); break;
+template<unsigned ROWS>
+__device__ __forceinline__ void moe_rows_q8_any(float (&acc)[1][ROWS], const char *const (&r)[1], const int8_t *xq,
+        const float *xd, const unsigned (&xr)[ROWS], unsigned mask, unsigned K, unsigned type) {
+#define QWEN_ROWS_Q8(TYPE) case TYPE: doti_rows<TYPE, ROWS, 1, moe_geometry<TYPE>::CH>(acc, r, xq, xd, xr, mask, K); break;
     switch (type) {
     QWEN_ROWS_Q8(6) QWEN_ROWS_Q8(8) QWEN_ROWS_Q8(11) QWEN_ROWS_Q8(12) QWEN_ROWS_Q8(13) QWEN_ROWS_Q8(14)
     QWEN_ROWS_Q8(16) QWEN_ROWS_Q8(17) QWEN_ROWS_Q8(18) QWEN_ROWS_Q8(20) QWEN_ROWS_Q8(21) QWEN_ROWS_Q8(22)
@@ -1295,6 +1302,56 @@ __device__ __forceinline__ void moe_rows_q8_any(float (&acc)[NR][ROWS], const ch
     default: break;
     }
 #undef QWEN_ROWS_Q8
+}
+
+/* A down row with four lanes, each every fourth sub-block of 32 weights
+ * (five of a 640-weight row): a warp of 32 lanes over one such row leaves
+ * a third of them idle and gives each a short chain of loads; with eight
+ * rows a warp each lane decodes five independent sub-blocks (Q2_0 down rows
+ * of a three-row verify: 41 us to 34 in isolation).  The caller adds the
+ * four lanes' sums. */
+template<unsigned TYPE, unsigned ROWS>
+__device__ __forceinline__ void moe_quad_q8(float (&acc)[ROWS], const char *r, const int8_t *xq, const float *xd,
+        const unsigned (&xr)[ROWS], unsigned mask, unsigned K,
+        const void *grid_table = NULL, const uint8_t *sign_table = NULL) {
+    for (unsigned c = threadIdx.x & 3; c < K / 32; c += 4) {
+        int q[8];
+        float d[4], m[4] = {};
+        if constexpr (grouped_i32(TYPE)) {
+            group32i<TYPE>(r, c, q, d[0], d[2], grid_table, sign_table);
+            d[1] = d[0];
+            d[3] = d[2];
+        } else {
+            #pragma unroll
+            for (unsigned o = 0; o < 4; o++) group8i<TYPE>(r, 4 * c + o, q[2 * o], q[2 * o + 1], d[o], m[o], grid_table, sign_table);
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < ROWS; j++) if (mask >> j & 1) {
+            const int8_t *xt = xq + (uint64_t)xr[j] * K + 32 * c;
+            const int4 xa = *(const int4 *)xt, xb = *(const int4 *)(xt + 16);
+            const int x[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+            float a = 0;
+            #pragma unroll
+            for (unsigned o = 0; o < 4; o++) {
+                const int sx = TYPE == 12 || TYPE == 13 ? __dp4a(0x01010101, x[2 * o], __dp4a(0x01010101, x[2 * o + 1], 0)) : 0;
+                a = __fadd_rn(a, q8_term<TYPE>(d[o], __dp4a(q[2 * o], x[2 * o], __dp4a(q[2 * o + 1], x[2 * o + 1], 0)), m[o], sx));
+            }
+            acc[j] = __fmaf_rn(xd[(uint64_t)xr[j] * (K / 32) + c], a, acc[j]);
+        }
+    }
+}
+
+template<unsigned ROWS>
+__device__ __forceinline__ void moe_quad_q8_any(float (&acc)[ROWS], const char *r, const int8_t *xq, const float *xd,
+        const unsigned (&xr)[ROWS], unsigned mask, unsigned K, unsigned type) {
+#define QWEN_QUAD_Q8(TYPE) case TYPE: moe_quad_q8<TYPE, ROWS>(acc, r, xq, xd, xr, mask, K); break;
+    switch (type) {
+    QWEN_QUAD_Q8(6) QWEN_QUAD_Q8(8) QWEN_QUAD_Q8(11) QWEN_QUAD_Q8(12) QWEN_QUAD_Q8(13) QWEN_QUAD_Q8(14)
+    QWEN_QUAD_Q8(16) QWEN_QUAD_Q8(17) QWEN_QUAD_Q8(18) QWEN_QUAD_Q8(20) QWEN_QUAD_Q8(21) QWEN_QUAD_Q8(22)
+    QWEN_QUAD_Q8(23) QWEN_QUAD_Q8(42)
+    default: break;
+    }
+#undef QWEN_QUAD_Q8
 }
 
 /* The expert kernels stage the IQ types' codebooks in shared memory: a
@@ -1324,15 +1381,15 @@ __device__ __forceinline__ void stage_iq_grid(uint8_t *grid, uint8_t *signs) {
  * of (rows, slot, token) finds the pairs of its expert with a ballot over
  * the selection; only the first token's block computes them, the others
  * leave at once.  The shared expert's block of token 0 computes every
- * token.  A warp takes RW rows.  64 registers (a few spilled in the shared
- * slot's switch) keep 32 warps an SM; at 96 to 136 the rows waited on
- * memory 10% longer. */
+ * token.  A gate/up warp takes one row of each, a down warp eight rows.
+ * 64 registers (a few spilled in the shared slot's switch) keep 32 warps
+ * an SM; at 96 to 136 the rows waited on memory 10% longer. */
 template<unsigned TYPE, bool DOWN, unsigned ROWS>
 __global__ void __launch_bounds__(128, 8) moe_mv_q8(float *out, const int8_t *xq, const float *xd, const int *selected,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
         unsigned shared_type, unsigned shared_up_type, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M,
         uint64_t rb, uint64_t srb, uint64_t surb) {
-    constexpr unsigned NR = moe_geometry<TYPE, DOWN>::NR, RW = DOWN ? NR : 1;
+    constexpr unsigned RW = DOWN ? 8 : 1;
     const unsigned lane = threadIdx.x & 31, row0 = (blockIdx.x * 4 + threadIdx.x / 32) * RW, slot = blockIdx.y, t = blockIdx.z;
     const bool shared = slot == NS;
     const unsigned stride = NS + (shared_type != UINT_MAX), n = T * NS;
@@ -1369,43 +1426,39 @@ __global__ void __launch_bounds__(128, 8) moe_mv_q8(float *out, const int8_t *xq
     unsigned xr[ROWS];
     #pragma unroll
     for (unsigned j = 0; j < ROWS; j++) xr[j] = DOWN ? j * stride + ((slots >> (4 * j)) & 15) : j;
-    float a[NR][ROWS] = {};
     if constexpr (DOWN) {
-        /* rows past M (M % RW) repeat the last one and are not stored */
-        const char *r[NR];
+        /* rows past M (M % 8) repeat the last one and are not stored */
+        const unsigned mine_row = row0 + lane / 4, row = min(mine_row, M - 1);
+        float a[ROWS] = {};
+        if (shared) moe_quad_q8_any<ROWS>(a, sh0 + row * srb, xq, xd, xr, mask, K, shared_type);
+        else if (valid) moe_quad_q8<TYPE, ROWS>(a, w0 + ((uint64_t)e * M + row) * rb, xq, xd, xr, mask, K,
+                                                grid_table, sign_table);
         #pragma unroll
-        for (unsigned i = 0; i < NR; i++) {
-            const unsigned row = min(row0 + i, M - 1);
-            r[i] = shared ? sh0 + row * srb : w0 + ((uint64_t)e * M + row) * rb;
+        for (unsigned j = 0; j < ROWS; j++) if (mask >> j & 1) {
+            float v = a[j];
+            v += __shfl_xor_sync(0xffffffff, v, 1);
+            v += __shfl_xor_sync(0xffffffff, v, 2);
+            if (!(lane & 3) && mine_row < M) out[((uint64_t)j * stride + ((slots >> (4 * j)) & 15)) * M + mine_row] = v;
         }
-        if (shared) moe_rows_q8_any<ROWS, NR>(a, r, xq, xd, xr, mask, K, true, shared_type);
-        else if (valid) doti_rows<TYPE, ROWS, NR, moe_geometry<TYPE, true>::CH>(a, r, xq, xd, xr, mask, K,
-                                                                                grid_table, sign_table);
-    } else if (shared) {
-        /* the shared gate and up rows may differ in type */
-        float g[1][ROWS] = {}, u[1][ROWS] = {};
-        const char *rg[1] = { sh0 + row0 * srb }, *ru[1] = { sh1 + row0 * surb };
-        moe_rows_q8_any<ROWS, 1>(g, rg, xq, xd, xr, mask, K, false, shared_type);
-        moe_rows_q8_any<ROWS, 1>(u, ru, xq, xd, xr, mask, K, false, shared_up_type);
-        #pragma unroll
-        for (unsigned j = 0; j < ROWS; j++) { a[0][j] = g[0][j]; a[1][j] = u[0][j]; }
-    } else if (valid) {
-        const uint64_t off = ((uint64_t)e * M + row0) * rb;
-        const char *r[2] = { w0 + off, w1 + off };
-        doti_rows<TYPE, ROWS, 2, moe_geometry<TYPE, false>::CH>(a, r, xq, xd, xr, mask, K, grid_table, sign_table);
-    }
-    #pragma unroll
-    for (unsigned j = 0; j < ROWS; j++) if (mask >> j & 1) {
-        const uint64_t pair = (uint64_t)j * stride + ((slots >> (4 * j)) & 15);
-        if constexpr (DOWN) {
+    } else {
+        float a[2][ROWS] = {};
+        if (shared) {
+            /* the shared gate and up rows may differ in type */
+            float g[1][ROWS] = {}, u[1][ROWS] = {};
+            const char *rg[1] = { sh0 + row0 * srb }, *ru[1] = { sh1 + row0 * surb };
+            moe_rows_q8_any<ROWS>(g, rg, xq, xd, xr, mask, K, shared_type);
+            moe_rows_q8_any<ROWS>(u, ru, xq, xd, xr, mask, K, shared_up_type);
             #pragma unroll
-            for (unsigned i = 0; i < NR; i++) {
-                const float v = sum(a[i][j]);
-                if (!lane && row0 + i < M) out[pair * M + row0 + i] = v;
-            }
-        } else {
+            for (unsigned j = 0; j < ROWS; j++) { a[0][j] = g[0][j]; a[1][j] = u[0][j]; }
+        } else if (valid) {
+            const uint64_t off = ((uint64_t)e * M + row0) * rb;
+            const char *r[2] = { w0 + off, w1 + off };
+            doti_rows<TYPE, ROWS, 2, moe_geometry<TYPE>::CH>(a, r, xq, xd, xr, mask, K, grid_table, sign_table);
+        }
+        #pragma unroll
+        for (unsigned j = 0; j < ROWS; j++) if (mask >> j & 1) {
             const float g = sum(a[0][j]), u = sum(a[1][j]);
-            if (!lane) out[pair * M + row0] = silu(g) * u;
+            if (!lane) out[((uint64_t)j * stride + ((slots >> (4 * j)) & 15)) * M + row0] = silu(g) * u;
         }
     }
 }
@@ -1464,13 +1517,13 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K), surb = row_bytes(sut, K);
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
     /* int8 activations where every weight type of the layer has an int8
-     * decoder; a down warp takes four rows */
+     * decoder; a down warp takes eight rows */
     if (act_q8() && T <= 8 && NS < 16 && grouped_i8(type) && (st == UINT_MAX || (grouped_i8(st) && grouped_i8(sut))) &&
         !(K % 32)) {
         const int8_t *xq;
         const float *xd;
         if (!q8_rows(x, down ? T * (NS + (st != UINT_MAX)) : T, K, &xq, &xd)) return 0;
-        const dim3 grid_down((M + 15) / 16, grid.y, grid.z);
+        const dim3 grid_down((M + 31) / 32, grid.y, grid.z);
 #define QWEN_MOE_Q8_ROWS(TYPE, R) \
         if (down) moe_mv_q8<TYPE, true, R><<<grid_down,128,0,cuda_decode_stream()>>>(out,xq,xd,sel,w0,w1,s0,s1,st,sut,NE,T,NS,K,M,rb,srb,surb); \
         else moe_mv_q8<TYPE, false, R><<<grid,128,0,cuda_decode_stream()>>>(out,xq,xd,sel,w0,w1,s0,s1,st,sut,NE,T,NS,K,M,rb,srb,surb)
@@ -2075,7 +2128,7 @@ __global__ void matvec_split_q8(float *out, const char *w, const int8_t *xq, con
                     const int4 xa = *(const int4 *)xt, xb = *(const int4 *)(xt + 16);
                     const int p0 = __dp4a(q[0], xa.x, __dp4a(q[1], xa.y, __dp4a(q[2], xa.z, __dp4a(q[3], xa.w, 0))));
                     const int p1 = __dp4a(q[4], xb.x, __dp4a(q[5], xb.y, __dp4a(q[6], xb.z, __dp4a(q[7], xb.w, 0))));
-                    acc[t] += xd[(uint64_t)t * (K / 32) + c] * (d0 * (float)p0 + d1 * (float)p1);
+                    acc[t] = __fmaf_rn(xd[(uint64_t)t * (K / 32) + c], q8_halves(d0, p0, d1, p1), acc[t]);
                 }
             } else {
                 int w0[CH], w1[CH];
@@ -2091,9 +2144,9 @@ __global__ void matvec_split_q8(float *out, const char *w, const int8_t *xq, con
                     for (unsigned o = 0; o < CH; o++) {
                         const int2 x = *(const int2 *)(xt + 8 * o);
                         const int sx = TYPE == 12 || TYPE == 13 ? __dp4a(0x01010101, x.x, __dp4a(0x01010101, x.y, 0)) : 0;
-                        a += d[o] * (float)__dp4a(w0[o], x.x, __dp4a(w1[o], x.y, 0)) - m[o] * (float)sx;
+                        a = __fadd_rn(a, q8_term<TYPE>(d[o], __dp4a(w0[o], x.x, __dp4a(w1[o], x.y, 0)), m[o], sx));
                     }
-                    acc[t] += s * a;
+                    acc[t] = __fmaf_rn(s, a, acc[t]);
                 }
             }
         }

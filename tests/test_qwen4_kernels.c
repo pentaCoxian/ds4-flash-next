@@ -4481,13 +4481,14 @@ static void test_dense_q8_rows(arena_t *a, uint32_t in_dim, uint32_t rows, uint3
  * by one block, with the bits each token gets alone. */
 static void test_moe_q8_rows(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F, uint32_t T,
                              uint32_t wtype, uint32_t dtype) {
+    const uint32_t sgt = g_moe_sh_gate, sut = g_moe_sh_up, sdt = g_moe_sh_down;
     double *sh;
     const uint64_t gate_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &sh); free(sh);
     const uint64_t up_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &sh); free(sh);
     const uint64_t down_off = arena_tier(a, dtype, (uint64_t)NE * E, F, &sh); free(sh);
-    const uint64_t sg_off = arena_tier(a, 23u, F, E, &sh); free(sh);
-    const uint64_t su_off = arena_tier(a, 21u, F, E, &sh); free(sh);
-    const uint64_t sd_off = arena_tier(a, 20u, E, F, &sh); free(sh);
+    const uint64_t sg_off = arena_tier(a, sgt, F, E, &sh); free(sh);
+    const uint64_t su_off = arena_tier(a, sut, F, E, &sh); free(sh);
+    const uint64_t sd_off = arena_tier(a, sdt, E, F, &sh); free(sh);
     const uint32_t n_out = slots + 1u;
     float *x = rand_vec((uint64_t)T * E, 1.0f);
     int32_t *sel = malloc((uint64_t)T * slots * 4);
@@ -4499,9 +4500,9 @@ static void test_moe_q8_rows(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E
     ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)T * n_out * F);
     ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * n_out * E);
     require_ok(ds4_gpu_qwen4_moe_mid2_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, wtype, NE, T, slots, E, F,
-                                             sg_off, su_off, 23u, 21u), "moe q8 mid");
+                                             sg_off, su_off, sgt, sut), "moe q8 mid");
     require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
-                                             sd_off, 20u), "moe q8 down");
+                                             sd_off, sdt), "moe q8 down");
     float *mid = download(gmid, (uint64_t)T * n_out * F), *part = download(gpart, (uint64_t)T * n_out * E);
     char name[96];
     for (uint32_t t = 0; t < T; t++) {
@@ -4510,11 +4511,11 @@ static void test_moe_q8_rows(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E
         require_ok(ds4_gpu_tensor_write(s1, 0, sel + (uint64_t)t * slots, (uint64_t)slots * 4), "sel row write");
         ds4_gpu_tensor *m1 = upload(NULL, (uint64_t)n_out * F), *p1 = upload(NULL, (uint64_t)n_out * E);
         require_ok(ds4_gpu_qwen4_moe_mid2_tensor(m1, g1, s1, a->base, a->size, gate_off, up_off, wtype, NE, 1, slots, E, F,
-                                                 sg_off, su_off, 23u, 21u), "moe q8 mid row");
+                                                 sg_off, su_off, sgt, sut), "moe q8 mid row");
         /* the lone down rows read the batch's mid row, so the comparison is of the down kernel alone */
         ds4_gpu_tensor *mt = upload(mid + (uint64_t)t * n_out * F, (uint64_t)n_out * F);
         require_ok(ds4_gpu_qwen4_moe_down_tensor(p1, mt, s1, a->base, a->size, down_off, dtype, NE, 1, slots, F, E,
-                                                 sd_off, 20u), "moe q8 down row");
+                                                 sd_off, sdt), "moe q8 down row");
         float *m = download(m1, (uint64_t)n_out * F), *p = download(p1, (uint64_t)n_out * E);
         snprintf(name, sizeof(name), "moe q8 %u/%u NE=%u T=%u row %u: mid", wtype, dtype, NE, T, t);
         require_same_rows(name, mid + (uint64_t)t * n_out * F, m, (uint64_t)n_out * F);
@@ -4543,6 +4544,7 @@ static void test_act_q8(arena_t *a) {
         test_dense_q8_rows(a, 2560, 2560, 3, types[i]);
         test_dense_q8_rows(a, 6144, 2560, 5, types[i]);
         test_dense_q8_rows(a, 2560, 320, 2, types[i]);
+        test_dense_q8_rows(a, 2560, 1280, 3, types[i]);
         a->used = used;
     }
     printf("int8 activations: routed experts\n");
@@ -4556,6 +4558,21 @@ static void test_act_q8(arena_t *a) {
         test_moe_types(a, 8, 6, 256, 256, 8, gate_types[i], 20u);
         test_moe_q8_rows(a, 16, 10, 2560, 640, 3, gate_types[i], 42u);
         test_moe_q8_rows(a, 8, 6, 256, 256, 8, gate_types[i], 20u);
+        a->used = used;
+    }
+    /* down rows without a 32-weight decoder (Q8_0, and Q4_K's minimum) */
+    {
+        const uint64_t used = a->used;
+        test_moe_types(a, 16, 10, 2560, 640, 3, 21u, 8u);
+        test_moe_types(a, 8, 6, 256, 256, 8, 23u, 12u);
+        test_moe_q8_rows(a, 16, 10, 2560, 640, 3, 21u, 8u);
+        test_moe_q8_rows(a, 8, 6, 256, 256, 8, 23u, 12u);
+        g_moe_sh_down = 12u;
+        test_moe_types(a, 8, 6, 256, 256, 3, 21u, 20u);
+        /* the shared gate and up rows as K-quants (Q4_K, Q5_K), as iq3m8 has them */
+        g_moe_sh_gate = 12u; g_moe_sh_up = 13u; g_moe_sh_down = 20u;
+        test_moe_types(a, 16, 10, 2560, 640, 3, 17u, 42u);
+        test_moe_q8_rows(a, 16, 10, 2560, 640, 3, 17u, 42u);
         a->used = used;
     }
     g_moe_sh_gate = sg; g_moe_sh_up = su; g_moe_sh_down = sd;
