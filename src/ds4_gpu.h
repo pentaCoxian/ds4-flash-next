@@ -3528,6 +3528,26 @@ int ds4_gpu_qwen4_idx_block_key_q8_tensor(
 int ds4_gpu_qwen4_idx_block_key_q8_refresh(
         ds4_gpu_tensor *block_key_q8, uint32_t q8_cap, const ds4_gpu_tensor *block_key,
         uint32_t block0, uint32_t n_blocks);
+#if !defined(__APPLE__)
+/* CUDA: the GDN front, scan and n-gram convolution with a third snapshot
+ * point, for a 4-row MTP verify (state after rows 0, 1 and 2) */
+int ds4_gpu_qwen4_gdn_front3_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *mixed, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
+        const void *map, uint64_t size, uint64_t co, uint64_t ao, uint64_t bo, uint64_t so, uint64_t dto,
+        uint32_t type, uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t D, uint32_t CK, uint32_t K,
+        ds4_gpu_tensor *snap, uint32_t st, ds4_gpu_tensor *snap2, uint32_t st2,
+        ds4_gpu_tensor *snap3, uint32_t st3);
+int ds4_gpu_qwen4_gdn_scan3_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+        uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t D,
+        ds4_gpu_tensor *snap, uint32_t st, ds4_gpu_tensor *snap2, uint32_t st2,
+        ds4_gpu_tensor *snap3, uint32_t st3);
+int ds4_gpu_qwen4_ple_conv3_tensor(ds4_gpu_tensor *R, const ds4_gpu_tensor *gated,
+        const ds4_gpu_tensor *normed, ds4_gpu_tensor *history, const void *map, uint64_t size,
+        uint64_t off, uint32_t type, uint32_t T, uint32_t C, uint32_t K, uint32_t dilation,
+        ds4_gpu_tensor *snap, uint32_t st, ds4_gpu_tensor *snap2, uint32_t st2,
+        ds4_gpu_tensor *snap3, uint32_t st3);
+#endif
 /* CUDA: page-lock a host staging buffer (best effort), and release it */
 int ds4_gpu_host_register(void *ptr, uint64_t bytes);
 void ds4_gpu_host_unregister(void *ptr);

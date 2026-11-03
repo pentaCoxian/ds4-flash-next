@@ -205,16 +205,35 @@ partials are cut by each row's own key count.
 That is 47% of the FP16 bytes, about 3 GB less at 262K. The indexer's raw keys
 stay FP32.
 
-**MTP.** MTP drafts up to two tokens, verified as a 2- or 3-row pass chosen
-per cycle by expected tokens per second. After a prefill the MTP layer's
-cache rows for the prompt are filled from the trunk, so drafts attend over
-the real prompt. On a prompt that restates part of its own source, first-draft
-acceptance went from 79% to 87%.
+**MTP.** MTP drafts up to three tokens, verified as a 2-, 3- or 4-row pass
+chosen per cycle by expected tokens per second: the draft probabilities,
+calibrated per session, against the measured cost of each depth. A 4-row
+verify snapshots the recurrent state after rows 0, 1 and 2, and its
+attention runs as two 2-row sub-batches where the rows' block sets differ,
+so greedy output stays identical to plain decode. After a prefill the MTP
+layer's cache rows for the prompt are filled from the trunk, so drafts
+attend over the real prompt. On a prompt that restates part of its own
+source, first-draft acceptance went from 79% to 87%.
+
+With default sampling, a draft is accepted when it is the verify row's
+argmax, and the token after the accepted ones is drawn at once, with the
+caller's settings, and the next drafts follow it (it is the caller's next
+sample). Drafted from the argmax instead, a sample other than it found no
+draft, and 48 of 237 cycles of an explanation at temperature 0.8 ran as
+plain steps.
+
+The drafts score a prefix of the output head, the first 98,304 vocabulary
+rows, which leaves out many CJK tokens. Pass a list of rows instead:
+`DS4_QWEN4_MTP_DRAFT_VOCAB=<file>` (token ids, one a line; the rows are
+copied beside the MTP block). With a 64K list that adds the Japanese,
+Chinese and Korean tokens (`draftvocab-64k-ml`), translation into Japanese
+went from 123 to 140 tok/s and Japanese prose from 84 to 94, with English
+unchanged.
 
 **Lookahead.** Over a layer split each GPU used to idle while the other ran
-its half of a verify. Now, while GPU1 verifies a 3-row window, the MTP chain
-drafts the next three tokens, and GPU0 runs the next window's layers with
-them.
+its half of a verify. Now, while GPU1 verifies a 3- or 4-row window, the MTP
+chain drafts as many next tokens, and GPU0 runs the next window's layers
+with them.
 
 - If the window is accepted whole and its next token is the first of those
   three, the next window is half done.
@@ -297,7 +316,8 @@ scores' scale.
 |---|---|
 | `DS4_QWEN4_LOOKAHEAD=0` | no lookahead |
 | `DS4_QWEN4_MTP_FILL=0` | no MTP cache rows for the prompt |
-| `DS4_QWEN4_MTP_DEPTH=1/2/3` | force the MTP verify depth (`window` for the older rule) |
+| `DS4_QWEN4_MTP_DEPTH=1/2/3/4` | force the MTP verify depth (`window` for the older rule) |
+| `DS4_QWEN4_MTP_DRAFT_VOCAB=<file>` | draft over the listed vocabulary rows (see MTP) |
 | `DS4_QWEN4_KV_F16=1` | FP16 K/V rows |
 | `DS4_QWEN4_KV_Q8=1` | 8-bit K/V rows on newer GPUs too |
 | `DS4_QWEN4_F32_ACT=1` | FP32 decode activations |

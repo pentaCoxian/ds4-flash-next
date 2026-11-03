@@ -4361,6 +4361,64 @@ static void bench_moe_cold(arena_t *a) {
 }
 #endif
 
+#ifndef __APPLE__
+/* QWEN4_MV_BENCH=1: the decode matvec (int8 activations) at the model's
+ * shapes, per weight type, from random weights copied to device memory:
+ * microseconds a call and the weight bytes' rate. */
+static void bench_mv(void) {
+    static const struct { uint32_t type, M, K; const char *what; } cases[] = {
+        { 23, 10240, 2560, "attn_qkv iq4_xs" }, { 12, 10240, 2560, "attn_qkv q4_k" },
+        { 13, 10240, 2560, "attn_qkv q5_k" }, { 14, 10240, 2560, "attn_qkv q6_k" },
+        { 21, 6144, 2560, "attn_gate iq3_s" }, { 23, 6144, 2560, "attn_gate iq4_xs" },
+        { 23, 12288, 2560, "attn_q iq4_xs" }, { 23, 2560, 6144, "ssm_out iq4_xs" },
+        { 14, 2560, 6144, "attn_out q6_k" }, { 12, 640, 2560, "shexp q4_k" },
+        { 20, 2560, 640, "shexp down iq4_nl" }, { 13, 98304, 2560, "draft head q5_k" },
+    };
+    uint64_t need = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        need += (cases[i].type == 12 ? 144 : cases[i].type == 13 ? 176 : cases[i].type == 14 ? 210 :
+                 cases[i].type == 21 ? 110 : cases[i].type == 23 ? 136 : 18 * 8) *
+                (uint64_t)cases[i].M * (cases[i].K / 256) + 4096;
+    arena_t a = { .size = (need + (1u << 20)) & ~0xfffull, .used = 0 };
+    a.base = mmap(NULL, a.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    require_ok(a.base != MAP_FAILED, "mv bench arena");
+    uint64_t r = 0x9e3779b97f4a7c15ull;
+    for (uint64_t i = 0; i < a.size / 8; i++) {   /* random bits, f16 scales kept finite */
+        r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+        ((uint64_t *)a.base)[i] = r & 0x3bff3bff3bff3bffull;
+    }
+    setenv("DS4_CUDA_COPY_MODEL", "1", 1);
+    unsetenv("DS4_QWEN4_F32_ACT");
+    require_ok(ds4_gpu_set_model_map(a.base, a.size), "mv bench map");
+    uint64_t off = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const uint32_t type = cases[i].type, M = cases[i].M, K = cases[i].K;
+        const uint64_t rb = type == 12 ? K / 256 * 144 : type == 13 ? K / 256 * 176 : type == 14 ? K / 256 * 210 :
+                            type == 21 ? K / 256 * 110 : type == 23 ? K / 256 * 136 : K / 32 * 18;
+        const uint64_t bytes = rb * M;
+        float *xv = malloc((uint64_t)8 * K * 4);
+        for (uint64_t j = 0; j < (uint64_t)8 * K; j++) xv[j] = frand();
+        ds4_gpu_tensor *x = upload(xv, (uint64_t)8 * K), *out = upload(NULL, (uint64_t)8 * M);
+        free(xv);
+        for (uint32_t T = 1; T <= 4; T++) {
+            if (T == 2) continue;
+            const int reps = M > 50000 ? 50 : 300;
+            for (int w = 0; w < 20; w++) ds4_gpu_qwen4_dense_mm_tensor(out, x, a.base, a.size, off, type, T, K, M);
+            require_ok(ds4_gpu_end_commands(), "mv bench sync");
+            const double t0 = bench_now();
+            for (int k = 0; k < reps; k++)
+                require_ok(ds4_gpu_qwen4_dense_mm_tensor(out, x, a.base, a.size, off, type, T, K, M), "mv bench call");
+            require_ok(ds4_gpu_end_commands(), "mv bench sync");
+            const double us = 1e6 * (bench_now() - t0) / reps;
+            printf("  %-22s %6ux%-5u T=%u %8.1f us  %6.0f GB/s\n", cases[i].what, M, K, T, us, bytes / us / 1e3);
+        }
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(x);
+        off += (bytes + 4095) & ~4095ull;
+    }
+}
+#endif
+
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {
     bench_ctx c = { .a = a };
@@ -5089,6 +5147,12 @@ int main(void) {
         bench_dispatch(&arena);
         return 0;
     }
+#ifndef __APPLE__
+    if (getenv("QWEN4_MV_BENCH")) {
+        bench_mv();
+        return 0;
+    }
+#endif
     printf("hyper-connections\n");
     test_decode_fusions(&arena);
     test_qwen4_argmax();
