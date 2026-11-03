@@ -1021,6 +1021,12 @@ __global__ void router(int *selected, float *weights, const float *logits,
  * grids hold no zero byte, so the per-byte negation (g ^ ff) + 1 never
  * carries; Volta has no hardware for the SIMD intrinsics (__vcmpne4,
  * __vsub4) that would do it otherwise. */
+/* the four bytes a - b, each byte of a below 128 and of b at most 128: the
+ * high bit set in each byte of a stops a borrow at the byte (__vsub4 has no
+ * hardware on Volta either) */
+__device__ __forceinline__ int sub4(unsigned a, unsigned b) {
+    return (int)(((a | 0x80808080u) - b) ^ 0x80808080u);
+}
 __device__ __forceinline__ int signed4(unsigned g, unsigned bits) {
     const unsigned b01 = ((bits & 15) * 0x00204081u) & 0x01010101u;
     return (int)((g ^ (b01 * 0xffu)) + b01);
@@ -1046,7 +1052,7 @@ __device__ __forceinline__ void group8i(const char *row, unsigned g, int &w0, in
         const unsigned q = u16_at(b + 2 + (g % 8) * 2);
         const unsigned lo = (q & 3) | ((q >> 2) & 3) << 8 | ((q >> 4) & 3) << 16 | ((q >> 6) & 3) << 24;
         const unsigned hi = ((q >> 8) & 3) | ((q >> 10) & 3) << 8 | ((q >> 12) & 3) << 16 | ((q >> 14) & 3) << 24;
-        w0 = (int)__vsub4(lo, 0x01010101u); w1 = (int)__vsub4(hi, 0x01010101u); d = half_at(b);
+        w0 = sub4(lo, 0x01010101u); w1 = sub4(hi, 0x01010101u); d = half_at(b);
         return;
     }
     if (TYPE == 20 || TYPE == 6) {
@@ -1057,8 +1063,8 @@ __device__ __forceinline__ void group8i(const char *row, unsigned g, int &w0, in
         if (TYPE == 20) { w0 = iq4nl4((unsigned)lo); w1 = iq4nl4((unsigned)(lo >> 32)); return; }
         const unsigned h = b[2 + q];   /* the fifth bits of these eight weights */
         const unsigned h0 = ((h & 15) * 0x00204081u) & 0x01010101u, h1 = (((h >> 4) & 15) * 0x00204081u) & 0x01010101u;
-        w0 = (int)__vsub4((unsigned)lo | h0 << 4, 0x10101010u);
-        w1 = (int)__vsub4((unsigned)(lo >> 32) | h1 << 4, 0x10101010u);
+        w0 = sub4((unsigned)lo | h0 << 4, 0x10101010u);
+        w1 = sub4((unsigned)(lo >> 32) | h1 << 4, 0x10101010u);
         return;
     }
     const uint8_t *b = (const uint8_t *)row + (g / 32) * row_bytes(TYPE, 256);
@@ -1077,7 +1083,7 @@ __device__ __forceinline__ void group8i(const char *row, unsigned g, int &w0, in
         d = half_at(b + 208) * (float)(int8_t)b[192 + 8 * h + e / 16 + 2 * gq];
         const uint64_t q = ((bytes8(b + 64 * h + e + 32 * (gq & 1)) >> (4 * (gq >> 1))) & QWEN_NIBBLES) |
                            (((bytes8(b + 128 + 32 * h + e) >> (2 * gq)) & 0x0303030303030303ull) << 4);
-        w0 = (int)__vsub4((uint32_t)q, 0x20202020u); w1 = (int)__vsub4((uint32_t)(q >> 32), 0x20202020u);
+        w0 = sub4((uint32_t)q, 0x20202020u); w1 = sub4((uint32_t)(q >> 32), 0x20202020u);
         return;
     }
     if (TYPE == 11) {
@@ -1086,7 +1092,7 @@ __device__ __forceinline__ void group8i(const char *row, unsigned g, int &w0, in
                                             (((b[104 + s % 4] >> (2 * (s / 4))) & 3) << 4)) - 32);
         const uint64_t q = (bytes8(b + 32 + 32 * h + e) >> (2 * gq)) & 0x0303030303030303ull;
         const uint64_t lo4 = (~(bytes8(b + e) >> (4 * h + gq)) & 0x0101010101010101ull) << 2;   /* 4 where the high bit is clear */
-        w0 = (int)__vsub4((uint32_t)q, (uint32_t)lo4); w1 = (int)__vsub4((uint32_t)(q >> 32), (uint32_t)(lo4 >> 32));
+        w0 = sub4((uint32_t)q, (uint32_t)lo4); w1 = sub4((uint32_t)(q >> 32), (uint32_t)(lo4 >> 32));
         return;
     }
     if (TYPE == 23) {
@@ -1141,12 +1147,60 @@ __device__ __forceinline__ unsigned u32_at2(const uint8_t *p) {   /* 4 bytes at 
 }
 
 __host__ __device__ constexpr bool grouped_i32(unsigned type) {
-    return type == 16 || type == 17 || type == 18 || type == 20 || type == 21 || type == 22 || type == 23 || type == 42;
+    return type == 8 || type == 12 || type == 13 || type == 14 || type == 16 || type == 17 || type == 18 ||
+           type == 20 || type == 21 || type == 22 || type == 23 || type == 42;
 }
 
+/* m: the K-quants' minimum, which the sub-block's sum takes m * sum(x) off */
 template<unsigned TYPE>
-__device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8], float &d0, float &d1,
+__device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8], float &d0, float &d1, float &m,
         const void *grid_table = NULL, const uint8_t *sign_table = NULL) {
+    m = 0;
+    if (TYPE == 8) {           /* Q8_0: one 34-byte block of 32 */
+        const uint8_t *b = (const uint8_t *)row + s * 34;
+        d0 = d1 = half_at(b);
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const uint64_t q = bytes8(b + 2 + 8 * k);
+            w[2 * k] = (int)(uint32_t)q; w[2 * k + 1] = (int)(uint32_t)(q >> 32);
+        }
+        return;
+    }
+    if (TYPE == 12 || TYPE == 13) {   /* Q4_K, Q5_K: the nibbles of 32 bytes, Q5_K's fifth bits */
+        const uint8_t *b = (const uint8_t *)row + (s / 8) * (TYPE == 12 ? 144 : 176);
+        const unsigned ib = s % 8, sh = 4 * (ib & 1);
+        unsigned sc, mn;
+        scale_min_k4(b + 4, ib, sc, mn);
+        d0 = d1 = half_at(b) * sc;
+        m = half_at(b + 2) * mn;
+        const uint8_t *qs = b + (TYPE == 12 ? 16 : 48) + 32 * (ib / 2);
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const uint64_t q = bytes8(qs + 8 * k);
+            unsigned lo = ((uint32_t)q >> sh) & 0x0f0f0f0fu, hi = ((uint32_t)(q >> 32) >> sh) & 0x0f0f0f0fu;
+            if (TYPE == 13) {
+                const uint64_t h = bytes8(b + 16 + 8 * k);
+                lo |= (((uint32_t)h >> ib) & 0x01010101u) << 4;
+                hi |= (((uint32_t)(h >> 32) >> ib) & 0x01010101u) << 4;
+            }
+            w[2 * k] = (int)lo; w[2 * k + 1] = (int)hi;
+        }
+        return;
+    }
+    if (TYPE == 14) {          /* Q6_K: 32 weights of a half, a scale per 16 */
+        const uint8_t *b = (const uint8_t *)row + (s / 8) * 210;
+        const unsigned sb = s % 8, h = sb / 4, gq = sb % 4;
+        const float d = half_at(b + 208);
+        d0 = d * (float)(int8_t)b[192 + 8 * h + 2 * gq];
+        d1 = d * (float)(int8_t)b[193 + 8 * h + 2 * gq];
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            const uint64_t q = ((bytes8(b + 64 * h + 32 * (gq & 1) + 8 * k) >> (4 * (gq >> 1))) & QWEN_NIBBLES) |
+                               (((bytes8(b + 128 + 32 * h + 8 * k) >> (2 * gq)) & 0x0303030303030303ull) << 4);
+            w[2 * k] = sub4((uint32_t)q, 0x20202020u); w[2 * k + 1] = sub4((uint32_t)(q >> 32), 0x20202020u);
+        }
+        return;
+    }
     if (TYPE == 20) {          /* IQ4_NL: one 18-byte block of 32 */
         const uint8_t *b = (const uint8_t *)row + s * 18;
         const uint64_t lo = bytes8(b + 2), hi = bytes8(b + 10);
@@ -1166,7 +1220,7 @@ __device__ __forceinline__ void group32i(const char *row, unsigned s, int (&w)[8
             const unsigned v = (unsigned)(q >> (16 * k));
             const unsigned lo = (v & 3) | ((v >> 2) & 3) << 8 | ((v >> 4) & 3) << 16 | ((v >> 6) & 3) << 24;
             const unsigned hi = ((v >> 8) & 3) | ((v >> 10) & 3) << 8 | ((v >> 12) & 3) << 16 | ((v >> 14) & 3) << 24;
-            w[2 * k] = (int)__vsub4(lo, 0x01010101u); w[2 * k + 1] = (int)__vsub4(hi, 0x01010101u);
+            w[2 * k] = sub4(lo, 0x01010101u); w[2 * k + 1] = sub4(hi, 0x01010101u);
         }
         return;
     }
@@ -1266,6 +1320,16 @@ __device__ __forceinline__ float q8_term(float d, int dot, float m, int sx) {
 __device__ __forceinline__ float q8_halves(float d0, int p0, float d1, int p1) {
     return __fmaf_rn(d0, (float)p0, __fmul_rn(d1, (float)p1));
 }
+/* a sub-block of 32: the halves' terms, less m * sum(x) for the K-quants */
+template<unsigned TYPE>
+__device__ __forceinline__ float q8_sub32(float d0, int p0, float d1, int p1, float m, int sx) {
+    if (TYPE == 12 || TYPE == 13) return __fmaf_rn(-m, (float)sx, q8_halves(d0, p0, d1, p1));
+    return q8_halves(d0, p0, d1, p1);
+}
+__device__ __forceinline__ int sum32(int4 a, int4 b) {   /* the sum of 32 int8 */
+    return __dp4a(0x01010101, a.x, __dp4a(0x01010101, a.y, __dp4a(0x01010101, a.z, __dp4a(0x01010101, a.w,
+           __dp4a(0x01010101, b.x, __dp4a(0x01010101, b.y, __dp4a(0x01010101, b.z, __dp4a(0x01010101, b.w, 0))))))));
+}
 
 /* Round rows of n activations (n a multiple of 32) to int8 with a scale per
  * 32: one warp per 32 values.  The divisions are IEEE ones, which fast math
@@ -1335,19 +1399,20 @@ __device__ __forceinline__ void doti_rows(float (&acc)[NR][ROWS], const char *co
     for (unsigned c = threadIdx.x & 31; c < K / (8 * CH); c += 32) {
         if constexpr (CH == 4 && grouped_i32(TYPE)) {
             int q[NR][8];
-            float d0[NR], d1[NR];
+            float d0[NR], d1[NR], mm[NR];
             #pragma unroll
-            for (unsigned i = 0; i < NR; i++) group32i<TYPE>(r[i], c, q[i], d0[i], d1[i], grid_table, sign_table);
+            for (unsigned i = 0; i < NR; i++) group32i<TYPE>(r[i], c, q[i], d0[i], d1[i], mm[i], grid_table, sign_table);
             #pragma unroll
             for (unsigned j = 0; j < ROWS; j++) if (mask >> j & 1) {
                 const int8_t *xt = xq + (uint64_t)xr[j] * K + 32 * c;
                 const int4 xa = *(const int4 *)xt, xb = *(const int4 *)(xt + 16);
                 const float s = xd[(uint64_t)xr[j] * (K / 32) + c];
+                const int sx = TYPE == 12 || TYPE == 13 ? sum32(xa, xb) : 0;
                 #pragma unroll
                 for (unsigned i = 0; i < NR; i++) {
                     const int p0 = __dp4a(q[i][0], xa.x, __dp4a(q[i][1], xa.y, __dp4a(q[i][2], xa.z, __dp4a(q[i][3], xa.w, 0))));
                     const int p1 = __dp4a(q[i][4], xb.x, __dp4a(q[i][5], xb.y, __dp4a(q[i][6], xb.z, __dp4a(q[i][7], xb.w, 0))));
-                    acc[i][j] = __fmaf_rn(s, q8_halves(d0[i], p0, d1[i], p1), acc[i][j]);
+                    acc[i][j] = __fmaf_rn(s, q8_sub32<TYPE>(d0[i], p0, d1[i], p1, mm[i], sx), acc[i][j]);
                 }
             }
         } else {
@@ -1418,9 +1483,10 @@ __device__ __forceinline__ void moe_quad_q8(float (&acc)[ROWS], const char *r, c
         int q[8];
         float d[4], m[4] = {};
         if constexpr (grouped_i32(TYPE)) {
-            group32i<TYPE>(r, c, q, d[0], d[2], grid_table, sign_table);
+            group32i<TYPE>(r, c, q, d[0], d[2], m[0], grid_table, sign_table);
             d[1] = d[0];
             d[3] = d[2];
+            m[1] = m[2] = m[3] = m[0];
         } else {
             #pragma unroll
             for (unsigned o = 0; o < 4; o++) group8i<TYPE>(r, 4 * c + o, q[2 * o], q[2 * o + 1], d[o], m[o], grid_table, sign_table);
@@ -2203,9 +2269,9 @@ __global__ void matvec_split(float *out, const char *w, const float *x,
 }
 
 /* matvec_split with int8 activations.  With a warp per row (W = 1) the
- * IQ types take a sub-block of 32 weights per lane and step (CH = 4
- * groups, group32i), which keeps four times the bytes in flight and loads
- * the sub-block's fields once; their codebook decode is otherwise the
+ * types with a 32-weight decoder take a sub-block of 32 weights per lane and
+ * step (CH = 4 groups, group32i), which keeps four times the bytes in flight
+ * and loads the sub-block's fields once; their decode is otherwise the
  * step's latency.  CH depends on the matrix alone. */
 template<unsigned TYPE, unsigned W, unsigned ROWS, unsigned CH>
 __global__ void matvec_split_q8(float *out, const char *w, const int8_t *xq, const float *xd,
@@ -2220,15 +2286,16 @@ __global__ void matvec_split_q8(float *out, const char *w, const int8_t *xq, con
         for (unsigned c = c0 + lane; c < c1; c += 32) {
             if constexpr (CH == 4 && grouped_i32(TYPE)) {
                 int q[8];
-                float d0, d1;
-                group32i<TYPE>(wr, c, q, d0, d1);
+                float d0, d1, mm;
+                group32i<TYPE>(wr, c, q, d0, d1, mm);
                 #pragma unroll
                 for (unsigned t = 0; t < ROWS; t++) if (t < T) {
                     const int8_t *xt = xq + (uint64_t)t * K + 32 * c;
                     const int4 xa = *(const int4 *)xt, xb = *(const int4 *)(xt + 16);
                     const int p0 = __dp4a(q[0], xa.x, __dp4a(q[1], xa.y, __dp4a(q[2], xa.z, __dp4a(q[3], xa.w, 0))));
                     const int p1 = __dp4a(q[4], xb.x, __dp4a(q[5], xb.y, __dp4a(q[6], xb.z, __dp4a(q[7], xb.w, 0))));
-                    acc[t] = __fmaf_rn(xd[(uint64_t)t * (K / 32) + c], q8_halves(d0, p0, d1, p1), acc[t]);
+                    const int sx = TYPE == 12 || TYPE == 13 ? sum32(xa, xb) : 0;
+                    acc[t] = __fmaf_rn(xd[(uint64_t)t * (K / 32) + c], q8_sub32<TYPE>(d0, p0, d1, p1, mm, sx), acc[t]);
                 }
             } else {
                 int w0[CH], w1[CH];
@@ -2280,7 +2347,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
         if (!q8_rows(x, T, K, &xq, &xd)) return 0;
 #define QWEN_SPLIT_Q8_ROWS(TYPE, R) \
         if (W == 1) { \
-            if (iq_codebook(TYPE)) matvec_split_q8<TYPE,1,R,4><<<(M+7)/8,256,0,cuda_decode_stream()>>>(out,w,xq,xd,T,K,M,stride); \
+            if (grouped_i32(TYPE)) matvec_split_q8<TYPE,1,R,4><<<(M+7)/8,256,0,cuda_decode_stream()>>>(out,w,xq,xd,T,K,M,stride); \
             else matvec_split_q8<TYPE,1,R,1><<<(M+7)/8,256,0,cuda_decode_stream()>>>(out,w,xq,xd,T,K,M,stride); \
         } \
         else if (W == 2) matvec_split_q8<TYPE,2,R,1><<<(M+3)/4,256,0,cuda_decode_stream()>>>(out,w,xq,xd,T,K,M,stride); \
