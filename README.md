@@ -175,6 +175,7 @@ commercial use. The code is MIT, like upstream.
 
 - [The fork in detail](docs/FLASH_NEXT_FORK.md): what changed, which Macs gain, the larger quants, contexts beyond 262K, running `ds4-server` by hand.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
+- [NVIDIA V100](docs/CUDA_V100.md): iq3m8 on two 32 GB V100s, its speeds, switches, and how the CUDA path gets there.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): Qwen MTP, the depth policy, and sampling.
 - [Serving](docs/SERVER.md): APIs, the live dashboard, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): OpenCode, DSH, Pi, Codex CLI, and Claude Code.

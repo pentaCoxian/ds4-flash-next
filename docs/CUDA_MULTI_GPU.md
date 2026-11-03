@@ -8,6 +8,9 @@ can still run here when DwarfStar supports its GGUF layout. The Flash kernels
 do not require Blackwell's native FP4 instructions; Ada uses an appropriate
 CUDA path. Support remains model-specific, not a promise to run arbitrary GGUFs.
 
+For Qwen3.8 Flash Next on two V100s (Volta, CUDA 12.x), see
+[NVIDIA V100](CUDA_V100.md).
+
 ## Build
 
 Install the NVIDIA driver and CUDA toolkit, including `nvcc` and cuBLAS.
