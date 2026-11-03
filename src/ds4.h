@@ -557,6 +557,22 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
                                                int (*accepted)[2], int *n_accepted,
                                                char *err, size_t errlen);
+/* Pipelined MTP decode of several sessions (Qwen3.8 --mtp on CUDA over a
+ * layer split): one speculative cycle as three calls.  _front queues the
+ * first GPU's layers of the session's next verify window (token plus its
+ * pending drafts, at most limit rows), _back the later GPUs' layers, and
+ * _finish waits for the window and commits it with greedy acceptance, as
+ * ds4_session_eval_speculative_argmax does: accepted (room for 3) gets the
+ * committed tokens, and the session's logits follow the last one.  Queue
+ * another session's _front between a session's _back and its _finish, and
+ * the first GPU runs that window while the later ones verify this one.  A
+ * token without a draft (a sample other than the argmax) is a window of one
+ * row.  A started cycle must be finished; on failure the session is
+ * invalid. */
+bool ds4_session_spec_pipe_supported(ds4_session *s);
+int ds4_session_spec_front(ds4_session *s, int token, int limit, char *err, size_t errlen);
+int ds4_session_spec_back(ds4_session *s, char *err, size_t errlen);
+int ds4_session_spec_finish(ds4_session *s, int *accepted, int accepted_cap, char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */

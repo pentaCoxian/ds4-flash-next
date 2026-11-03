@@ -130,7 +130,9 @@ static int g_cuda_exact_score_split_vec4_plain;
 static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
-static int g_current_logical_tier = -1;
+/* cudaSetDevice is per host thread, and so is what it last selected: the
+ * server prefills on a slot's thread and decodes on its coordinator's */
+static thread_local int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 
 typedef struct ds4_gpu_stream_expert_table {
@@ -289,6 +291,12 @@ extern "C" int ds4_gpu_device_is_spark(void) {
  * destinations cannot race for staging memory. */
 static void   *g_xdev_bounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static size_t  g_xdev_bounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
+/* The default-stream copies' own bounce buffers (they do not wait on the
+ * host), and per pair the event after the upload that last read one: the
+ * next download into it waits for that event on the device. */
+static void       *g_xdev_dbounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
+static size_t      g_xdev_dbounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
+static cudaEvent_t g_xdev_dbounce_read[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
 /* Internal helper: resolve a tensor's device index. -1 (untagged) is
  * treated as device 0 for legacy callers. */
@@ -2927,6 +2935,16 @@ extern "C" void ds4_gpu_cleanup(void) {
                 g_xdev_bounce[i][j] = NULL;
                 g_xdev_bounce_bytes[i][j] = 0;
             }
+            if (g_xdev_dbounce_read[i][j]) {
+                (void)cudaEventSynchronize(g_xdev_dbounce_read[i][j]);
+                (void)cudaEventDestroy(g_xdev_dbounce_read[i][j]);
+                g_xdev_dbounce_read[i][j] = NULL;
+            }
+            if (g_xdev_dbounce[i][j]) {
+                (void)cudaFreeHost(g_xdev_dbounce[i][j]);
+                g_xdev_dbounce[i][j] = NULL;
+                g_xdev_dbounce_bytes[i][j] = 0;
+            }
         }
     }
     cuda_stream_selected_cache_release();
@@ -3487,23 +3505,42 @@ static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
         return ok;
     }
 
-    if (g_xdev_bounce_bytes[sd][dd] < bytes) {
-        if (g_xdev_bounce[sd][dd]) (void)cudaFreeHost(g_xdev_bounce[sd][dd]);
-        if (!cuda_ok(cudaMallocHost(&g_xdev_bounce[sd][dd], (size_t)bytes),
+    /* Through pinned host memory, both halves queued on the devices' default
+     * streams: the destination's waits for the download, and the next
+     * download into this buffer for the upload that read it.  The host does
+     * not wait (it used to block until the source had finished all its
+     * queued work, then for both copies: a prefill chunk's whole hand-off
+     * with both GPUs idle). */
+    cudaEvent_t &read = g_xdev_dbounce_read[sd][dd];
+    if (g_xdev_dbounce_bytes[sd][dd] < bytes) {
+        if (g_xdev_dbounce[sd][dd]) {
+            if (read) (void)cudaEventSynchronize(read);
+            (void)cudaFreeHost(g_xdev_dbounce[sd][dd]);
+            g_xdev_dbounce[sd][dd] = NULL;
+            g_xdev_dbounce_bytes[sd][dd] = 0;
+        }
+        if (!cuda_ok(cudaMallocHost(&g_xdev_dbounce[sd][dd], (size_t)bytes),
                      "default-stream bounce alloc")) return 0;
-        g_xdev_bounce_bytes[sd][dd] = bytes;
+        g_xdev_dbounce_bytes[sd][dd] = bytes;
     }
+    void *bounce = g_xdev_dbounce[sd][dd];
     int ok = 0;
     WITH_DEVICE(g_gpu[sd].device_id) {
-        ok = cuda_ok(cudaMemcpy(g_xdev_bounce[sd][dd], src->ptr, (size_t)bytes,
-                                cudaMemcpyDeviceToHost),
-                     "default-stream bounce d2h");
+        ok = (!read || cuda_ok(cudaStreamWaitEvent(0, read, 0), "default-stream bounce reuse wait")) &&
+             cuda_ok(cudaMemcpyAsync(bounce, src->ptr, (size_t)bytes, cudaMemcpyDeviceToHost, 0),
+                     "default-stream bounce d2h") &&
+             cuda_ok(cudaEventRecord((cudaEvent_t)g_gpu[sd].boundary_event, 0),
+                     "default-stream bounce d2h record");
     }
     if (ok) {
         WITH_DEVICE(g_gpu[dd].device_id) {
-            ok = cuda_ok(cudaMemcpy(dst->ptr, g_xdev_bounce[sd][dd],
-                                    (size_t)bytes, cudaMemcpyHostToDevice),
-                         "default-stream bounce h2d");
+            ok = cuda_ok(cudaStreamWaitEvent(0, (cudaEvent_t)g_gpu[sd].boundary_event, 0),
+                         "default-stream bounce h2d wait") &&
+                 cuda_ok(cudaMemcpyAsync(dst->ptr, bounce, (size_t)bytes, cudaMemcpyHostToDevice, 0),
+                         "default-stream bounce h2d") &&
+                 (read || cuda_ok(cudaEventCreateWithFlags(&read, cudaEventDisableTiming),
+                                  "default-stream bounce event")) &&
+                 cuda_ok(cudaEventRecord(read, 0), "default-stream bounce read record");
         }
     }
     return ok;
@@ -3513,6 +3550,21 @@ extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                                  const ds4_gpu_tensor *src,
                                                  uint64_t bytes) {
     return ds4_gpu_tensor_copy_xdev_default_impl(dst, src, bytes);
+}
+
+/* Page-lock a host staging buffer for every device (uploads from it run at
+ * the link's rate, ~3x a pageable buffer's on PCIe 3), and release it. */
+extern "C" int ds4_gpu_host_register(void *ptr, uint64_t bytes) {
+    if (!ptr || !bytes) return 0;
+    if (cudaHostRegister(ptr, (size_t)bytes, cudaHostRegisterPortable) == cudaSuccess) return 1;
+    (void)cudaGetLastError();
+    return 0;
+}
+
+extern "C" void ds4_gpu_host_unregister(void *ptr) {
+    if (!ptr) return;
+    (void)cudaHostUnregister(ptr);
+    (void)cudaGetLastError();
 }
 
 extern "C" int ds4_gpu_tensor_copy_xdev3_default_dst(
@@ -27014,7 +27066,9 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
          * probe and are unaffected. */
         const size_t reserve_floor = (size_t)2ull * 1024ull * 1024ull * 1024ull;
         const size_t reserve_pct = free_b / 20u;
-        const size_t reserve = reserve_floor > reserve_pct ? reserve_floor : reserve_pct;
+        /* --gpu-vram full passes no safety margin: no reserve either */
+        const size_t reserve = safety_margin_bytes == 0 ? 0 :
+            reserve_floor > reserve_pct ? reserve_floor : reserve_pct;
         const size_t budget = free_b > reserve ? (free_b - reserve) : 0;
         (void)safety_margin_bytes;
         out->device_indices[i] = d;

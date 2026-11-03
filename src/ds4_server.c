@@ -10099,7 +10099,13 @@ struct server_slot {
     bool decode_done;
     int decode_token;
     bool decode_speculative;
-    int decode_accepted[2];
+    /* a speculative token's request for the pipelined worker
+     * (decode_worker_pipe_main): the tokens the cycle may commit, and the
+     * sampling a slot decoding alone hands its lookahead */
+    int decode_limit, decode_eos, decode_top_k;
+    float decode_temperature, decode_top_p, decode_min_p;
+    uint64_t *decode_rng;
+    int decode_accepted[17];
     int decode_accepted_count;
     int decode_rc;
     char decode_err[160];
@@ -10292,6 +10298,9 @@ struct server {
     pthread_cond_t model_cv;
     bool model_busy;
     bool qwen4_batch_mtp;
+    bool qwen4_pipe_mtp;   /* CUDA layer split: decode_worker_pipe_main */
+    bool pipe_prefill_turn;   /* that worker lets one prefill quantum in */
+    int pipe_prefill_quantum;   /* its prefill quantum while nothing generates */
     bool model_stopping;
     int decode_pending;
     int active_generations;
@@ -12888,8 +12897,10 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     pthread_mutex_lock(&s->model_mu);
     slot->prefill_waiting = true;
     pthread_cond_broadcast(&s->model_cv);
+    /* Pending decodes go first; the pipelined worker hands a waiting prefill
+     * one quantum at a time between its cycles. */
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
-           (s->model_busy || s->decode_pending > 0 ||
+           (s->model_busy || (s->decode_pending > 0 && !s->pipe_prefill_turn) ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
@@ -12902,6 +12913,7 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     slot->prefill_waiting = false;
     s->last_prefill_slot = slot->id;
     s->model_busy = true;
+    s->pipe_prefill_turn = false;
     pthread_mutex_unlock(&s->model_mu);
     pthread_mutex_lock(&s->inference_mu);
     return true;
@@ -12920,6 +12932,7 @@ static void server_prefill_leave(server *s) {
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
     int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    if (!generation_active && s->qwen4_pipe_mtp && s->pipe_prefill_quantum > 0) quantum = s->pipe_prefill_quantum;
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -13695,8 +13708,15 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
     return true;
 }
 
+typedef struct {
+    int limit, eos, top_k;
+    float temperature, top_p, min_p;
+    uint64_t *rng;
+} server_spec_args;
+
 static int server_eval_tokens(server *s, server_slot *slot, int token,
-                              bool speculative, int accepted[2], int *n_accepted,
+                              bool speculative, const server_spec_args *spec,
+                              int *accepted, int *n_accepted,
                               char *err, size_t errlen) {
     *n_accepted = 0;
     if (!s || !slot) return 1;
@@ -13729,6 +13749,18 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
     }
     slot->decode_token = token;
     slot->decode_speculative = speculative;
+    if (spec) {
+        slot->decode_limit = spec->limit;
+        slot->decode_eos = spec->eos;
+        slot->decode_top_k = spec->top_k;
+        slot->decode_temperature = spec->temperature;
+        slot->decode_top_p = spec->top_p;
+        slot->decode_min_p = spec->min_p;
+        slot->decode_rng = spec->rng;
+    } else {
+        slot->decode_limit = 2;
+        slot->decode_rng = NULL;
+    }
     slot->decode_accepted_count = 0;
     slot->decode_rc = 1;
     slot->decode_err[0] = '\0';
@@ -13769,8 +13801,8 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
 
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen) {
-    int accepted[2], count;
-    return server_eval_tokens(s, slot, token, false, accepted, &count, err, errlen);
+    int accepted[17], count;
+    return server_eval_tokens(s, slot, token, false, NULL, accepted, &count, err, errlen);
 }
 
 static long server_decode_coalesce_us(void) {
@@ -13892,6 +13924,174 @@ static void *decode_worker_main(void *arg) {
     free(items);
     free(accepted);
     free(n_accepted);
+    return NULL;
+}
+
+/* model_mu held: hand a slot its decode result */
+static void server_decode_deliver_locked(server *s, server_slot *slot, int rc, const int *toks, int n,
+                                         const char *err) {
+    slot->decode_in_flight = false;
+    slot->decode_rc = rc;
+    if (rc == 0) {
+        slot->decode_accepted_count = n;
+        memcpy(slot->decode_accepted, toks, (size_t)n * sizeof(int));
+    } else {
+        snprintf(slot->decode_err, sizeof(slot->decode_err), "%s", err && err[0] ? err : "batched decode failed");
+    }
+    slot->decode_done = true;
+    pthread_cond_broadcast(&s->model_cv);
+}
+
+static bool server_any_prefill_waiting_locked(const server *s) {
+    for (int i = 0; i < s->slot_count; i++) if (s->slots[i].prefill_waiting) return true;
+    return false;
+}
+
+/* the next pending slot from rr on, other than `busy` */
+static server_slot *server_peek_pending_locked(server *s, const server_slot *busy, int rr) {
+    for (int k = 0; k < s->slot_count; k++) {
+        server_slot *slot = &s->slots[(rr + k) % s->slot_count];
+        if (slot != busy && slot->decode_pending) return slot;
+    }
+    return NULL;
+}
+
+static void server_take_pending_locked(server *s, server_slot *slot, int *rr) {
+    *rr = (int)(slot - s->slots) + 1;
+    slot->decode_pending = false;
+    slot->decode_in_flight = true;
+    s->decode_pending--;
+}
+
+/* Batched decode of Qwen3.8 with MTP over a CUDA layer split.  A slot's
+ * speculative cycle runs as a front (the first GPU's layers of its verify
+ * window), a back (the later GPU's) and a finish (wait and commit; see
+ * ds4_session_spec_front), and the worker queues one slot's front while
+ * another slot's back runs: GPU0 works on one stream while GPU1 verifies
+ * the other.  A slot generating alone takes the single-session cycle,
+ * lookahead included, and plain tokens run once nothing is in flight.  A
+ * waiting prefill gets the model for a quantum once nothing is in flight,
+ * and decode then keeps it as long again. */
+static void *decode_worker_pipe_main(void *arg) {
+    server *s = arg;
+    server_slot *front = NULL, *back = NULL;
+    int rr = 0;
+    bool owned = false;     /* this worker set model_busy */
+    bool yielded = false;   /* a prefill ran since the last delivered cycle */
+    /* decode then keeps the model as long as that prefill quantum held it */
+    double yield_t = 0.0, decode_until = 0.0;
+    const long wait_us = server_decode_coalesce_us();
+    char err[160];
+    int toks[17];
+    pthread_mutex_lock(&s->model_mu);
+    for (;;) {
+        if (!owned) {
+            /* a turn handed to a waiting prefill stands until it is taken */
+            while (!s->model_stopping &&
+                   (s->decode_pending == 0 || s->model_busy ||
+                    (s->pipe_prefill_turn && server_any_prefill_waiting_locked(s))))
+                pthread_cond_wait(&s->model_cv, &s->model_mu);
+            s->pipe_prefill_turn = false;
+            if (s->decode_pending == 0) break;
+            while (s->model_busy) pthread_cond_wait(&s->model_cv, &s->model_mu);
+            s->model_busy = owned = true;
+            if (yield_t > 0.0) {
+                const double now = now_sec();
+                decode_until = now + (now - yield_t);
+                yield_t = 0.0;
+            }
+        }
+        if (front && !back) {
+            server_slot *slot = front;
+            front = NULL;
+            pthread_mutex_unlock(&s->model_mu);
+            pthread_mutex_lock(&s->inference_mu);
+            err[0] = '\0';
+            const int rc = ds4_session_spec_back(slot->session, err, sizeof(err));
+            pthread_mutex_unlock(&s->inference_mu);
+            pthread_mutex_lock(&s->model_mu);
+            if (rc != 0) server_decode_deliver_locked(s, slot, 1, NULL, 0, err);
+            else back = slot;
+            continue;
+        }
+        const bool hold = !yielded && server_any_prefill_waiting_locked(s) && now_sec() >= decode_until;
+        server_slot *next = !front && !hold ? server_peek_pending_locked(s, back, rr) : NULL;
+        /* a plain token, or a speculative one with no other stream, runs the
+         * session's own call once the pipeline is empty */
+        const bool alone = next && (!next->decode_speculative || s->active_generations <= 1);
+        if (next && !(alone && back)) {
+            server_take_pending_locked(s, next, &rr);
+            pthread_mutex_unlock(&s->model_mu);
+            pthread_mutex_lock(&s->inference_mu);
+            int n = 0, rc = 0;
+            err[0] = '\0';
+            if (!alone) {
+                rc = ds4_session_spec_front(next->session, next->decode_token, next->decode_limit,
+                                            err, sizeof(err));
+            } else if (next->decode_speculative) {
+                n = ds4_session_eval_speculative(next->session, next->decode_token, next->decode_limit,
+                                                 next->decode_eos, next->decode_temperature,
+                                                 next->decode_top_k, next->decode_top_p, next->decode_min_p,
+                                                 next->decode_rng, toks, 17, err, sizeof(err));
+                rc = n > 0 ? 0 : 1;
+            } else {
+                rc = ds4_session_eval(next->session, next->decode_token, err, sizeof(err));
+                toks[0] = next->decode_token;
+                n = 1;
+            }
+            pthread_mutex_unlock(&s->inference_mu);
+            pthread_mutex_lock(&s->model_mu);
+            if (!alone && rc == 0) {
+                front = next;
+            } else {
+                server_decode_deliver_locked(s, next, rc, toks, n, err);
+                if (rc == 0) yielded = false;
+            }
+            continue;
+        }
+        if (back) {
+            /* a stream that just got its tokens resubmits within moments:
+             * give its front the chance to run beside this back */
+            if (!next && !front && !hold && s->decode_pending == 0 && s->active_generations > 1 && wait_us > 0) {
+                struct timespec deadline;
+                clock_gettime(CLOCK_REALTIME, &deadline);
+                timespec_add_us(&deadline, wait_us);
+                while (s->decode_pending == 0 && s->active_generations > 1 && !s->model_stopping &&
+                       pthread_cond_timedwait(&s->model_cv, &s->model_mu, &deadline) != ETIMEDOUT) {}
+                if (s->decode_pending > 0) continue;
+            }
+            server_slot *slot = back;
+            back = NULL;
+            pthread_mutex_unlock(&s->model_mu);
+            pthread_mutex_lock(&s->inference_mu);
+            err[0] = '\0';
+            const int n = ds4_session_spec_finish(slot->session, toks, 3, err, sizeof(err));
+            pthread_mutex_unlock(&s->inference_mu);
+            pthread_mutex_lock(&s->model_mu);
+            server_decode_deliver_locked(s, slot, n > 0 ? 0 : 1, toks, n, err);
+            if (n > 0) yielded = false;
+            continue;
+        }
+        /* nothing in flight and nothing to start: a generating slot that
+         * just got its tokens resubmits within moments, so release the model
+         * (to a waiting prefill, for a quantum) only when none does */
+        if (!hold && s->active_generations > 0 && wait_us > 0 && !s->model_stopping) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            timespec_add_us(&deadline, wait_us);
+            while (s->decode_pending == 0 && s->active_generations > 0 && !s->model_stopping &&
+                   pthread_cond_timedwait(&s->model_cv, &s->model_mu, &deadline) != ETIMEDOUT) {}
+            if (s->decode_pending > 0) continue;
+        }
+        s->model_busy = owned = false;
+        pthread_cond_broadcast(&s->model_cv);
+        if (hold) {
+            s->pipe_prefill_turn = true;
+            yielded = true;
+            yield_t = now_sec();
+        }
+    }
+    pthread_mutex_unlock(&s->model_mu);
     return NULL;
 }
 
@@ -14601,7 +14801,17 @@ decode_again:
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
-            if (server_eval_tokens(s, slot, token, true, toks, &ntok, err, sizeof(err)) != 0) {
+            if (server_eval_tokens(s, slot, token, true, NULL, toks, &ntok, err, sizeof(err)) != 0) {
+                finish = "error";
+                break;
+            }
+        } else if (s->batched_mode && s->qwen4_pipe_mtp && !j->req.ignore_eos &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            const server_spec_args spec = {
+                .limit = max_tokens - completion, .eos = eos_token, .top_k = top_k,
+                .temperature = temperature, .top_p = top_p, .min_p = min_p, .rng = &rng,
+            };
+            if (server_eval_tokens(s, slot, token, true, &spec, toks, &ntok, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }
@@ -16039,6 +16249,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    bool mixed_prefill_quantum_set;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -16285,6 +16496,7 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.mixed_prefill_quantum_set = true;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -16591,6 +16803,24 @@ int main(int argc, char **argv) {
         }
     }
     metrics_init(&s, cfg.engine.model_path, ds4_engine_mtp_draft_tokens(engine) > 0);
+    /* Qwen3.8 MTP over a CUDA layer split: the slots' cycles share the GPUs
+     * (decode_worker_pipe_main) */
+    s.qwen4_pipe_mtp = s.batched_mode && !s.qwen4_batch_mtp && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                       getenv("DS4_SERVER_NO_PIPE") == NULL;
+    for (int i = 0; s.qwen4_pipe_mtp && i < slot_count; i++)
+        s.qwen4_pipe_mtp = ds4_session_spec_pipe_supported(s.slots[i].session);
+    /* Its prefill and decode take turns rather than share batches, and a
+     * 128-token chunk prefills at a third of a 2048-token one's rate: beside
+     * a generation a quantum is one prefill chunk (2048 at least).  Each
+     * quantum is a sync of its own that pipelines only its own chunks over
+     * the GPUs, so while nothing generates one is twelve chunks: 2048-token
+     * quanta prefilled a 34K prompt at 1380 tok/s, against 2500 in one sync
+     * of 3072-token chunks. */
+    if (s.qwen4_pipe_mtp) {
+        const int chunk = ds4_engine_prefill_chunk(engine) > 0 ? (int)ds4_engine_prefill_chunk(engine) : 2048;
+        if (!cfg.mixed_prefill_quantum_set) s.mixed_prefill_quantum = chunk > 2048 ? chunk : 2048;
+        s.pipe_prefill_quantum = 12 * chunk;
+    }
 
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
@@ -16607,7 +16837,9 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, false),
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
-        if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
+        if (s.qwen4_pipe_mtp) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: MTP decoding pipelines the sessions over the GPUs");
+        } else if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }
@@ -16628,7 +16860,8 @@ int main(int argc, char **argv) {
     int slot_threads_started = 0;
     bool decode_thread_started = false;
     if (s.batched_mode) {
-        if (pthread_create(&s.decode_thread, NULL, decode_worker_main, &s) != 0) {
+        if (pthread_create(&s.decode_thread, NULL, s.qwen4_pipe_mtp ? decode_worker_pipe_main : decode_worker_main,
+                           &s) != 0) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: failed to start decode coordinator");
             server_close_resources(&s);
             return 1;

@@ -147,8 +147,12 @@ int parse_gpu_vram_arg(const char     *vram_arg,
         return 0;
     }
 
-    /* Case 3: --gpu-vram auto. */
-    if (!strcmp(vram_arg, "auto")) {
+    /* Case 3: --gpu-vram auto, or full: each device's free memory with no
+     * reserve and no safety margin (the planner then packs right up to what
+     * the card has; runtime scratch past the plan can run out of memory). */
+    const bool full = !strcmp(vram_arg, "full");
+    if (full) out->safety_margin_bytes = 0;
+    if (full || !strcmp(vram_arg, "auto")) {
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__)
         int filter_buf[DS4_MAX_GPUS];
         const int *filter_ptr = NULL;
@@ -165,7 +169,7 @@ int parse_gpu_vram_arg(const char     *vram_arg,
 #else
         (void)dev_list; (void)dev_count;
         errbuf_set(errbuf, errbuflen,
-                   "--gpu-vram auto requires a CUDA build");
+                   "--gpu-vram auto and full require a CUDA build");
         return 1;
 #endif
     }

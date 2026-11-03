@@ -839,6 +839,111 @@ static void test_idx_score_mm(uint32_t T, uint32_t n, uint32_t pos0) {
     free(got); ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gq); free(ref); free(keyh); free(keyf); free(q);
 }
 
+#ifndef __APPLE__
+/* f32 to f16 rounding to nearest even, as __float2half_rn does */
+static uint16_t f32_to_f16_rne(float f) {
+    union { float f; uint32_t u; } v = { f };
+    const uint32_t sign = (v.u >> 16) & 0x8000u, au = v.u & 0x7fffffffu;
+    if (au >= 0x47800000u) return (uint16_t)(sign | (au > 0x7f800000u ? 0x7e00u : 0x7c00u));
+    if (au < 0x38800000u) return (uint16_t)(sign | (uint32_t)nearbyintf(fabsf(f) * 16777216.0f));
+    uint32_t r = au - 0x38000000u;
+    r += 0xfffu + ((r >> 13) & 1u);
+    return (uint16_t)(sign | (r >> 13));
+}
+
+/* ---- int8 block keys and the decode rows' scorer (CUDA) ----
+ * The int8 copy is rounded from the f16 keys as kv_store_q8 rounds, the
+ * queries as quantize_q8 rounds; the reference repeats the kernel's float
+ * operations in its order, so scores and tile maxima must match bit for
+ * bit, for every row count (a row's score does not depend on T). */
+static void test_idx_score_q8(uint32_t n, uint32_t pos0) {
+    const uint32_t Hi = 4, Di = 128, ratio = 4, cap = n + 7, TM = 8, nt = (n + 7) / 8;
+    uint16_t *keyh = malloc((uint64_t)n * Di * 2);
+    float *keyf = rand_vec((uint64_t)n * Di, 1.0f);
+    for (uint64_t i = 0; i < (uint64_t)n * Di; i++) keyh[i] = f32_to_f16_rne(keyf[i] * (float)(1 + (i / Di) % 7));
+    int8_t *kq = malloc((uint64_t)n * Di);
+    uint16_t *kd = malloc((uint64_t)n * 4 * 2);
+    for (uint64_t g = 0; g < (uint64_t)n * 4; g++) {
+        float a = 0.0f;
+        for (uint32_t i = 0; i < 32; i++) a = fmaxf(a, fabsf(f16_to_f32(keyh[g * 32 + i])));
+        kd[g] = f32_to_f16_rne(a / 127.0f);
+        const float df = f16_to_f32(kd[g]), id = df > 0.0f ? 1.0f / df : 0.0f;
+        for (uint32_t i = 0; i < 32; i++)
+            kq[g * 32 + i] = (int8_t)fminf(fmaxf(rintf(f16_to_f32(keyh[g * 32 + i]) * id), -127.0f), 127.0f);
+    }
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc((uint64_t)n * Di * 2);
+    ds4_gpu_tensor *gq8 = ds4_gpu_tensor_alloc((uint64_t)cap * (Di + 8));
+    require_ok(gk && gq8 && ds4_gpu_tensor_write(gk, 0, keyh, (uint64_t)n * Di * 2) &&
+               ds4_gpu_qwen4_idx_block_key_q8_refresh(gq8, cap, gk, 0, n), "q8 keys refresh");
+    uint8_t *got8 = malloc((uint64_t)cap * (Di + 8));
+    require_ok(ds4_gpu_tensor_read(gq8, 0, got8, (uint64_t)cap * (Di + 8)), "q8 keys read");
+    if (memcmp(got8, kq, (uint64_t)n * Di) || memcmp(got8 + (uint64_t)cap * Di, kd, (uint64_t)n * 8)) {
+        fprintf(stderr, "q8 block keys n=%u: int8 copy differs from the reference\n", n);
+        exit(1);
+    }
+    float *q = rand_vec((uint64_t)TM * Hi * Di, 1.0f);
+    int8_t *qq = malloc((uint64_t)TM * Hi * Di);
+    float *qs = malloc((uint64_t)TM * Hi * 4 * sizeof(float));
+    for (uint64_t g = 0; g < (uint64_t)TM * Hi * 4; g++) {
+        float a = 0.0f;
+        for (uint32_t i = 0; i < 32; i++) a = fmaxf(a, fabsf(q[g * 32 + i]));
+        qs[g] = a / 127.0f;
+        for (uint32_t i = 0; i < 32; i++) qq[g * 32 + i] = (int8_t)(qs[g] > 0.0f ? rintf(q[g * 32 + i] / qs[g]) : 0.0f);
+    }
+    float *ref = malloc((uint64_t)TM * n * sizeof(float));
+    uint32_t *ref_tiles = calloc((uint64_t)TM * nt, sizeof(uint32_t));
+    for (uint32_t t = 0; t < TM; t++) {
+        for (uint32_t b = 0; b < n; b++) {
+            float score = 0.0f;
+            for (uint32_t h = 0; h < Hi; h++) {
+                float p[4];
+                for (uint32_t g = 0; g < 4; g++) {
+                    int acc = 0;
+                    for (uint32_t i = 0; i < 32; i++)
+                        acc += (int)qq[(((uint64_t)t * Hi + h) * 4 + g) * 32 + i] * (int)kq[(uint64_t)b * Di + g * 32 + i];
+                    p[g] = ((float)acc * qs[((uint64_t)t * Hi + h) * 4 + g]) * f16_to_f32(kd[(uint64_t)b * 4 + g]);
+                }
+                score = score + fmaxf((p[0] + p[1]) + (p[2] + p[3]), 0.0f);
+            }
+            if (b >= (pos0 + t + 1) / ratio) score = -3e38f;
+            ref[(uint64_t)t * n + b] = score;
+            const float c = fmaxf(score, 0.0f);
+            uint32_t u;
+            memcpy(&u, &c, 4);
+            if (u > ref_tiles[(uint64_t)t * nt + b / 8]) ref_tiles[(uint64_t)t * nt + b / 8] = u;
+        }
+    }
+    ds4_gpu_tensor *gq = upload(q, (uint64_t)TM * Hi * Di);
+    ds4_gpu_tensor *gs = upload(NULL, (uint64_t)TM * n);
+    ds4_gpu_tensor *gt = ds4_gpu_tensor_alloc((uint64_t)TM * nt * 4);
+    const uint32_t Ts[] = { 1, 2, 3, 8 };
+    for (uint32_t k = 0; k < sizeof(Ts) / sizeof(Ts[0]); k++) {
+        const uint32_t T = Ts[k];
+        require_ok(gq && gs && gt && ds4_gpu_qwen4_idx_score_q8_tensor(gs, gt, gq, gq8, cap, T, n, Hi, Di, pos0, ratio),
+                   "idx score q8");
+        float *got = download(gs, (uint64_t)T * n);
+        uint32_t *got_tiles = malloc((uint64_t)T * nt * 4);
+        require_ok(ds4_gpu_tensor_read(gt, 0, got_tiles, (uint64_t)T * nt * 4), "q8 tiles read");
+        for (uint64_t i = 0; i < (uint64_t)T * n; i++) {
+            if (memcmp(&got[i], &ref[i], 4)) {
+                fprintf(stderr, "idx score q8 T=%u n=%u: row %llu block %llu got %.9g ref %.9g\n", T, n,
+                        (unsigned long long)(i / n), (unsigned long long)(i % n), got[i], ref[i]);
+                exit(1);
+            }
+        }
+        if (memcmp(got_tiles, ref_tiles, (uint64_t)T * nt * 4)) {
+            fprintf(stderr, "idx score q8 T=%u n=%u: tile maxima differ\n", T, n);
+            exit(1);
+        }
+        free(got); free(got_tiles);
+    }
+    printf("  %-44s ok  bit-exact, T=1,2,3,8\n", "idx score q8 n and pos0 as given");
+    ds4_gpu_tensor_free(gt); ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gq);
+    ds4_gpu_tensor_free(gq8); ds4_gpu_tensor_free(gk);
+    free(ref_tiles); free(ref); free(qs); free(qq); free(q); free(got8); free(kd); free(kq); free(keyf); free(keyh);
+}
+#endif
+
 /* ---- indexer radix select ---- */
 
 #ifdef __APPLE__
@@ -1151,6 +1256,17 @@ static void test_attn_groups(void) {
     test_attn_mm_keys(2, 8193, true, 511, 24, true);
     test_attn_mm_keys(8, 8193, true, 511, 32, true);
     test_attn_mm_keys(2, 32769, false, 6, 24, true);
+    /* the 8-bit rows' grouped kernel (Volta's tensor cores) */
+    ds4_gpu_qwen4_set_kv_q8(true);
+    g_test_kv_q8 = true;
+    test_attn_mm_keys(32, 4093, false, 6, 24, false);
+    test_attn_mm_keys(33, 8193, true, 511, 24, false);
+    test_attn_mm_keys(64, 30000, true, 511, 24, false);
+    test_attn_mm_keys(32, 97, false, 6, 2, false);
+    test_attn_mm_keys(33, 100, true, 6, 32, false);
+    test_attn_mm_keys(33, 100, true, 6, 34, false);
+    ds4_gpu_qwen4_set_kv_q8(false);
+    g_test_kv_q8 = false;
 }
 #endif
 
@@ -1706,6 +1822,70 @@ static void rope_ref(double *x, uint32_t n_rot, uint32_t pos, double base) {
 /* Decode n_pos tokens one at a time through prep / block keys / scoring /
  * expand / attention and compare against a reference that recomputes the
  * selection.  k_blocks is small so the sparse path is exercised early. */
+/* The raw indexer keys in a ring of T + 8 rows indexed by pos % rows (the
+ * sessions' ring of a chunk and eight rows) pool into the same block keys as
+ * a row per position: chunks of T rows from pos0 on, each pooling the blocks
+ * it completes, the first from up to three rows of the chunk before. */
+static void test_ik_ring(arena_t *a, uint32_t T, uint32_t pos0, uint32_t n_pos) {
+    const uint32_t H = 4, Hkv = 2, D = 64, n_rot = 32, Hi = 2, Di = 128, ratio = 4;
+    const uint32_t cap = pos0 + n_pos + 4, n_bk = cap / ratio + 1;
+    double *w0, *w1, *w2, *w3;
+    const uint64_t gq_off = arena_f32(a, D, &w0, 0.5f, 1.5f), gk_off = arena_f32(a, D, &w1, 0.5f, 1.5f);
+    const uint64_t giq_off = arena_f32(a, Di, &w2, 0.5f, 1.5f), gik_off = arena_f32(a, Di, &w3, 0.5f, 1.5f);
+    float *qg = rand_vec((uint64_t)n_pos * H * 2 * D, 1.0f), *kp = rand_vec((uint64_t)n_pos * Hkv * D, 1.0f);
+    float *vp = rand_vec((uint64_t)n_pos * Hkv * D, 1.0f), *iq = rand_vec((uint64_t)n_pos * Hi * Di, 1.0f);
+    float *ik = rand_vec((uint64_t)n_pos * Di, 1.0f);
+    ds4_gpu_tensor *gqg = upload(qg, (uint64_t)n_pos * H * 2 * D), *gkp = upload(kp, (uint64_t)n_pos * Hkv * D);
+    ds4_gpu_tensor *gvp = upload(vp, (uint64_t)n_pos * Hkv * D), *giq = upload(iq, (uint64_t)n_pos * Hi * Di);
+    ds4_gpu_tensor *gik = upload(ik, (uint64_t)n_pos * Di);
+    ds4_gpu_tensor *gq = upload(NULL, (uint64_t)T * H * D), *ggate = upload(NULL, (uint64_t)T * H * D);
+    ds4_gpu_tensor *giqo = upload(NULL, (uint64_t)T * Hi * Di);
+    ds4_gpu_tensor *gpos3 = ds4_gpu_tensor_alloc((uint64_t)cap * 16);
+    require_ok(gpos3 != NULL, "ik ring pos3");
+    uint32_t *p3 = calloc((size_t)cap * 4, sizeof(uint32_t));
+    for (uint32_t p = 0; p < cap; p++) p3[p * 4] = p3[p * 4 + 1] = p3[p * 4 + 2] = p;
+    require_ok(ds4_gpu_tensor_write(gpos3, 0, p3, (uint64_t)cap * 16), "ik ring pos3 write");
+    free(p3);
+    uint8_t *keys[2];
+    for (int v = 0; v < 2; v++) {
+        const uint32_t rows = v ? T + 8 : cap;
+        ds4_gpu_tensor *gkc = ds4_gpu_tensor_alloc((uint64_t)cap * test_kv_row_bytes((uint64_t)Hkv * D));
+        ds4_gpu_tensor *gvc = ds4_gpu_tensor_alloc((uint64_t)cap * test_kv_row_bytes((uint64_t)Hkv * D));
+        ds4_gpu_tensor *gikc = upload(NULL, (uint64_t)rows * Di);
+        ds4_gpu_tensor *gbk = ds4_gpu_tensor_alloc((uint64_t)n_bk * Di * 2);
+        require_ok(gkc && gvc && gbk && ds4_gpu_tensor_fill_f32(gbk, 0.0f, (uint64_t)n_bk * Di / 2), "ik ring allocs");
+        for (uint32_t done = 0; done < n_pos; done += T) {
+            const uint32_t t = n_pos - done < T ? n_pos - done : T, p = pos0 + done;
+            ds4_gpu_tensor *vqg = ds4_gpu_tensor_view(gqg, (uint64_t)done * H * 2 * D * 4, (uint64_t)t * H * 2 * D * 4);
+            ds4_gpu_tensor *vk = ds4_gpu_tensor_view(gkp, (uint64_t)done * Hkv * D * 4, (uint64_t)t * Hkv * D * 4);
+            ds4_gpu_tensor *vv = ds4_gpu_tensor_view(gvp, (uint64_t)done * Hkv * D * 4, (uint64_t)t * Hkv * D * 4);
+            ds4_gpu_tensor *viq = ds4_gpu_tensor_view(giq, (uint64_t)done * Hi * Di * 4, (uint64_t)t * Hi * Di * 4);
+            ds4_gpu_tensor *vik = ds4_gpu_tensor_view(gik, (uint64_t)done * Di * 4, (uint64_t)t * Di * 4);
+            require_ok(ds4_gpu_qwen4_attn_prep_tensor(gq, ggate, gkc, gvc, giqo, gikc, vqg, vk, vv, viq, vik, gpos3,
+                                                      a->base, a->size, gq_off, gk_off, giq_off, t, H, Hkv, D, n_rot,
+                                                      Hi, Di, p, cap, 1.0e7f, 1e-6f), "ik ring prep");
+            const uint32_t b0 = p / ratio, b1 = (p + t) / ratio;
+            if (b1 > b0)
+                require_ok(ds4_gpu_qwen4_idx_block_key_tensor(gbk, gikc, gpos3, a->base, a->size, gik_off, b0, b1 - b0,
+                                                              ratio, Di, n_rot, 1.0e7f, 1e-6f), "ik ring block key");
+            ds4_gpu_tensor_free(vik); ds4_gpu_tensor_free(viq); ds4_gpu_tensor_free(vv);
+            ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vqg);
+        }
+        keys[v] = malloc((uint64_t)n_bk * Di * 2);
+        require_ok(ds4_gpu_tensor_read(gbk, 0, keys[v], (uint64_t)n_bk * Di * 2), "ik ring read");
+        ds4_gpu_tensor_free(gbk); ds4_gpu_tensor_free(gikc); ds4_gpu_tensor_free(gvc); ds4_gpu_tensor_free(gkc);
+    }
+    /* blocks wholly after pos0 (the ones before it pool rows nobody wrote) */
+    const uint32_t first = (pos0 + ratio - 1) / ratio, last = (pos0 + n_pos) / ratio;
+    require_ok(last > first && !memcmp(keys[0] + (uint64_t)first * Di * 2, keys[1] + (uint64_t)first * Di * 2,
+                                       (uint64_t)(last - first) * Di * 2), "ik ring block keys match the full cache");
+    free(keys[0]); free(keys[1]);
+    ds4_gpu_tensor_free(gpos3); ds4_gpu_tensor_free(giqo); ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(gq);
+    ds4_gpu_tensor_free(gik); ds4_gpu_tensor_free(giq); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(gkp);
+    ds4_gpu_tensor_free(gqg);
+    free(ik); free(iq); free(vp); free(kp); free(qg);
+}
+
 static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t n_rot,
                            uint32_t Hi, uint32_t Di, uint32_t k_blocks, uint32_t n_pos) {
     const uint32_t ratio = 4, cap = n_pos + 4, group = H / Hkv;
@@ -1859,6 +2039,27 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
         if ((pos + 1) % ratio == 0) {
             require_ok(ds4_gpu_qwen4_idx_block_key_tensor(gbk, gikc, gpos3, a->base, a->size, gik_off, n_blocks - 1, 1,
                                                           ratio, Di, n_rot, (float)base, (float)eps), "block key");
+#ifndef __APPLE__
+            if (Di == 128) {   /* the q8 writer: the same f16 key, and the int8 copy a refresh makes of it */
+                const uint32_t qcap = cap / ratio + 1, b = n_blocks - 1;
+                ds4_gpu_tensor *gbk2 = ds4_gpu_tensor_alloc((uint64_t)qcap * Di * 2);
+                ds4_gpu_tensor *gq8a = ds4_gpu_tensor_alloc((uint64_t)qcap * (Di + 8));
+                ds4_gpu_tensor *gq8b = ds4_gpu_tensor_alloc((uint64_t)qcap * (Di + 8));
+                require_ok(gbk2 && gq8a && gq8b &&
+                           ds4_gpu_qwen4_idx_block_key_q8_tensor(gbk2, gq8a, qcap, gikc, gpos3, a->base, a->size, gik_off,
+                                                                 b, 1, ratio, Di, n_rot, (float)base, (float)eps) &&
+                           ds4_gpu_qwen4_idx_block_key_q8_refresh(gq8b, qcap, gbk, b, 1), "q8 block key");
+                uint8_t k1[256], k2[256], q1[136], q2[136];
+                require_ok(ds4_gpu_tensor_read(gbk, (uint64_t)b * 256, k1, 256) &&
+                           ds4_gpu_tensor_read(gbk2, (uint64_t)b * 256, k2, 256) &&
+                           ds4_gpu_tensor_read(gq8a, (uint64_t)b * 128, q1, 128) &&
+                           ds4_gpu_tensor_read(gq8b, (uint64_t)b * 128, q2, 128) &&
+                           ds4_gpu_tensor_read(gq8a, (uint64_t)qcap * 128 + b * 8, q1 + 128, 8) &&
+                           ds4_gpu_tensor_read(gq8b, (uint64_t)qcap * 128 + b * 8, q2 + 128, 8), "q8 block key read");
+                require_ok(!memcmp(k1, k2, 256) && !memcmp(q1, q2, 136), "q8 block key matches the f16 writer");
+                ds4_gpu_tensor_free(gq8b); ds4_gpu_tensor_free(gq8a); ds4_gpu_tensor_free(gbk2);
+            }
+#endif
         }
         const bool sparse = n_blocks > k_blocks;
         if (sparse) {
@@ -4364,6 +4565,16 @@ static void bench_dispatch(arena_t *a) {
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
     c.n[2] = 0; bench_run("attn sparse T=1024 ctx=256k random blocks", bench_p_attn_sparse, &c, 5);
     c.n[2] = 1; bench_run("attn sparse T=1024 ctx=256k blocks in last 8k", bench_p_attn_sparse, &c, 5);
+#ifndef __APPLE__
+    /* the 8-bit rows (the K/V buffers hold f16 rows' bytes, more than 8-bit rows need) */
+    ds4_gpu_qwen4_set_kv_q8(true);
+    c.n[2] = 0; bench_run("attn sparse q8 T=1024 ctx=256k random blocks", bench_p_attn_sparse, &c, 5);
+    c.n[2] = 1; bench_run("attn sparse q8 T=1024 ctx=256k blocks in last 8k", bench_p_attn_sparse, &c, 5);
+    setenv("DS4_QWEN4_NO_ATTN_MM", "1", 1);
+    c.n[2] = 0; bench_run("attn sparse q8 T=1024 ctx=256k random (per-token kernel)", bench_p_attn_sparse, &c, 5);
+    unsetenv("DS4_QWEN4_NO_ATTN_MM");
+    ds4_gpu_qwen4_set_kv_q8(false);
+#endif
     bench_run("router gemv f32 512x2560", bench_router_gemv, &c, 100);
     bench_run("router_topk (+gate logit)", bench_router_topk, &c, 100);
     bench_run("router_topk bf16 gate", bench_router_topk_bf16, &c, 100);
@@ -4904,6 +5115,12 @@ int main(void) {
     test_gdn(&arena, 16, 48, 128, 200);
     test_idx_score_mm(37, 3001, 11000);
     test_idx_score_mm(3, 70, 100);
+#ifndef __APPLE__
+    test_idx_score_mm(9, 130, 400);           /* one full 8-row group and a row */
+    test_idx_score_mm(1024, 2000, 9000);      /* a prefill chunk */
+    test_idx_score_q8(37, 100);
+    test_idx_score_q8(70001, 4 * 69990);
+#endif
     test_idx_select(4, 70001, 512, 69000);
     test_idx_select(3, 600, 512, 599);
     test_idx_select(2, 3000, 512, 520);
@@ -4961,6 +5178,10 @@ int main(void) {
 #ifdef __APPLE__
     test_attention_rows(&arena);
 #endif
+    printf("indexer key ring\n");
+    test_ik_ring(&arena, 3, 0, 61);       /* verify windows, a block across every chunk */
+    test_ik_ring(&arena, 37, 4097, 300);  /* ragged prefill chunks past the ring's span */
+    test_ik_ring(&arena, 64, 0, 64 * 9);
     test_attn_mm(32, 4093, false);
     test_attn_mm(33, 8193, true);
     test_attn_mm(4, 100, false);

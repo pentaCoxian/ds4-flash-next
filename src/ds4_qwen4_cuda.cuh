@@ -64,11 +64,11 @@ __global__ void attn_prep(float *qout, float *gate, char *kc, char *vc,
         const float *iq, const float *ik, const uint32_t *pos3,
         const float *gq, const float *gk, const float *giq,
         unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
-        unsigned pos0, float eps, rope_args rp) {
+        unsigned pos0, unsigned ik_rows, float eps, rope_args rp) {
     const unsigned slot = blockIdx.x, t = blockIdx.y, pos = pos0 + t, lane = threadIdx.x;
     __shared__ float row[256];
     if (slot == H + Hkv + Hi) {
-        for (unsigned i = lane; i < Di; i += 32) ikc[(uint64_t)pos * Di + i] = ik[(uint64_t)t * Di + i];
+        for (unsigned i = lane; i < Di; i += 32) ikc[(uint64_t)(pos % ik_rows) * Di + i] = ik[(uint64_t)t * Di + i];
         return;
     }
     const bool isq = slot < H, isk = !isq && slot < H + Hkv;
@@ -99,14 +99,35 @@ __global__ void attn_prep(float *qout, float *gate, char *kc, char *vc,
     }
 }
 
-__global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
-        const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
+/* The int8 copy of the pooled block keys (D = 128) that decode rows score
+ * from: a block's 128 values as int8, and after the cap blocks of those an
+ * f16 scale per 32 values, rounded from the f16 key as kv_store_q8 rounds a
+ * K/V value.  136 bytes a block against 256.  The warp holds elements
+ * i = 32g + lane of block b. */
+__device__ __forceinline__ void block_key_q8_store(char *q8, unsigned cap, unsigned b, unsigned i, __half h) {
+    const float x = __half2float(h);
+    float a = fabsf(x);
+    for (unsigned m = 16; m; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+    const __half d = __float2half_rn(__fdiv_rn(a, 127.0f));
+    const float id = __half2float(d) > 0 ? __fdiv_rn(1.0f, __half2float(d)) : 0;
+    q8[(uint64_t)b * 128 + i] = (char)(int)fminf(fmaxf(rintf(__fmul_rn(x, id)), -127.0f), 127.0f);
+    if (!(threadIdx.x & 31)) ((__half *)(q8 + (uint64_t)cap * 128))[(uint64_t)b * 4 + i / 32] = d;
+}
+
+__global__ void block_key_q8_from_half(char *q8, unsigned cap, const __half *key, unsigned block0) {
+    const unsigned b = block0 + blockIdx.x;
+    for (unsigned i = threadIdx.x; i < 128; i += 32) block_key_q8_store(q8, cap, b, i, key[(uint64_t)b * 128 + i]);
+}
+
+__global__ void block_key(__half *out, char *q8, unsigned q8_cap, const float *ik, unsigned ik_rows,
+        const uint32_t *pos3, const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps,
+        rope_args rp) {
     const unsigned b = block0 + blockIdx.x, lane = threadIdx.x, npt = D / 32;
     __shared__ float row[128];
     float ss = 0, v[4];
     for (unsigned i = 0; i < npt; i++) {
         float a = 0;
-        for (unsigned t = 0; t < ratio; t++) a += ik[((uint64_t)b * ratio + t) * D + lane * npt + i];
+        for (unsigned t = 0; t < ratio; t++) a += ik[(uint64_t)((b * ratio + t) % ik_rows) * D + lane * npt + i];
         v[i] = a / ratio;
         ss += v[i] * v[i];
     }
@@ -114,7 +135,11 @@ __global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
     for (unsigned i = 0; i < npt; i++) row[lane * npt + i] = v[i] * inv * gamma[lane * npt + i];
     __syncwarp();
     apply_rope(row, pos3 + (uint64_t)b * ratio * 4, rp);
-    for (unsigned i = lane; i < D; i += 32) out[(uint64_t)b * D + i] = __float2half_rn(row[i]);
+    for (unsigned i = lane; i < D; i += 32) {
+        const __half h = __float2half_rn(row[i]);
+        out[(uint64_t)b * D + i] = h;
+        if (q8) block_key_q8_store(q8, q8_cap, b, i, h);
+    }
 }
 
 __global__ void idx_score(float *out, const float *q, const __half *key,
@@ -130,6 +155,127 @@ __global__ void idx_score(float *out, const float *q, const __half *key,
         score += fmaxf(sum(a), 0);
     }
     if (!lane) out[(uint64_t)t * N + b] = score;
+}
+
+/* Decode and verify rows (T <= 8) score the int8 block keys once for all
+ * rows: four lanes a block and a lane one 32-value group, read as two
+ * 16-byte loads, each row's int8 queries (rounded as quantize_q8 rounds,
+ * staged per block) against it with dp4a.  A head's four group sums add as
+ * (g0 + g1) + (g2 + g3) and the heads' ReLUs in head order, so a row's
+ * score does not depend on T.  Eight consecutive blocks are a warp, so the
+ * rows' tile maxima (tile_max's) fall out of three shuffles. */
+template<unsigned H>
+__global__ void __launch_bounds__(256) idx_score_q8(float *out, unsigned *tiles, const float *q, const char *q8,
+        unsigned cap, unsigned N, unsigned T, unsigned pos0, unsigned ratio) {
+    __shared__ int qw[8][H][32];
+    __shared__ float qs[8][H][4];
+    const unsigned tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
+    for (unsigned g = warp; g < T * H * 4; g += 8) {
+        const float v = q[(uint64_t)g * 32 + lane];
+        float amax = fabsf(v);
+        for (unsigned o = 16; o; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+        const float s = __fdiv_rn(amax, 127.f);
+        const unsigned byte = (unsigned)__float2int_rn(s > 0 ? __fdiv_rn(v, s) : 0.f) & 255u;
+        const unsigned w = byte | __shfl_down_sync(0xffffffff, byte, 1) << 8 |
+                           __shfl_down_sync(0xffffffff, byte, 2) << 16 | __shfl_down_sync(0xffffffff, byte, 3) << 24;
+        if (!(lane & 3)) qw[g / (H * 4)][g / 4 % H][g % 4 * 8 + lane / 4] = (int)w;
+        if (!lane) qs[g / (H * 4)][g / 4 % H][g % 4] = s;
+    }
+    __syncthreads();
+    const unsigned j = lane & 3, nt = (N + 7) / 8;
+    const __half *ks = (const __half *)(q8 + (uint64_t)cap * 128);
+    for (unsigned base = (blockIdx.x * 8 + warp) * 8; base < N; base += gridDim.x * 64) {
+        const unsigned b = base + lane / 4;
+        int4 k0 = make_int4(0, 0, 0, 0), k1 = k0;
+        float kd = 0;
+        if (b < N) {
+            const int4 *p = (const int4 *)(q8 + (uint64_t)b * 128 + j * 32);
+            k0 = p[0]; k1 = p[1];
+            kd = __half2float(ks[(uint64_t)b * 4 + j]);
+        }
+        for (unsigned t = 0; t < T; t++) {
+            float score = 0;
+            #pragma unroll
+            for (unsigned h = 0; h < H; h++) {
+                const int *w = qw[t][h] + j * 8;
+                int acc = __dp4a(k0.x, w[0], 0);
+                acc = __dp4a(k0.y, w[1], acc); acc = __dp4a(k0.z, w[2], acc); acc = __dp4a(k0.w, w[3], acc);
+                acc = __dp4a(k1.x, w[4], acc); acc = __dp4a(k1.y, w[5], acc);
+                acc = __dp4a(k1.z, w[6], acc); acc = __dp4a(k1.w, w[7], acc);
+                float part = __fmul_rn(__fmul_rn((float)acc, qs[t][h][j]), kd);
+                part = __fadd_rn(part, __shfl_xor_sync(0xffffffff, part, 1));
+                part = __fadd_rn(part, __shfl_xor_sync(0xffffffff, part, 2));
+                score = __fadd_rn(score, fmaxf(part, 0));
+            }
+            if (b >= (pos0 + t + 1) / ratio) score = -3e38f;
+            if (b < N && !j) out[(uint64_t)t * N + b] = score;
+            if (tiles) {
+                unsigned v = b < N ? __float_as_uint(fmaxf(score, 0)) : 0;
+                v = max(v, __shfl_xor_sync(0xffffffff, v, 4));
+                v = max(v, __shfl_xor_sync(0xffffffff, v, 8));
+                v = max(v, __shfl_xor_sync(0xffffffff, v, 16));
+                if (!lane) tiles[(uint64_t)t * nt + base / 8] = v;
+            }
+        }
+    }
+}
+
+/* Prefill rows' indexer scores on the tensor cores (Volta's wmma and later):
+ * a block keeps 64 pooled keys (f16, as stored) in shared memory while groups
+ * of 8 rows pass over them, their 32 query heads as half plus a half
+ * residual scaled by 4096 (attention_group's split), so the products keep
+ * the FP32 queries' precision.  A warp owns one 16x16 tile of the 32 x 64
+ * head scores; the heads' ReLUs then add in head order. */
+template<unsigned H>
+__global__ void __launch_bounds__(256) idx_score_mm(float *out, const float *q, const __half *key,
+        unsigned N, unsigned T, unsigned pos0, unsigned ratio) {
+#if __CUDA_ARCH__ >= 700
+    namespace wm = nvcuda::wmma;
+    constexpr unsigned D = 128, NB = 64, RT = 8, M = RT * H, LD = D + 8, CL = NB + 4;
+    static_assert(M == 32, "two 16-row tiles of query heads");
+    __shared__ __align__(32) __half ks[NB][LD], qh[M][LD], ql[M][LD];
+    __shared__ __align__(32) float c[M][CL];
+    const unsigned tid = threadIdx.x, warp = tid / 32, b0 = blockIdx.x * NB, mi = warp / 4, ni = warp % 4;
+    for (unsigned i = tid; i < NB * D / 8; i += 256) {
+        const unsigned r = i / (D / 8), c8 = i % (D / 8), b = b0 + r;
+        *(uint4 *)&ks[r][c8 * 8] = b < N ? *(const uint4 *)(key + (uint64_t)b * D + c8 * 8) : make_uint4(0, 0, 0, 0);
+    }
+    for (unsigned t0 = 0; t0 < T; t0 += RT) {
+        __syncthreads();
+        for (unsigned i = tid; i < M * D; i += 256) {
+            const unsigned r = i / D, d = i % D;
+            const float v = t0 + r / H < T ? q[((uint64_t)t0 * H + r) * D + d] : 0;
+            const __half hv = __float2half_rn(v);
+            qh[r][d] = hv;
+            ql[r][d] = __float2half_rn((v - __half2float(hv)) * 4096.0f);
+        }
+        __syncthreads();
+        wm::fragment<wm::accumulator,16,16,16,float> hi, lo;
+        wm::fill_fragment(hi, 0);
+        wm::fill_fragment(lo, 0);
+        #pragma unroll
+        for (unsigned k = 0; k < D; k += 16) {
+            wm::fragment<wm::matrix_b,16,16,16,__half,wm::col_major> bf;
+            wm::fragment<wm::matrix_a,16,16,16,__half,wm::row_major> af;
+            wm::load_matrix_sync(bf, &ks[ni * 16][k], LD);
+            wm::load_matrix_sync(af, &qh[mi * 16][k], LD);
+            wm::mma_sync(hi, af, bf, hi);
+            wm::load_matrix_sync(af, &ql[mi * 16][k], LD);
+            wm::mma_sync(lo, af, bf, lo);
+        }
+        for (unsigned i = 0; i < hi.num_elements; i++) hi.x[i] += lo.x[i] * 0x1p-12f;
+        wm::store_matrix_sync(&c[mi * 16][ni * 16], hi, CL, wm::mem_row_major);
+        __syncthreads();
+        for (unsigned i = tid; i < RT * NB; i += 256) {
+            const unsigned r = i / NB, bl = i % NB, t = t0 + r, b = b0 + bl;
+            if (t >= T || b >= N) continue;
+            float s = 0;
+            #pragma unroll
+            for (unsigned h = 0; h < H; h++) s += fmaxf(c[r * H + h][bl], 0);
+            out[(uint64_t)t * N + b] = b >= (pos0 + t + 1) / ratio ? -3e38f : s;
+        }
+    }
+#endif
 }
 
 __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigned tiles) {
@@ -513,8 +659,192 @@ __global__ void attention_group(float *out, const float *q, const float *gate,
 #endif
 }
 
+/* 16 int8 values as 16 halves, exactly */
+__device__ __forceinline__ void int8x16_to_half(__half *dst, int4 w) {
+    const int x[4] = { w.x, w.y, w.z, w.w };
+    __half2 h[8];
+    #pragma unroll
+    for (unsigned k = 0; k < 4; k++) {
+        h[2 * k] = __halves2half2(__int2half_rn((signed char)x[k]), __int2half_rn((signed char)(x[k] >> 8)));
+        h[2 * k + 1] = __halves2half2(__int2half_rn((signed char)(x[k] >> 16)), __int2half_rn((signed char)(x[k] >> 24)));
+    }
+    ((uint4 *)dst)[0] = *(const uint4 *)&h[0];
+    ((uint4 *)dst)[1] = *(const uint4 *)&h[4];
+}
+
+/* attention_group for 8-bit K/V rows on the first tensor cores (Volta's
+ * wmma, prefill chunks): one block a row and KV group (its query heads
+ * padded to 16), 16 selected keys a step.  The rows' int8 values enter the
+ * products as half exactly and their scales in FP32: for the scores a warp
+ * takes one 32-value scale group of the keys and scales its partial by those
+ * keys' scales, for the values a warp owns the 32 output dimensions of one
+ * scale group and folds the values' scales into its copy of the
+ * probabilities.  Queries and probabilities enter as half plus a half
+ * residual scaled by 4096, as above, with FP32 sums.  The outputs stay in
+ * wmma fragments; fragments of row and column indices, loaded once, give each
+ * element its head and key, so the online softmax scales them in place.  The
+ * next step's rows are read into registers while the tensor cores work. */
+__global__ void __launch_bounds__(256) attention_group_q8(float *out, const float *q, const float *gate,
+        const char *kc, const char *vc, const int *sel, const unsigned *counts,
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
+#if __CUDA_ARCH__ >= 700
+    namespace wm = nvcuda::wmma;
+    constexpr unsigned D = 256, KB = 16, LD = D + 8, PL = KB + 8, SL = KB + 4;
+    const unsigned tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
+    const unsigned t = blockIdx.y, kh = blockIdx.x, group = H / Hkv;
+    const unsigned n = sparse ? counts[t] : pos0 + t + 1, last = pos0 + t;
+    const uint64_t kv_dim = (uint64_t)Hkv * D, rb = kv_row_bytes(kv_dim, true);
+    __shared__ __align__(32) __half qhl[2][16][LD], ks[KB][LD], vs[KB][LD];
+    union Work { float part[8][16][SL]; __half pw[8][2][16][PL]; float map[2][16][16]; };
+    __shared__ __align__(32) Work wk;
+    __shared__ float probf[16][SL], ksc[KB][8], vsc[KB][8];
+    __shared__ float max_score[16], denom[16], correction[16], qs[16];
+    __shared__ unsigned valid[KB];
+    const unsigned qr = tid / 16, col = tid % 16, h = kh * group + qr;
+    float mx = 0;
+    for (unsigned d = col; d < D; d += 16)
+        if (qr < group) mx = fmaxf(mx, fabsf(q[((uint64_t)t * H + h) * D + d] * scale));
+    for (unsigned off = 8; off; off /= 2) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off, 16));
+    const int e = mx > 0 ? max(-120, min(120, (int)((__float_as_uint(mx) >> 23) & 255) - 127)) : 0;
+    const float inv = ldexpf(1, -e);
+    if (!col) { qs[qr] = ldexpf(1, e); max_score[qr] = -3e38f; denom[qr] = 0; }
+    for (unsigned d = col; d < D; d += 16) {
+        const float v = qr < group ? q[((uint64_t)t * H + h) * D + d] * scale * inv : 0;
+        const __half hv = __float2half_rn(v);
+        qhl[0][qr][d] = hv;
+        qhl[1][qr][d] = __float2half_rn((v - __half2float(hv)) * 4096);
+    }
+    wk.map[0][qr][col] = (float)qr;
+    wk.map[1][qr][col] = (float)col;
+    __syncthreads();
+    wm::fragment<wm::accumulator,16,16,16,float> rowf, colf, acc[2];
+    wm::load_matrix_sync(rowf, &wk.map[0][0][0], 16, wm::mem_row_major);
+    wm::load_matrix_sync(colf, &wk.map[1][0][0], 16, wm::mem_row_major);
+    wm::fill_fragment(acc[0], 0);
+    wm::fill_fragment(acc[1], 0);
+    /* a thread loads 16 bytes of one key's K and V rows, and their scale on even segments */
+    const unsigned lr = tid / 16, ls = tid % 16;
+    int4 kr = make_int4(0, 0, 0, 0), vr = kr;
+    float ksv = 0, vsv = 0;
+    bool ok = false;
+    auto fetch = [&](unsigned j0) {
+        const unsigned j = j0 + lr;
+        const unsigned p = j < n ? (sparse ? (unsigned)sel[(uint64_t)t * stride + j] : j) : UINT_MAX;
+        ok = p <= last;
+        kr = vr = make_int4(0, 0, 0, 0);
+        ksv = vsv = 0;
+        if (ok) {
+            const char *krow = kc + (uint64_t)p * rb, *vrow = vc + (uint64_t)p * rb;
+            kr = *(const int4 *)(krow + kh * D + ls * 16);
+            vr = *(const int4 *)(vrow + kh * D + ls * 16);
+            if (!(ls & 1)) {
+                ksv = __half2float(((const __half *)(krow + kv_dim))[kh * (D / 32) + ls / 2]);
+                vsv = __half2float(((const __half *)(vrow + kv_dim))[kh * (D / 32) + ls / 2]);
+            }
+        }
+    };
+    fetch(0);
+    for (unsigned j0 = 0; j0 < n; j0 += KB) {
+        __syncthreads();
+        int8x16_to_half(&ks[lr][ls * 16], kr);
+        int8x16_to_half(&vs[lr][ls * 16], vr);
+        if (!(ls & 1)) { ksc[lr][ls / 2] = ksv; vsc[lr][ls / 2] = vsv; }
+        if (!ls) valid[lr] = ok;
+        if (j0 + KB < n) fetch(j0 + KB);
+        __syncthreads();
+        {   /* scores: warp g takes values 32g..32g+31 of the keys */
+            const unsigned g = warp;
+            wm::fragment<wm::accumulator,16,16,16,float> hi, lo;
+            wm::fill_fragment(hi, 0);
+            wm::fill_fragment(lo, 0);
+            #pragma unroll
+            for (unsigned k = g * 32; k < g * 32 + 32; k += 16) {
+                wm::fragment<wm::matrix_b,16,16,16,__half,wm::col_major> bf;
+                wm::fragment<wm::matrix_a,16,16,16,__half,wm::row_major> af;
+                wm::load_matrix_sync(bf, &ks[0][k], LD);
+                wm::load_matrix_sync(af, &qhl[0][0][k], LD);
+                wm::mma_sync(hi, af, bf, hi);
+                wm::load_matrix_sync(af, &qhl[1][0][k], LD);
+                wm::mma_sync(lo, af, bf, lo);
+            }
+            for (unsigned i = 0; i < hi.num_elements; i++)
+                hi.x[i] = (hi.x[i] + lo.x[i] * 0x1p-12f) * ksc[(unsigned)colf.x[i]][g];
+            wm::store_matrix_sync(&wk.part[g][0][0], hi, SL, wm::mem_row_major);
+        }
+        __syncthreads();
+        {   /* online softmax: a thread one head and key */
+            float s = -3e38f;
+            if (valid[col]) {
+                s = 0;
+                #pragma unroll
+                for (unsigned g = 0; g < 8; g++) s += wk.part[g][qr][col];
+                s *= qs[qr];
+            }
+            float peak = fmaxf(max_score[qr], s);
+            for (unsigned off = 8; off; off /= 2) peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, off, 16));
+            const float p = valid[col] ? expf(s - peak) : 0;
+            float total = p;
+            for (unsigned off = 8; off; off /= 2) total += __shfl_xor_sync(0xffffffff, total, off, 16);
+            probf[qr][col] = p;
+            __syncthreads();
+            if (!col) {
+                const float old = expf(max_score[qr] - peak);
+                correction[qr] = old;
+                max_score[qr] = peak;
+                denom[qr] = denom[qr] * old + total;
+            }
+        }
+        __syncthreads();
+        {   /* values: warp g owns output dimensions 32g..32g+31 */
+            const unsigned g = warp;
+            for (unsigned i = lane; i < 16 * KB; i += 32) {
+                const unsigned r = i / KB, k = i % KB;
+                const float v = probf[r][k] * vsc[k][g];
+                const __half hv = __float2half_rn(v);
+                wk.pw[g][0][r][k] = hv;
+                wk.pw[g][1][r][k] = __float2half_rn((v - __half2float(hv)) * 4096.0f);
+            }
+            __syncwarp();
+            wm::fragment<wm::matrix_a,16,16,16,__half,wm::row_major> ah, al;
+            wm::load_matrix_sync(ah, &wk.pw[g][0][0][0], PL);
+            wm::load_matrix_sync(al, &wk.pw[g][1][0][0], PL);
+            #pragma unroll
+            for (unsigned jn = 0; jn < 2; jn++) {
+                wm::fragment<wm::matrix_b,16,16,16,__half,wm::row_major> bf;
+                wm::fragment<wm::accumulator,16,16,16,float> hi, lo;
+                wm::load_matrix_sync(bf, &vs[0][g * 32 + jn * 16], LD);
+                wm::fill_fragment(hi, 0);
+                wm::fill_fragment(lo, 0);
+                wm::mma_sync(hi, ah, bf, hi);
+                wm::mma_sync(lo, al, bf, lo);
+                for (unsigned i = 0; i < hi.num_elements; i++)
+                    acc[jn].x[i] = acc[jn].x[i] * correction[(unsigned)rowf.x[i]] + (hi.x[i] + lo.x[i] * 0x1p-12f);
+            }
+        }
+    }
+    __syncthreads();
+    float (*ob)[D + 4] = (float (*)[D + 4])&qhl[0][0][0];
+    #pragma unroll
+    for (unsigned jn = 0; jn < 2; jn++)
+        wm::store_matrix_sync(&ob[0][warp * 32 + jn * 16], acc[jn], D + 4, wm::mem_row_major);
+    __syncthreads();
+    for (unsigned i = tid; i < group * D; i += 256) {
+        const unsigned r = i / D, d = i % D;
+        const uint64_t dst = ((uint64_t)t * H + kh * group + r) * D + d;
+        out[dst] = (denom[r] > 0 ? ob[r][d] / denom[r] : 0) * sigmoid(gate[dst]);
+    }
+#endif
+}
+
 static bool tensor(const ds4_gpu_tensor *t, uint64_t bytes) {
     return t && t->ptr && bytes <= t->bytes;
+}
+
+/* Rows of a raw indexer key cache: up to want, fewer when the tensor is a
+ * ring that the kernels index by pos % rows (as metal/qwen4.metal does). */
+static uint64_t ik_ring_rows(const ds4_gpu_tensor *ik, uint32_t D, uint64_t want) {
+    const uint64_t rows = ik && ik->ptr && D ? ik->bytes / ((uint64_t)D * 4) : 0;
+    return rows < want ? rows : want;
 }
 
 __host__ __device__ static uint64_t row_bytes(uint32_t type, uint64_t n) {
@@ -3239,7 +3569,7 @@ __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const f
     const unsigned C = (2 * Hk + Hv) * D, npt = D / 32;
     float *q = qkv + (uint64_t)t * C + h * D + lane * npt, *k = q + Hk * D;
     float qs = 0, ks = 0;
-    for (unsigned i = 0; i < npt; i++) { qs += q[i] * q[i]; ks += k[i] * k[i]; }
+    for (unsigned i = 0; i < npt; i++) { qs = __fmaf_rn(q[i], q[i], qs); ks = __fmaf_rn(k[i], k[i], ks); }
     qs = rsqrtf(sum(qs) + 1e-6f) * rsqrtf((float)D);
     ks = rsqrtf(sum(ks) + 1e-6f);
     for (unsigned i = 0; i < npt; i++) { q[i] *= qs; k[i] *= ks; }
@@ -3275,7 +3605,7 @@ __global__ void gdn_scan(float *out, float *state, const float *qkv,
         float qn[4], kn[4];
         if (PREP) {
             float qs = 0, ks = 0;
-            for (unsigned i = 0; i < npt; i++) { qs += q[i] * q[i]; ks += k[i] * k[i]; }
+            for (unsigned i = 0; i < npt; i++) { qs = __fmaf_rn(q[i], q[i], qs); ks = __fmaf_rn(k[i], k[i], ks); }
             qs = rsqrtf(sum(qs) + 1e-6f) * rsqrtf((float)dim);   /* dim = D at run time, as gdn_prep's
                                                                    * rsqrtf: a constant would fold exactly */
             ks = rsqrtf(sum(ks) + 1e-6f);
@@ -3304,6 +3634,79 @@ __global__ void gdn_scan(float *out, float *state, const float *qkv,
     for (unsigned r = 0; r < ROWS; r++)
         #pragma unroll
         for (unsigned i = 0; i < npt; i++) state[idx+(uint64_t)r*D+i] = s[r][i];
+}
+
+/* The scan of 128-dim heads, every row count: eight lanes a state row, 16 of
+ * its 128 values each.  A warp walks 4R rows, R in each lane group; each
+ * reduction is three shuffles instead of gdn_scan's five, a lane's partial
+ * sums four independent chains, and the next token's q, k, v and gates load
+ * at the top of the step.  gdn_scan's per-token reads and then its 32-lane
+ * shuffles bounded prefill (3.15 against 1.40 ms for 1024 tokens of 48 heads
+ * on a V100).  A row's arithmetic does not depend on R or T, so a prompt
+ * split into chunks and tails gets the bits of a whole one.
+ * DS4_QWEN4_GDN_SCAN_PLAIN=1 keeps gdn_scan for A/B. */
+template<unsigned R>
+__global__ void __launch_bounds__(128) gdn_scan_l8(float *out, float *state, const float *qkv,
+        const float *a, const float *b, unsigned T, unsigned Hk, unsigned Hv,
+        float *snap, unsigned st, float *snap2, unsigned st2) {
+    constexpr unsigned D = 128, NPT = 16;
+    const unsigned lane = threadIdx.x & 31, grp = lane / 8, h = blockIdx.y, kh = h % Hk;
+    const unsigned dv = (blockIdx.x * 4 + threadIdx.x / 32) * 4 * R + grp * R, k0 = (lane & 7) * NPT;
+    const unsigned C = (2 * Hk + Hv) * D;
+    const uint64_t idx = ((uint64_t)h * D + dv) * D + k0;
+    float s[R][NPT];
+    #pragma unroll
+    for (unsigned r = 0; r < R; r++)
+        #pragma unroll
+        for (unsigned i = 0; i < NPT; i += 4) *(float4 *)&s[r][i] = *(const float4 *)&state[idx + (uint64_t)r * D + i];
+    float cq[NPT], ck[NPT], cv[R], ca, cb, nq[NPT], nk[NPT], nv[R], na, nb;
+    auto fetch = [&](unsigned t, float (&q)[NPT], float (&k)[NPT], float (&v)[R], float &da, float &db) {
+        const float *row = qkv + (uint64_t)t * C;
+        #pragma unroll
+        for (unsigned i = 0; i < NPT; i += 4) {
+            *(float4 *)&q[i] = *(const float4 *)&row[kh * D + k0 + i];
+            *(float4 *)&k[i] = *(const float4 *)&row[(Hk + kh) * D + k0 + i];
+        }
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) v[r] = row[2 * Hk * D + h * D + dv + r];
+        da = a[(uint64_t)t * Hv + h];
+        db = b[(uint64_t)t * Hv + h];
+    };
+    fetch(0, cq, ck, cv, ca, cb);
+    for (unsigned t = 0; t < T; t++) {
+        if (t + 1 < T) fetch(t + 1, nq, nk, nv, na, nb);
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) {
+            float up[4] = {};
+            #pragma unroll
+            for (unsigned i = 0; i < NPT; i++) { s[r][i] *= ca; up[i % 4] += s[r][i] * ck[i]; }
+            float u = (up[0] + up[1]) + (up[2] + up[3]);
+            u += __shfl_xor_sync(0xffffffff, u, 1);
+            u += __shfl_xor_sync(0xffffffff, u, 2);
+            u += __shfl_xor_sync(0xffffffff, u, 4);
+            const float delta = (cv[r] - u) * cb;
+            float op[4] = {};
+            #pragma unroll
+            for (unsigned i = 0; i < NPT; i++) { s[r][i] += ck[i] * delta; op[i % 4] += s[r][i] * cq[i]; }
+            float o = (op[0] + op[1]) + (op[2] + op[3]);
+            o += __shfl_xor_sync(0xffffffff, o, 1);
+            o += __shfl_xor_sync(0xffffffff, o, 2);
+            o += __shfl_xor_sync(0xffffffff, o, 4);
+            if (!(lane & 7)) out[((uint64_t)t * Hv + h) * D + dv + r] = o;
+            if (snap && t == st) for (unsigned i = 0; i < NPT; i++) snap[idx + (uint64_t)r * D + i] = s[r][i];
+            if (snap2 && t == st2) for (unsigned i = 0; i < NPT; i++) snap2[idx + (uint64_t)r * D + i] = s[r][i];
+        }
+        #pragma unroll
+        for (unsigned i = 0; i < NPT; i++) { cq[i] = nq[i]; ck[i] = nk[i]; }
+        #pragma unroll
+        for (unsigned r = 0; r < R; r++) cv[r] = nv[r];
+        ca = na;
+        cb = nb;
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < R; r++)
+        #pragma unroll
+        for (unsigned i = 0; i < NPT; i += 4) *(float4 *)&state[idx + (uint64_t)r * D + i] = *(const float4 *)&s[r][i];
 }
 
 /* With oq it also rounds the output to int8 for ssm_out, as quantize_q8
@@ -3425,7 +3828,19 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
         T,Hk,Hv,snap ? (float *)snap->ptr : NULL,st,snap2 ? (float *)snap2->ptr : NULL,st2,A,bias,D)
 #define QWEN_GDN_DIM(DIM) case DIM: if (T > 8) { QWEN_GDN(4,DIM,false); } else if (prep) { QWEN_GDN(1,DIM,true); } \
         else { QWEN_GDN(1,DIM,false); } break
-    switch (D) { QWEN_GDN_DIM(32); QWEN_GDN_DIM(64); QWEN_GDN_DIM(96); QWEN_GDN_DIM(128); }
+    static const bool plain = getenv("DS4_QWEN4_GDN_SCAN_PLAIN") != NULL;
+#define QWEN_GDN_L8(R) gdn_scan_l8<R><<<dim3(128 / (16 * R), Hv), 128, 0, cuda_decode_stream()>>>( \
+        (float *)out->ptr, (float *)state->ptr, (const float *)qkv->ptr, (const float *)a->ptr, (const float *)b->ptr, \
+        T, Hk, Hv, snap ? (float *)snap->ptr : NULL, st, snap2 ? (float *)snap2->ptr : NULL, st2)
+    /* Prefill chunks and their tails take the eight-lane scan, so a split
+     * prompt gets the bits of a whole one; the fused decode and verify rows
+     * (prep) keep gdn_scan's warp a row, whose short chains walk one to
+     * three tokens faster (0.7 ms a 3-row cycle). */
+    if (D == 128 && !plain && !prep) {
+        if (T > 8) QWEN_GDN_L8(2);
+        else QWEN_GDN_L8(1);
+    } else switch (D) { QWEN_GDN_DIM(32); QWEN_GDN_DIM(64); QWEN_GDN_DIM(96); QWEN_GDN_DIM(128); }
+#undef QWEN_GDN_L8
 #undef QWEN_GDN_DIM
 #undef QWEN_GDN
     return launched();
@@ -3585,11 +4000,14 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, float base, float eps) {
     using namespace qwen4_cuda;
     const uint64_t qb = (uint64_t)T * H * D * 4, kb = (uint64_t)T * Hkv * D * 4, ib = (uint64_t)T * Hi * Di * 4;
+    /* the raw indexer key cache may be a ring shorter than the context
+     * (pos % rows), holding at least a chunk and the three rows before it */
+    const uint64_t ik_rows = ik_ring_rows(ikc, Di, cap);
     if (!T || !H || !Hkv || H % Hkv || !Hi || D < 32 || D > 256 || D % 32 ||
         Di < 32 || Di > 128 || Di % 32 || nrot > 64 || nrot > D || nrot > Di || nrot % 2 ||
         (uint64_t)pos0 + T > cap || !tensor(q, qb) || !tensor(gate, qb) || !tensor(qg, qb * 2) ||
         !tensor(kp, kb) || !tensor(vp, kb) || !tensor(iq, ib) || !tensor(iqout, ib) ||
-        !tensor(ik, (uint64_t)T * Di * 4) || !tensor(ikc, (uint64_t)cap * Di * 4) ||
+        !tensor(ik, (uint64_t)T * Di * 4) || !ik_rows || (ik_rows < cap && ik_rows < (uint64_t)T + 3u) ||
         !tensor(kc, (uint64_t)cap * kv_row_bytes((uint64_t)Hkv * D, g_kv_q8)) ||
         !tensor(vc, (uint64_t)cap * kv_row_bytes((uint64_t)Hkv * D, g_kv_q8)) ||
         !tensor(pos3, (uint64_t)cap * 16)) return 0;
@@ -3599,10 +4017,30 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         (float *)gate->ptr, (char *)kc->ptr, (char *)vc->ptr, (float *)iqout->ptr, (float *)ikc->ptr, \
         (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr, (const float *)iq->ptr, \
         (const float *)ik->ptr, (const uint32_t *)pos3->ptr, (const float *)gq, (const float *)gk, (const float *)giq, \
-        H, Hkv, D, Hi, Di, pos0, eps, rope(nrot, base))
+        H, Hkv, D, Hi, Di, pos0, (unsigned)ik_rows, eps, rope(nrot, base))
     if (g_kv_q8) QWEN_PREP(true);
     else QWEN_PREP(false);
 #undef QWEN_PREP
+    return launched();
+}
+
+/* the int8 copy of cap pooled block keys: 128 values and four f16 scales a block */
+static uint64_t block_key_q8_bytes(uint64_t cap) { return cap * (128 + 8); }
+
+static int idx_block_key(ds4_gpu_tensor *out, ds4_gpu_tensor *q8, uint32_t q8_cap,
+        const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3, const void *map, uint64_t size,
+        uint64_t off, uint32_t b0, uint32_t N, uint32_t ratio, uint32_t D, uint32_t nrot,
+        float base, float eps) {
+    using namespace qwen4_cuda;
+    const uint64_t rows = (uint64_t)b0 + N, ik_rows = ik_ring_rows(ik, D, rows * ratio);
+    if (!N || !ratio || D < 32 || D > 128 || D % 32 || nrot > D || nrot > 64 || nrot % 2 ||
+        !tensor(out, rows * D * 2) || !ik_rows || !tensor(pos3, rows * ratio * 16) ||
+        (q8 && (D != 128 || rows > q8_cap || !tensor(q8, block_key_q8_bytes(q8_cap))))) return 0;
+    const char *w = weight(map, size, off, D * 4);
+    if (!w) return 0;
+    block_key<<<N, 32, 0, cuda_decode_stream()>>>((__half *)out->ptr, q8 ? (char *)q8->ptr : NULL, q8_cap,
+        (const float *)ik->ptr, (unsigned)ik_rows, (const uint32_t *)pos3->ptr, (const float *)w, b0, ratio, D, eps,
+        rope(nrot, base));
     return launched();
 }
 
@@ -3610,14 +4048,42 @@ extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3, const void *map, uint64_t size,
         uint64_t off, uint32_t b0, uint32_t N, uint32_t ratio, uint32_t D, uint32_t nrot,
         float base, float eps) {
+    return idx_block_key(out, NULL, 0, ik, pos3, map, size, off, b0, N, ratio, D, nrot, base, eps);
+}
+
+/* CUDA: the pooled keys and their int8 copy (cap blocks, D = 128) in one pass */
+extern "C" int ds4_gpu_qwen4_idx_block_key_q8_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *q8, uint32_t q8_cap,
+        const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3, const void *map, uint64_t size,
+        uint64_t off, uint32_t b0, uint32_t N, uint32_t ratio, uint32_t D, uint32_t nrot,
+        float base, float eps) {
+    return q8 && idx_block_key(out, q8, q8_cap, ik, pos3, map, size, off, b0, N, ratio, D, nrot, base, eps);
+}
+
+/* CUDA: rebuild the int8 copy of blocks [b0, b0 + N) from the f16 keys
+ * (after a checkpoint restored them) */
+extern "C" int ds4_gpu_qwen4_idx_block_key_q8_refresh(ds4_gpu_tensor *q8, uint32_t q8_cap,
+        const ds4_gpu_tensor *key, uint32_t b0, uint32_t N) {
     using namespace qwen4_cuda;
     const uint64_t rows = (uint64_t)b0 + N;
-    if (!N || !ratio || D < 32 || D > 128 || D % 32 || nrot > D || nrot > 64 || nrot % 2 ||
-        !tensor(out, rows * D * 2) || !tensor(ik, rows * ratio * D * 4) || !tensor(pos3, rows * ratio * 16)) return 0;
-    const char *w = weight(map, size, off, D * 4);
-    if (!w) return 0;
-    block_key<<<N, 32, 0, cuda_decode_stream()>>>((__half *)out->ptr, (const float *)ik->ptr,
-        (const uint32_t *)pos3->ptr, (const float *)w, b0, ratio, D, eps, rope(nrot, base));
+    if (!N) return 1;
+    if (rows > q8_cap || !tensor(q8, block_key_q8_bytes(q8_cap)) || !tensor(key, rows * 128 * 2)) return 0;
+    block_key_q8_from_half<<<N, 32, 0, cuda_decode_stream()>>>((char *)q8->ptr, q8_cap, (const __half *)key->ptr, b0);
+    return launched();
+}
+
+/* CUDA: decode and verify rows (T <= 8, four heads of 128) score the int8
+ * keys, and write the rows' tile maxima when tiles is given */
+extern "C" int ds4_gpu_qwen4_idx_score_q8_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *tiles,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *q8, uint32_t q8_cap, uint32_t T, uint32_t N,
+        uint32_t H, uint32_t D, uint32_t pos0, uint32_t ratio) {
+    using namespace qwen4_cuda;
+    const unsigned nt = (N + 7) / 8;
+    if (!T || T > 8 || H != 4 || D != 128 || !N || N > q8_cap || !ratio ||
+        !tensor(out, (uint64_t)T * N * 4) || !tensor(q, (uint64_t)T * H * D * 4) ||
+        !tensor(q8, block_key_q8_bytes(q8_cap)) || (tiles && !tensor(tiles, (uint64_t)T * nt * 4))) return 0;
+    const unsigned blocks = std::min((N + 63) / 64, 4u * 80u);
+    idx_score_q8<4><<<blocks, 256, 0, cuda_decode_stream()>>>((float *)out->ptr,
+        tiles ? (unsigned *)tiles->ptr : NULL, (const float *)q->ptr, (const char *)q8->ptr, q8_cap, N, T, pos0, ratio);
     return launched();
 }
 
@@ -3629,8 +4095,15 @@ extern "C" int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *out, ds4_gpu_tenso
     if (!T || !N || !H || !D || !ratio || !tensor(out, (uint64_t)T * N * 4) ||
         !tensor(q, (uint64_t)T * H * D * 4) || !tensor(key, (uint64_t)N * D * 2) ||
         (tiles && !tensor(tiles, (uint64_t)T * nt * 4))) return 0;
-    idx_score<<<dim3((N + 3) / 4, T), 128, 0, cuda_decode_stream()>>>((float *)out->ptr,
-        (const float *)q->ptr, (const __half *)key->ptr, N, H, D, pos0, ratio);
+    /* prefill rows take the tensor cores; DS4_QWEN4_IDX_SCORE_FP32=1 keeps
+     * the per-row FP32 kernel for A/B */
+    static const bool fp32 = getenv("DS4_QWEN4_IDX_SCORE_FP32") != NULL;
+    if (T > 8 && H == 4 && D == 128 && !fp32)
+        idx_score_mm<4><<<(N + 63) / 64, 256, 0, cuda_decode_stream()>>>((float *)out->ptr,
+            (const float *)q->ptr, (const __half *)key->ptr, N, T, pos0, ratio);
+    else
+        idx_score<<<dim3((N + 3) / 4, T), 128, 0, cuda_decode_stream()>>>((float *)out->ptr,
+            (const float *)q->ptr, (const __half *)key->ptr, N, H, D, pos0, ratio);
     if (!launched()) return 0;
     if (tiles) tile_max<<<dim3((nt + 255) / 256, T), 256, 0, cuda_decode_stream()>>>(
         (unsigned *)tiles->ptr, (const float *)out->ptr, N, nt);
@@ -4069,6 +4542,16 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
         ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode && !getenv("DS4_QWEN4_NO_ATTN_MM")) {
         attention_group<<<dim3(Hkv,T),256,0,cuda_decode_stream()>>>((float *)out->ptr,
             (const float *)q->ptr,(const float *)gate->ptr,(const __half *)kc->ptr,(const __half *)vc->ptr,
+            sparse ? (const int *)sel->ptr : NULL,sparse ? (const unsigned *)count->ptr : NULL,
+            H,Hkv,pos0,stride,sparse,scale);
+        return launched();
+    }
+    /* 8-bit rows (the GPUs without sm_80's tiles): Volta's tensor cores */
+    if (!partial && T >= 32 && D == 256 && H/Hkv <= 16 && g_kv_q8 &&
+        !((uintptr_t)kc->ptr&15) && !((uintptr_t)vc->ptr&15) &&
+        (volta() || ds4_cuda_attn_tokentile_arch_ok()) && !g_quality_mode && !getenv("DS4_QWEN4_NO_ATTN_MM")) {
+        attention_group_q8<<<dim3(Hkv,T),256,0,cuda_decode_stream()>>>((float *)out->ptr,
+            (const float *)q->ptr,(const float *)gate->ptr,(const char *)kc->ptr,(const char *)vc->ptr,
             sparse ? (const int *)sel->ptr : NULL,sparse ? (const unsigned *)count->ptr : NULL,
             H,Hkv,pos0,stride,sparse,scale);
         return launched();

@@ -3515,6 +3515,27 @@ int ds4_gpu_qwen4_idx_score_tensor(
         ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *block_key,
         uint32_t n_tokens, uint32_t n_blocks, uint32_t n_idx_head, uint32_t idx_dim,
         uint32_t pos0, uint32_t ratio);
+/* CUDA: an int8 copy of the pooled block keys (idx_dim 128; q8_cap blocks of
+ * 136 bytes, see ds4_qwen4_cuda.cuh) that decode and verify rows score with
+ * dp4a, one read of each key for all n_tokens <= 8 rows.  The f16 keys stay
+ * the copy that prefill and checkpoints use. */
+int ds4_gpu_qwen4_idx_block_key_q8_tensor(
+        ds4_gpu_tensor *block_key, ds4_gpu_tensor *block_key_q8, uint32_t q8_cap,
+        const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
+        const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
+        uint32_t block0, uint32_t n_blocks, uint32_t ratio, uint32_t idx_dim, uint32_t n_rot,
+        float rope_base, float eps);
+int ds4_gpu_qwen4_idx_block_key_q8_refresh(
+        ds4_gpu_tensor *block_key_q8, uint32_t q8_cap, const ds4_gpu_tensor *block_key,
+        uint32_t block0, uint32_t n_blocks);
+/* CUDA: page-lock a host staging buffer (best effort), and release it */
+int ds4_gpu_host_register(void *ptr, uint64_t bytes);
+void ds4_gpu_host_unregister(void *ptr);
+int ds4_gpu_qwen4_idx_score_q8_tensor(
+        ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq,
+        const ds4_gpu_tensor *block_key_q8, uint32_t q8_cap,
+        uint32_t n_tokens, uint32_t n_blocks, uint32_t n_idx_head, uint32_t idx_dim,
+        uint32_t pos0, uint32_t ratio);
 int ds4_gpu_qwen4_idx_select_tensor(
         ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, const ds4_gpu_tensor *tile_max,
         uint32_t n_blocks, uint32_t n_tokens, uint32_t top_k);
