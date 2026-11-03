@@ -58312,6 +58312,10 @@ typedef struct ds4_qwen4_gpu_graph {
      * the residual streams, crosses (qwen4_graph_use_tier). */
     const int *tier;
     int head_tier, cur_tier;
+    /* the CUDA prefill pipeline (qwen4_cpipe_front): its n-gram rows, and the
+     * later tiers' rope rows left for qwen4_cpipe_back to write */
+    float *pipe_ngram_host;
+    bool pipe_later_pos3;
     struct {
 #define QWEN4_TIER_FIELD(field_) ds4_gpu_tensor *field_;
         DS4_QWEN4_SCRATCH_FIELDS(QWEN4_TIER_FIELD)
@@ -58453,6 +58457,8 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         free(g->host_row);
     }
     g->host_row = NULL;
+    free(g->pipe_ngram_host);
+    g->pipe_ngram_host = NULL;
     free(g->host_pos3);
     free(g->draft_ids);
     g->draft_ids = NULL;
@@ -59146,11 +59152,13 @@ static bool qwen4_graph_hc_gate_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m, 
     /* Prefill takes the up projection as a GEMM over the activated low-rank
      * rows.  Metal's Q8_0 GEMM rounds the activations as its BF16 one does
      * (tests/test_qwen4_kernels.c); other backends keep Q8_0 up rows on the
-     * per-row kernel. */
+     * per-row kernel below 32 rows, where CUDA's Q8_0 GEMM (half hi/lo
+     * components on the tensor cores) does not apply.  The per-row kernel
+     * rereads the up rows for every token: 0.5 s of a 2048-token chunk. */
 #ifdef __APPLE__
     const bool gemm = T > 8u;
 #else
-    const bool gemm = T > 8u && up->type != DS4_TENSOR_Q8_0;
+    const bool gemm = T > 8u && (up->type != DS4_TENSOR_Q8_0 || T >= 32u);
 #endif
     if (gemm) {
         return ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
@@ -60019,7 +60027,7 @@ static bool qwen4_graph_stage_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
     bool ok = ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) &&
               ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
     /* every tier's attention layers read the rope positions */
-    for (int t = 0; g->tier && ok && t < DS4_MAX_GPUS; t++) {
+    for (int t = 0; g->tier && ok && !g->pipe_later_pos3 && t < DS4_MAX_GPUS; t++) {
         if (t != g->cur_tier && g->on_tier[t].pos3)
             ok = ds4_gpu_tensor_write(g->on_tier[t].pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
     }
@@ -60028,9 +60036,9 @@ static bool qwen4_graph_stage_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
 
 /* host side: the PLE n-gram gather.  The rows come from disk and only the
  * PLE layer reads them. */
-static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t T) {
+static bool qwen4_graph_gather_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t T,
+                                      float *row) {
     const uint32_t E = DS4_N_EMBD;
-    float *row = g->host_row;
     uint32_t ids[256 * DS4_MAX_PLE_HEADS];
     for (uint32_t t = 0; t < T; t++) {
         qwen4_ple_step(tokens[t], g->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
@@ -60051,7 +60059,12 @@ static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             }
         }
     }
-    return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
+    return true;
+}
+
+static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t T) {
+    return qwen4_graph_gather_ngrams(g, m, tokens, T, g->host_row) &&
+           ds4_gpu_tensor_write(g->ple_emb, 0, g->host_row, (uint64_t)T * DS4_N_EMBD * sizeof(float)) != 0;
 }
 
 /* The final mixer and the output projection on the last of T rows. */
@@ -60307,6 +60320,104 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     return qwen4_graph_forward_tokens_once(g, m, w, tokens, T, logits_out, all_rows);
 }
 
+
+#if !defined(__APPLE__)
+/* CUDA prefill over a layer split.  Each chunk runs the first tier's layers
+ * and then the later tiers', so one chunk at a time leaves each GPU idle
+ * while the other works.  The pipeline runs the first tier's layers of
+ * chunk k+1 (front) while the later tiers finish chunk k (back):
+ *
+ *   front(k+1)  finish(k)  back(k+1)  front(k+2)  finish(k+1)  ...
+ *
+ * front never waits for the later tiers: their work does not touch the
+ * first tier's buffers, and the later tiers' rope rows are written in back,
+ * while those tiers are idle (a write waits for its device's queue).  back
+ * puts the first tier's queue after the later tiers' before R crosses, so
+ * the copy cannot overwrite rows a later tier still reads; finish waits for
+ * the head tier and reads the chunk's logits. */
+static uint32_t qwen4_cpipe_split(const ds4_qwen4_gpu_graph *g) {
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    uint32_t il = 0;
+    while (il < n_trunk && qwen4_layer_tier(g, il) == qwen4_layer_tier(g, 0)) il++;
+    return il;
+}
+
+static bool qwen4_cpipe_on(const ds4_qwen4_gpu_graph *g) {
+    static int off = -1;
+    if (off < 0) {
+        const char *tv = getenv("DS4_QWEN4_TIMING");
+        off = getenv("DS4_QWEN4_NO_PIPE") != NULL || (tv && atoi(tv) >= 2) ||
+              getenv("DS4_QWEN4_NGRAM_FIRST") != NULL;
+    }
+    const uint32_t split = qwen4_cpipe_split(g);
+    return !off && g->tier && split > DS4_N_PLE_LAYER && split < DS4_N_LAYER - DS4_N_NEXTN_PREDICT &&
+           g->head_tier != qwen4_layer_tier(g, 0) && !g->snap_after_first && !g->snap_after_second;
+}
+
+/* continue on tier t without ordering its queue after the current one's */
+static bool qwen4_cpipe_switch(ds4_qwen4_gpu_graph *g, int t) {
+    if (t == g->cur_tier) return true;
+    qwen4_tier_store(g, g->cur_tier);
+    if (ds4_gpu_set_current_device(t) != 0) return false;
+    qwen4_tier_load(g, t);
+    return true;
+}
+
+static bool qwen4_cpipe_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                             uint32_t il, uint32_t pos0, uint32_t T) {
+    const ds4_layer_weights *l = &w->layer[il];
+    return (!ds4_qwen4_layer_is_ple(il) || qwen4_layer_ple(g, m, l, T)) &&
+           qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T) &&
+           qwen4_layer_mixer(g, m, l, il, pos0, T) &&
+           qwen4_layer_ffn_mix(g, m, l, T) &&
+           qwen4_layer_moe(g, m, l, il, pos0, T);
+}
+
+static bool qwen4_cpipe_front(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                             const int *tokens, uint32_t T) {
+    if (T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) return false;
+    }
+    if (!g->pipe_ngram_host) g->pipe_ngram_host = xmalloc((uint64_t)g->cap_tokens * DS4_N_EMBD * sizeof(float));
+    /* the disk reads first, while the GPUs work through their queues */
+    if (!qwen4_graph_gather_ngrams(g, m, tokens, T, g->pipe_ngram_host) ||
+        !qwen4_cpipe_switch(g, qwen4_layer_tier(g, 0))) return false;
+    g->pipe_later_pos3 = true;
+    bool ok = qwen4_graph_stage_rows(g, m, w, tokens, T);
+    g->pipe_later_pos3 = false;
+    ok = ok && ds4_gpu_tensor_write(g->ple_emb, 0, g->pipe_ngram_host, (uint64_t)T * DS4_N_EMBD * sizeof(float)) &&
+         glm_graph_begin_commands_if_needed();
+    const uint32_t split = qwen4_cpipe_split(g);
+    for (uint32_t il = 0; il < split && ok; il++) ok = qwen4_cpipe_layer(g, m, w, il, g->pos, T);
+    return ok;
+}
+
+static bool qwen4_cpipe_back(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                            uint32_t T, bool logits) {
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT, split = qwen4_cpipe_split(g);
+    const int first = qwen4_layer_tier(g, 0);
+    bool ok = true;
+    for (int t = 0; t < DS4_MAX_GPUS && ok; t++) {
+        if (t == first) continue;
+        ds4_gpu_tensor *pos3 = t == g->cur_tier ? g->pos3 : g->on_tier[t].pos3;
+        if (!pos3) continue;
+        ok = ds4_gpu_tensor_write(pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u) &&
+             qwen4_cpipe_switch(g, t) && qwen4_graph_use_tier(g, first, 0);
+    }
+    for (uint32_t il = split; il < n_trunk && ok; il++) {
+        ok = qwen4_graph_use_tier(g, qwen4_layer_tier(g, il), T) && qwen4_cpipe_layer(g, m, w, il, g->pos, T);
+    }
+    ok = ok && qwen4_graph_use_tier(g, g->head_tier, T) && (!logits || qwen4_graph_logits_last(g, m, w, T));
+    if (ok) g->pos += T;
+    return ok;
+}
+
+static bool qwen4_cpipe_finish(ds4_qwen4_gpu_graph *g, float *logits_out) {
+    return qwen4_cpipe_switch(g, g->head_tier) && ds4_gpu_end_commands() &&
+           (!logits_out || ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)DS4_N_VOCAB * sizeof(float)));
+}
+#endif
 
 /* Two prefill chunks in flight with the ANE.  Chunk A runs ahead of chunk
  * B on the GPU's queue, each layer in three phases:
@@ -71703,10 +71814,44 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
             if (entry_bytes[i] > largest) largest = entry_bytes[i];
         }
         for (int d = 0; d < pcfg.n_gpus; d++) cap = engine_size_add_sat(cap, pcfg.gpu_budget_bytes[d]);
+#if !defined(__APPLE__)
+        size_t full[DS4_LAYER_PACK_MAX_GPUS];
+        for (int d = 0; d < pcfg.n_gpus; d++) full[d] = pcfg.gpu_budget_bytes[d];
+#endif
         for (int d = 0; total <= cap && d < pcfg.n_gpus; d++) {
             const size_t share = (size_t)((double)total * ((double)pcfg.gpu_budget_bytes[d] / (double)cap)) + largest;
             if (share < pcfg.gpu_budget_bytes[d]) pcfg.gpu_budget_bytes[d] = share;
         }
+#if !defined(__APPLE__)
+        /* The CUDA prefill pipelines the GPUs (qwen4_cpipe_front) and runs at
+         * the pace of the slowest, and a trunk layer's prefill costs about the
+         * same whatever its bytes: give each GPU its share of the layers, which
+         * also shares the attention layers' KV.  Where the later GPUs cannot
+         * hold their share (the head and the nextn block go last), the earlier
+         * ones take a layer more at a time.  Entry 0 is the embedding, then
+         * the layers, the nextn block and the head. */
+        const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+        for (uint32_t shift = 0; total <= cap && !getenv("DS4_QWEN4_BYTE_SPLIT") && shift < n_trunk; shift++) {
+            size_t want[DS4_LAYER_PACK_MAX_GPUS], cum = 0, rest = 0;
+            uint32_t next = 0;
+            bool fits = true;
+            for (int d = 0; fits && d + 1 < pcfg.n_gpus; d++) {
+                cum = engine_size_add_sat(cum, full[d]);
+                uint32_t last = (uint32_t)((double)n_trunk * ((double)cum / (double)cap) + 0.5) + shift;
+                if (last > n_trunk) last = n_trunk;
+                want[d] = 0;
+                for (; next <= last; next++) want[d] = engine_size_add_sat(want[d], entry_bytes[next]);
+                fits = want[d] <= full[d];
+            }
+            if (!fits) break;
+            for (uint32_t i = next; i < DS4_N_LAYER + 2u; i++) rest = engine_size_add_sat(rest, entry_bytes[i]);
+            if (rest <= full[pcfg.n_gpus - 1]) {
+                for (int d = 0; d + 1 < pcfg.n_gpus; d++) pcfg.gpu_budget_bytes[d] = want[d];
+                pcfg.gpu_budget_bytes[pcfg.n_gpus - 1] = full[pcfg.n_gpus - 1];
+                break;
+            }
+        }
+#endif
     }
 
     const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
@@ -77697,6 +77842,79 @@ int ds4_session_sync_multimodal(
     return rc;
 }
 
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(__APPLE__)
+/* The prompt's chunks through the CUDA prefill pipeline (qwen4_cpipe_front).
+ * A chunk's logits, MTP rows, checkpoint tokens and progress follow once
+ * its back half finishes, while the next chunk's front half runs.  Until
+ * the pipeline drains, the first tier's state is a chunk ahead of the
+ * checkpoint, so those chunks report prefill_display; every
+ * DS4_QWEN4_PIPE_GROUP chunks (default 8) and at the end it drains and
+ * reports prefill_chunk, where callers may store the session. */
+static int qwen4_session_prefill_pipe(ds4_session *s, const ds4_tokens *prompt, int start,
+                                      char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    static int group = -1;
+    if (group < 0) {
+        const char *ge = getenv("DS4_QWEN4_PIPE_GROUP");
+        group = ge && atoi(ge) > 0 ? atoi(ge) : 8;
+    }
+    int pb = -1, pn = 0, in_group = 0;
+    /* finish the chunk in flight: its logits, MTP rows and checkpoint */
+#define QWEN4_PIPE_DONE(drained_) do { \
+        bool fok_ = qwen4_cpipe_finish(g, s->logits); \
+        if (fok_ && qwen4_mtp_fill_on()) { \
+            const bool last_ = pb + pn == prompt->len; \
+            fok_ = qwen4_graph_mtp_fill(g, &e->model, &e->weights, g->R, (uint32_t)pb, \
+                                        (uint32_t)(pn - (last_ ? 1 : 0)), prompt->v + pb + 1) && \
+                   (!last_ || qwen4_graph_mtp_keep_tail(g, g->R, (uint32_t)pn - 1u, (uint32_t)(pb + pn - 1))); \
+        } \
+        if (!fok_) { \
+            snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", pb); \
+            s->checkpoint_valid = false; \
+            return 1; \
+        } \
+        for (int j_ = 0; j_ < pn; j_++) token_vec_push(&s->checkpoint, prompt->v[pb + j_]); \
+        s->checkpoint_valid = (drained_); \
+        s->qwen4_rewound = false; \
+        s->mtp_draft_valid = false; \
+        if (s->progress) s->progress(s->progress_ud, (drained_) ? "prefill_chunk" : "prefill_display", \
+                                     pb + pn, prompt->len); \
+        pb = -1; \
+    } while (0)
+    for (int i = start; i < prompt->len;) {
+        if (ds4_session_cancelled(s)) {
+            if (pb >= 0) QWEN4_PIPE_DONE(true);
+            snprintf(err, errlen, "interrupted");
+            s->checkpoint_valid = s->checkpoint.len > 0;
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        const uint32_t chunk = (uint32_t)(prompt->len - i) < g->cap_tokens ? (uint32_t)(prompt->len - i) : g->cap_tokens;
+        if (pb >= 0 && in_group >= group) {
+            QWEN4_PIPE_DONE(true);
+            in_group = 0;
+        }
+        s->checkpoint_valid = false;
+        if (!qwen4_cpipe_front(g, &e->model, &e->weights, prompt->v + i, chunk)) {
+            snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
+            return 1;
+        }
+        if (pb >= 0) QWEN4_PIPE_DONE(false);
+        if (!qwen4_cpipe_back(g, &e->model, &e->weights, chunk, true)) {
+            snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
+            return 1;
+        }
+        pb = i;
+        pn = (int)chunk;
+        in_group++;
+        i += (int)chunk;
+    }
+    if (pb >= 0) QWEN4_PIPE_DONE(true);
+#undef QWEN4_PIPE_DONE
+    return 0;
+}
+#endif
+
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
@@ -77760,6 +77978,13 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          * batches, despite having multiple rows, must never overwrite dumps. */
         s->qwen4_graph.dump_prompt_rows = true;
         int prefill_rc = 0;
+#if !defined(__APPLE__)
+        /* two or more chunks over a CUDA layer split: overlap the GPUs */
+        if (prompt->len - start > (int)s->qwen4_graph.cap_tokens && qwen4_cpipe_on(&s->qwen4_graph)) {
+            prefill_rc = qwen4_session_prefill_pipe(s, prompt, start, err, errlen);
+            start = prompt->len;
+        }
+#endif
         for (int i = start; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");

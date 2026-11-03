@@ -2065,11 +2065,175 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
 #endif
 }
 
+__global__ void half_copy(__half *out, const float *x, uint64_t n4) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    const float4 v = ((const float4 *)x)[i];
+    ((__half2 *)out)[2 * i] = __floats2half2_rn(v.x, v.y);
+    ((__half2 *)out)[2 * i + 1] = __floats2half2_rn(v.z, v.w);
+}
+
+/* weights 8g..8g+7 of a row as half, into 16 bytes of shared memory */
+template<unsigned TYPE>
+__device__ __forceinline__ void half8(__half *dst, const char *row, unsigned g,
+        const uint64_t *grid_table, const uint8_t *sign_table) {
+    float w[8];
+    if (grouped(TYPE)) group8<TYPE>(row, g, w);
+    else {
+        const float4 lo = value4<TYPE>(row, 8 * g, grid_table, sign_table), hi = value4<TYPE>(row, 8 * g + 4, grid_table, sign_table);
+        w[0] = lo.x; w[1] = lo.y; w[2] = lo.z; w[3] = lo.w; w[4] = hi.x; w[5] = hi.y; w[6] = hi.z; w[7] = hi.w;
+    }
+    __half2 h[4];
+    #pragma unroll
+    for (unsigned k = 0; k < 4; k++) h[k] = __floats2half2_rn(w[2 * k], w[2 * k + 1]);
+    *(uint4 *)dst = *(const uint4 *)h;
+}
+
+/* Volta's expert tiles: the half operands of the half tiles above on the
+ * first tensor cores, with FP32 sums. A block takes 64 rows of one expert by
+ * 64 of its tokens, decoding each weight once, and the activations arrive as
+ * half. A warp owns 32 rows by 16 tokens and skips its products when those
+ * tokens lie past the expert's count, so a part-filled tile costs tensor
+ * time in 16-token steps. */
+template<unsigned TYPE, bool DOWN>
+__global__ void __launch_bounds__(256) expert_tile_h(float *out, const __half *x, const char *w0, const char *w1,
+        const int *lists, const int *counts, const unsigned *tiles, unsigned NE,
+        unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, uint64_t rb) {
+#if __CUDA_ARCH__ >= 700
+    namespace wm = nvcuda::wmma;
+    constexpr unsigned NR = 64, NT = 64, KC = 64, LD = KC + 8;
+    const unsigned tid = threadIdx.x, warp = tid / 32, nr = M / NR, job = blockIdx.x / nr;
+    if (job >= tiles[NE]) return;
+    unsigned e = 0, end = NE;
+    while (e < end) {
+        const unsigned mid = (e + end) / 2;
+        if (tiles[mid + 1] <= job) e = mid + 1; else end = mid;
+    }
+    const unsigned count = counts[e], t0 = (job - tiles[e]) * NT, r0 = (blockIdx.x % nr) * NR;
+    union Tile {
+        __half ab[(NR * (DOWN ? 1 : 2) + NT) * LD];
+        float c[NT][NR + 4];
+    };
+    __shared__ __align__(32) Tile tile;
+    __shared__ unsigned xrow[NT];
+    __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
+    __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
+    __half (*a)[LD] = (__half (*)[LD])tile.ab, (*u)[LD] = a + NR, (*b)[LD] = a + NR * (DOWN ? 1 : 2);
+    if (TYPE == 16) {
+        for (unsigned i = tid; i < 256; i += 256) grid_table[i] = cuda_iq2xxs_grid[i];
+        for (unsigned i = tid; i < 128; i += 256) sign_table[i] = cuda_ksigns_iq2xs[i];
+    }
+    /* the gate and up tiles read the token's row, the down tile its slot's */
+    if (tid < NT) {
+        const unsigned item = t0 + tid, pair = item < count ? lists[(uint64_t)e * cap + item] : 0;
+        xrow[tid] = item < count ? (DOWN ? (pair / NS) * NO + pair % NS : pair / NS) : UINT_MAX;
+    }
+    __syncthreads();
+    const unsigned g = tid % 8, wr = tid / 8, tc = warp % 4, rh = warp / 4;
+    const char *ra[2], *ru[2];
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++) {
+        ra[j] = w0 + ((uint64_t)e * M + r0 + wr + 32 * j) * rb;
+        ru[j] = DOWN ? NULL : w1 + ((uint64_t)e * M + r0 + wr + 32 * j) * rb;
+    }
+    const bool busy = t0 + tc * 16 < count;
+    wm::fragment<wm::accumulator,16,16,16,float> acc[2], up[2];
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++) {
+        wm::fill_fragment(acc[j], 0);
+        wm::fill_fragment(up[j], 0);
+    }
+    for (unsigned k0 = 0; k0 < K; k0 += KC) {
+        #pragma unroll
+        for (unsigned j = 0; j < 2; j++) {
+            half8<TYPE>(&a[wr + 32 * j][8 * g], ra[j], k0 / 8 + g, grid_table, sign_table);
+            if (!DOWN) half8<TYPE>(&u[wr + 32 * j][8 * g], ru[j], k0 / 8 + g, grid_table, sign_table);
+        }
+        #pragma unroll
+        for (unsigned i = tid; i < NT * KC / 8; i += 256) {
+            const unsigned t = i / 8, q = i % 8;
+            *(uint4 *)&b[t][8 * q] = xrow[t] != UINT_MAX ?
+                *(const uint4 *)(x + (uint64_t)xrow[t] * K + k0 + 8 * q) : make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+        if (busy) {
+            #pragma unroll
+            for (unsigned k = 0; k < KC; k += 16) {
+                wm::fragment<wm::matrix_b,16,16,16,__half,wm::col_major> bf;
+                wm::load_matrix_sync(bf, &b[tc * 16][k], LD);
+                #pragma unroll
+                for (unsigned j = 0; j < 2; j++) {
+                    wm::fragment<wm::matrix_a,16,16,16,__half,wm::row_major> af;
+                    wm::load_matrix_sync(af, &a[rh * 32 + j * 16][k], LD);
+                    wm::mma_sync(acc[j], af, bf, acc[j]);
+                    if (!DOWN) {
+                        wm::load_matrix_sync(af, &u[rh * 32 + j * 16][k], LD);
+                        wm::mma_sync(up[j], af, bf, up[j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned j = 0; j < 2; j++) {
+        if (!DOWN) for (unsigned i = 0; i < acc[j].num_elements; i++)
+            acc[j].x[i] = silu(acc[j].x[i]) * up[j].x[i];
+        wm::store_matrix_sync(&tile.c[tc * 16][rh * 32 + j * 16], acc[j], NR + 4, wm::mem_col_major);
+    }
+    __syncthreads();
+    for (unsigned i = tid; i < NT * NR; i += 256) {
+        const unsigned t = i / NR, r = i % NR;
+        if (xrow[t] == UINT_MAX) continue;
+        const unsigned pair = lists[(uint64_t)e * cap + t0 + t];
+        out[((uint64_t)(pair / NS) * NO + pair % NS) * M + r0 + r] = tile.c[t][r];
+    }
+#endif
+}
+
+static bool volta(void) {
+    static int major = -1;
+    if (major < 0) {
+        int device = 0;
+        cudaDeviceProp prop;
+        major = cudaGetDevice(&device) == cudaSuccess && cudaGetDeviceProperties(&prop, device) == cudaSuccess ? prop.major : 0;
+        (void)cudaGetLastError();
+    }
+    return major == 7 && !getenv("DS4_QWEN4_NO_VOLTA_TILES");
+}
+
+/* the types half8 decodes: group8's, and value4's IQ2_XXS, Q2_K and MXFP4 */
+static bool volta_tiles(unsigned type, unsigned K, unsigned M) {
+    return volta() && !g_quality_mode && !getenv("DS4_CUDA_NO_TF32") && !(K % 64) && !(M % 64) &&
+        (grouped(type) || type == 10 || type == 16 || type == 39);
+}
+
 static int matrix_dispatch(float *out, const float *x, const char *w0, const char *w1,
         const int *lists, const int *counts, unsigned type, unsigned NE, unsigned T,
         unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, bool down) {
     const dim3 grid((M + 15) / 16, lists ? NE : 1, std::min(8u, (T + 15) / 16));
     const uint64_t rb = expert_row_bytes(type, K);
+    if (lists && volta_tiles(type, K, M)) {
+        const uint64_t rows = down ? (uint64_t)T * NO : T, n = rows * K;
+        const uint64_t jobs = ((uint64_t)T * NS + 63) / 64 + NE, blocks = jobs * (M / 64);
+        if (blocks > INT_MAX) return 0;
+        unsigned *tiles = (unsigned *)tmp_alloc(n * 2 + ((uint64_t)NE + 1) * 4, "Qwen expert half tiles");
+        if (!tiles) return 0;
+        __half *xh = (__half *)(tiles + (NE + 1 + 3) / 4 * 4);
+        expert_tiles<<<1,1,0,cuda_decode_stream()>>>(tiles, counts, NE, 64);
+        half_copy<<<(unsigned)((n / 4 + 255) / 256),256,0,cuda_decode_stream()>>>(xh, x, n / 4);
+        if (!launched()) return 0;
+#define QWEN_VOLTA(TYPE) case TYPE: \
+        if (down) expert_tile_h<TYPE,true><<<(unsigned)blocks,256,0,cuda_decode_stream()>>>(out,xh,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+        else expert_tile_h<TYPE,false><<<(unsigned)blocks,256,0,cuda_decode_stream()>>>(out,xh,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
+        break;
+        switch (type) {
+        QWEN_GROUPED_TYPES(QWEN_VOLTA) QWEN_VOLTA(10) QWEN_VOLTA(16) QWEN_VOLTA(39)
+        default: return 0;
+        }
+#undef QWEN_VOLTA
+        return launched();
+    }
     if (ds4_cuda_attn_tokentile_arch_ok() && !getenv("DS4_CUDA_NO_TF32")) {
         if (lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39)) {
             const unsigned nt = T >= 2048 ? 64 : 32;
@@ -2438,7 +2602,7 @@ __global__ void pack_half_components(float *scales, __half *hi, __half *lo,
         const float v = value<TYPE>(x+(uint64_t)row*rb,k)*inv;
         const __half h = __float2half_rn(v);
         hi[(uint64_t)row*K+k] = h;
-        lo[(uint64_t)row*K+k] = __float2half_rn((v-__half2float(h))*4096);
+        if (lo) lo[(uint64_t)row*K+k] = __float2half_rn((v-__half2float(h))*4096);
     }
 }
 
@@ -2532,32 +2696,36 @@ __global__ void dense_rescale2(float *out, const float *xs, const float *ws,
     }
 }
 
-static int dense_q8_blas(float *out, const float *x, const char *w,
+/* Any weight type on the tensor cores: the weight rows are packed to half
+ * per tile, each weight and activation row under a power-of-two scale that
+ * keeps it in half's range, and one GEMM sums in FP32.  Half rounds both
+ * operands by at most 2^-11, under the int8 activations of the decode
+ * path; DS4_CUDA_NO_TF32 and the quality mode keep FP32 GEMMs. */
+static int dense_half_blas(float *out, const float *x, const char *w, unsigned type,
         unsigned T, unsigned K, unsigned M) {
-    const unsigned bound = (unsigned)std::max(UINT64_C(1),(UINT64_C(32)<<20)/((uint64_t)K*4));
+    const unsigned bound = (unsigned)std::max(UINT64_C(1),(UINT64_C(64)<<20)/((uint64_t)K*2));
     const unsigned tile = std::min(M,bound >= 64 ? bound/64*64 : bound);
     const uint64_t xn = (uint64_t)T*K, wn = (uint64_t)tile*K;
-    __half *xh = (__half *)tmp_alloc((xn+wn+T+tile)*4,"Qwen Q8 projection scratch");
+    __half *xh = (__half *)tmp_alloc((xn+wn)*2+((uint64_t)T+tile)*4,"Qwen half projection scratch");
     if (!xh) return 0;
-    __half *xl = xh+xn, *wh = xl+xn, *wl = wh+wn;
-    float *xs = (float *)(wl+wn), *ws = xs+T;
-    pack_half_components<0><<<T,256,0,cuda_decode_stream()>>>(xs,xh,xl,(const char *)x,K,(uint64_t)K*4);
+    __half *wh = xh+xn;
+    float *xs = (float *)(wh+wn), *ws = xs+T;
+    pack_half_components<0><<<T,256,0,cuda_decode_stream()>>>(xs,xh,NULL,(const char *)x,K,(uint64_t)K*4);
     if (!launched()) return 0;
-    const float zero = 0, one = 1, low = 0x1p-12f;
-    const uint64_t rb = row_bytes(8,K);
+    const float zero = 0, one = 1;
+    const uint64_t rb = row_bytes(type,K);
     for (unsigned r = 0; r < M; r += tile) {
         const unsigned n = std::min(tile,M-r);
-        pack_half_components<8><<<n,256,0,cuda_decode_stream()>>>(ws,wh,wl,w+(uint64_t)r*rb,K,rb);
-        if (!launched()) return 0;
-        if (!cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&low,wl,CUDA_R_16F,K,xh,CUDA_R_16F,K,&zero,out+r,CUDA_R_32F,M,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 weight residual") ||
+#define QWEN_PACK(TYPE) case TYPE: pack_half_components<TYPE><<<n,256,0,cuda_decode_stream()>>>(ws,wh,NULL,w+(uint64_t)r*rb,K,rb); break
+        switch (type) {
+        QWEN_EACH_TYPE(QWEN_PACK);
+        default: return 0;
+        }
+#undef QWEN_PACK
+        if (!launched() ||
             !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&low,wh,CUDA_R_16F,K,xl,CUDA_R_16F,K,&one,out+r,CUDA_R_32F,M,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 input residual") ||
-            !cublas_ok(cublasGemmEx(cuda_cublas_for_tier(0),CUBLAS_OP_T,CUBLAS_OP_N,
-                n,T,K,&one,wh,CUDA_R_16F,K,xh,CUDA_R_16F,K,&one,out+r,CUDA_R_32F,M,
-                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen Q8 leading product")) return 0;
+                n,T,K,&one,wh,CUDA_R_16F,K,xh,CUDA_R_16F,K,&zero,out+r,CUDA_R_32F,M,
+                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT),"Qwen half projection")) return 0;
         dense_rescale2<<<((uint64_t)n*T+255)/256,256,0,cuda_decode_stream()>>>(out+r,xs,ws,n,T,M);
         if (!launched()) return 0;
     }
@@ -3367,9 +3535,9 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (type == 1 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode && !getenv("DS4_CUDA_NO_TF32"))
         return dense_f16_blas((float *)out->ptr,(const float *)x->ptr,(const __half *)w,T,K,M);
-    if (type == 8 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
+    if (type != 0 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode && !getenv("DS4_CUDA_NO_TF32"))
-        return dense_q8_blas((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
+        return dense_half_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M);
     if (g_cublas_ready && T >= 32 && K <= INT_MAX && M <= INT_MAX && T <= INT_MAX)
         return dense_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M);
     return matrix_dispatch((float *)out->ptr, (const float *)x->ptr, w, NULL, NULL, NULL,
@@ -3533,8 +3701,9 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
 }
 
 extern "C" int ds4_gpu_qwen4_decode_fusions_enabled(void) { return 1; }
+/* the half expert tiles: sm_80's, and Volta's for the types volta_tiles takes */
 extern "C" int ds4_gpu_qwen4_tensor_tiles(void) {
-    return ds4_cuda_attn_tokentile_arch_ok() && !getenv("DS4_CUDA_NO_TF32");
+    return (ds4_cuda_attn_tokentile_arch_ok() || qwen4_cuda::volta()) && !getenv("DS4_CUDA_NO_TF32");
 }
 
 extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk,

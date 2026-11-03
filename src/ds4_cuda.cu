@@ -299,6 +299,14 @@ static inline int ds4_tensor_device_idx(const ds4_gpu_tensor *t) {
     return d;
 }
 
+/* A prefill pipelined over a layer split queues one GPU's half of a chunk,
+ * thousands of launches, while the other GPU works; the driver's default
+ * launch queue blocks the host after about a thousand.  The driver reads
+ * this when the process first touches CUDA; a caller's own setting wins. */
+__attribute__((constructor)) static void cuda_scale_launch_queues(void) {
+    setenv("CUDA_SCALE_LAUNCH_QUEUES", "4x", 0);
+}
+
 /* Debug/override flags are read once per CUDA init. The hot decode path calls
  * the xdev helpers many times per token, so they must not re-enter getenv(). */
 static void cuda_xdev_env_refresh(void) {
@@ -11579,14 +11587,22 @@ static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total == 88576ull,
               "M32/R32 total dynamic shared memory changed unexpectedly");
 static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total <= kTTSmemHardCap,
               "token-tile dynamic shared memory must stay under the 90 KiB pass gate");
+/* Prefill layers ask this for every launch: cache the answer per device
+ * (cudaGetDeviceProperties takes milliseconds). */
 static int ds4_cuda_attn_tokentile_arch_ok(void) {
+    static int major[64];
     int device = 0;
-    cudaDeviceProp prop;
-    if (cudaGetDevice(&device) != cudaSuccess ||
-        cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0) {
         (void)cudaGetLastError();
         return 0;
     }
+    if (device < 64 && major[device]) return major[device] >= 8;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (device < 64) major[device] = prop.major;
     return prop.major >= 8;
 }
 

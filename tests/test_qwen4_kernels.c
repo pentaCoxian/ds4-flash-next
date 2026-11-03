@@ -4431,6 +4431,48 @@ static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_
 
 #endif
 
+/* CUDA's prefill projections of quantized rows (dense_half_blas) round each
+ * row of weights and of activations to half, under the power of two of the
+ * row's largest magnitude, and sum the products in FP32. */
+static bool half_rows(uint32_t T, uint32_t wtype) {
+#ifdef __APPLE__
+    (void)T; (void)wtype;
+    return false;
+#else
+    return T >= 32u && wtype != 0u && wtype != 1u && !getenv("DS4_CUDA_NO_TF32");
+#endif
+}
+
+/* v to the nearest half, ties to even */
+static float half_rne(float v) {
+    if (v == 0.0f) return v;
+    int e;
+    (void)frexpf(v, &e);
+    const int q = e - 11 > -24 ? e - 11 : -24;
+    return ldexpf(nearbyintf(ldexpf(v, -q)), q);
+}
+
+static void half_round_row(float *x, uint32_t K) {
+    float mx = 0.0f;
+    for (uint32_t k = 0; k < K; k++) mx = fmaxf(mx, fabsf(x[k]));
+    if (mx == 0.0f) return;
+    int e;
+    (void)frexpf(mx, &e);
+    e -= 1;   /* the exponent of mx as its float bits hold it */
+    e = e < -120 ? -120 : e > 120 ? 120 : e;
+    for (uint32_t k = 0; k < K; k++) x[k] = ldexpf(half_rne(ldexpf(x[k], -e)), e);
+}
+
+static void half_round_rows_f64(double *w, uint64_t rows, uint32_t K) {
+    float *row = malloc(K * sizeof(float));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint32_t k = 0; k < K; k++) row[k] = (float)w[r * K + k];
+        half_round_row(row, K);
+        for (uint32_t k = 0; k < K; k++) w[r * K + k] = row[k];
+    }
+    free(row);
+}
+
 /* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
 static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
     double *sh;
@@ -4442,6 +4484,10 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     float *xr = malloc((uint64_t)T * in_dim * sizeof(float));
     memcpy(xr, x, (uint64_t)T * in_dim * sizeof(float));
     if (q8_act_rows(T, wtype, wtype) && in_dim % 32 == 0) q8_round(xr, (uint64_t)T * in_dim);
+    if (half_rows(T, wtype)) {
+        for (uint32_t t = 0; t < T; t++) half_round_row(xr + (uint64_t)t * in_dim, in_dim);
+        half_round_rows_f64(sh, rows, in_dim);
+    }
     double *ref = malloc((uint64_t)T * rows * sizeof(double));
     for (uint32_t t = 0; t < T; t++)
         for (uint32_t r = 0; r < rows; r++) {
@@ -4618,14 +4664,19 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
         ? arena_q8_0(a, M, K, &weights, 0.05f)
         : arena_f16(a, (uint64_t)M*K, &weights, 0.05f);
     float *rows = rand_vec((uint64_t)patterns*K, 1.0f);
-    float *x = malloc((uint64_t)T*K*sizeof(*x));
+    float *x = malloc((uint64_t)T*K*sizeof(*x)), *xr = malloc((uint64_t)patterns*K*sizeof(*xr));
     double *dots = calloc((uint64_t)patterns*M, sizeof(*dots));
     double *ref = malloc((count+guard)*sizeof(*ref));
-    require_ok(x && dots && ref && rows, "large dense allocations");
+    require_ok(x && xr && dots && ref && rows, "large dense allocations");
+    memcpy(xr, rows, (uint64_t)patterns*K*sizeof(*xr));
+    if (half_rows(T, wtype)) {
+        for (uint32_t p = 0; p < patterns; p++) half_round_row(xr+(uint64_t)p*K, K);
+        half_round_rows_f64(weights, M, K);
+    }
     for (uint32_t p = 0; p < patterns; p++)
         for (uint32_t m = 0; m < M; m++)
             for (uint32_t k = 0; k < K; k++)
-                dots[(uint64_t)p*M+m] += weights[(uint64_t)m*K+k]*rows[p*K+k];
+                dots[(uint64_t)p*M+m] += weights[(uint64_t)m*K+k]*xr[p*K+k];
     for (uint32_t t = 0; t < T; t++) {
         memcpy(x+(uint64_t)t*K, rows+(t%patterns)*K, K*sizeof(*x));
         memcpy(ref+(uint64_t)t*M, dots+(t%patterns)*M, M*sizeof(*ref));
@@ -4644,7 +4695,7 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
         for (unsigned i = 0; i < guard; i++) require_ok(got_guard[i] == 17.25f, "large dense output guard");
     }
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gx);
-    free(ref); free(dots); free(x); free(rows); free(weights);
+    free(ref); free(dots); free(x); free(xr); free(rows); free(weights);
 }
 #endif
 
@@ -4907,8 +4958,8 @@ int main(void) {
     test_dense_mm(&arena, 320, 10240, 40, 1u);
     test_dense_mm(&arena, 2560, 100, 9, 8u);
 #ifndef __APPLE__
-    /* the sm_80 tiles round as their references do; older GPUs run the
-     * FP32 tiles, which the routed-expert tests above cover */
+    /* the half tiles (sm_80's and Volta's) round as their references do;
+     * other GPUs run the FP32 tiles, which the routed-expert tests above cover */
     if (ds4_gpu_qwen4_tensor_tiles()) {
         test_half_expert_tiles(&arena,33,16,10,64);
         test_half_expert_tiles(&arena,2049,16,10,64);
