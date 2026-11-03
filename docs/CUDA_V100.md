@@ -331,6 +331,8 @@ scores' scale.
 | `DS4_QWEN4_GDN_SCAN_PLAIN=1` | the per-row GDN scan for prefill too |
 | `DS4_QWEN4_VROWS_HOST=1` | a lookahead window's rows read and scanned on the host |
 | `DS4_QWEN4_BYTE_SPLIT=1` | byte-proportional layer split |
+| `DS4_QWEN4_SPLIT_SHIFT=N` | start the layer split N layers later (more layers on the first GPU) |
+| `DS4_QWEN4_LA_INTERLEAVE=0` | encode the lookahead's two halves one after the other |
 | `DS4_QWEN4_IK_FULL=1` | raw indexer keys kept per position, not in a ring |
 | `DS4_QWEN4_PRIVATE_SCRATCH=1` | each session its own prefill transients (several sessions) |
 | `DS4_SERVER_NO_PIPE=1` | no pipelined two-slot MTP decode in the server |

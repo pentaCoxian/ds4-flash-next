@@ -60781,8 +60781,9 @@ static bool qwen4_cpipe_prefetch(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
     return true;
 }
 
-static bool qwen4_cpipe_front(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                             const int *tokens, uint32_t T) {
+/* the staging of qwen4_cpipe_front: its n-gram and input rows at g->pos, on the first tier */
+static bool qwen4_cpipe_front_stage(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                   const int *tokens, uint32_t T) {
     if (T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
     for (uint32_t t = 0; t < T; t++) {
         if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) return false;
@@ -60808,8 +60809,13 @@ static bool qwen4_cpipe_front(ds4_qwen4_gpu_graph *g, const ds4_model *m, const 
     g->pipe_later_pos3 = true;
     bool ok = prefetched ? qwen4_graph_write_rows(g, g->pipe_rows_next, T) : qwen4_graph_stage_rows(g, m, w, tokens, T);
     g->pipe_later_pos3 = false;
-    ok = ok && ds4_gpu_tensor_write(g->ple_emb, 0, g->pipe_ngram_host, (uint64_t)T * DS4_N_EMBD * sizeof(float)) &&
-         glm_graph_begin_commands_if_needed();
+    return ok && ds4_gpu_tensor_write(g->ple_emb, 0, g->pipe_ngram_host, (uint64_t)T * DS4_N_EMBD * sizeof(float)) &&
+           glm_graph_begin_commands_if_needed();
+}
+
+static bool qwen4_cpipe_front(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                             const int *tokens, uint32_t T) {
+    bool ok = qwen4_cpipe_front_stage(g, m, w, tokens, T);
     const uint32_t split = qwen4_cpipe_split(g);
     for (uint32_t il = 0; il < split && ok; il++) ok = qwen4_cpipe_layer(g, m, w, il, g->pos, T);
     return ok;
@@ -61006,20 +61012,22 @@ static bool qwen4_la_alloc3(ds4_qwen4_gpu_graph *g) {
 
 /* Run the first tier's layers of the T-row window toks ahead (3 or 4), after
  * the window being verified (whose back half is queued). */
-static bool qwen4_la_front(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *toks,
-                           uint32_t T) {
-    if (!qwen4_la_alloc(g) || !qwen4_cpipe_switch(g, qwen4_layer_tier(g, 0))) return false;
+static bool qwen4_la_front_begin(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                 const int *toks, uint32_t T) {
+    if (!qwen4_la_alloc(g) || (T == 4u && !qwen4_la_alloc3(g)) || !qwen4_cpipe_switch(g, qwen4_layer_tier(g, 0)))
+        return false;
     const uint32_t split = qwen4_cpipe_split(g);
     const uint64_t state_b = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM * sizeof(float);
     const uint64_t hist_b = (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM * sizeof(float);
     const uint64_t ple_b = (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * DS4_N_EMBD * DS4_N_HC * sizeof(float);
+    /* queued on the first tier, which runs the window ahead after them */
     bool ok = glm_graph_begin_commands_if_needed();
     for (uint32_t il = 0; il < split && ok; il++) {
         if (!g->la_lin_state[il]) continue;
-        ok = ds4_gpu_tensor_copy(g->la_lin_state[il], 0, g->layer_lin_state[il], 0, state_b) &&
-             ds4_gpu_tensor_copy(g->la_lin_hist[il], 0, g->layer_lin_hist[il], 0, hist_b);
+        ok = ds4_gpu_tensor_copy_async(g->la_lin_state[il], g->layer_lin_state[il], state_b) &&
+             ds4_gpu_tensor_copy_async(g->la_lin_hist[il], g->layer_lin_hist[il], hist_b);
     }
-    ok = ok && ds4_gpu_tensor_copy(g->la_ple_hist, 0, g->ple_hist, 0, ple_b);
+    ok = ok && ds4_gpu_tensor_copy_async(g->la_ple_hist, g->ple_hist, ple_b);
     if (!ok) return false;
     memcpy(g->la_ple_prev, g->ple_prev, sizeof(g->la_ple_prev));
     g->la_mrope_delta = g->mrope_delta;
@@ -61028,9 +61036,76 @@ static bool qwen4_la_front(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4
     g->snap_after_first = g->snap_after_second = true;
     g->snap_after_third = T == 4u;
     g->pipe_next_valid = false;   /* a prefill's prefetch is never this window's */
-    ok = qwen4_cpipe_front(g, m, w, toks, T);
-    qwen4_la_swap_snaps(g);
+    return qwen4_cpipe_front_stage(g, m, w, toks, T);
+}
+
+static bool qwen4_la_front(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w, const int *toks,
+                           uint32_t T) {
+    bool ok = qwen4_la_front_begin(g, m, w, toks, T);
+    const uint32_t split = qwen4_cpipe_split(g);
+    for (uint32_t il = 0; il < split && ok; il++) ok = qwen4_cpipe_layer(g, m, w, il, g->pos, T);
+    if (g->la_active) qwen4_la_swap_snaps(g);
     return ok;
+}
+
+/* qwen4_cpipe_back of the window being verified (T rows at g->pos, every
+ * row's logits) with the first tier's layers of the window run ahead (toks,
+ * at g->pos + T) encoded between its layers: the first tier starts on them
+ * as soon as the rows have crossed, instead of after the host has encoded
+ * the later tiers' layers, which left the first GPU idle for the first 5 ms
+ * of each window on a V100 pair.  *ahead: run ahead (in), queued (out).
+ * The two passes share the snapshot flags and nothing else: each tier has
+ * its own transients, and the window run ahead writes the first tier's
+ * snapshots into the second sets (qwen4_la_swap_snaps).
+ * DS4_QWEN4_LA_INTERLEAVE=0 encodes them one after the other. */
+static bool qwen4_la_back_front(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                uint32_t T, const int *toks, bool *ahead) {
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT, split = qwen4_cpipe_split(g);
+    const int first = qwen4_layer_tier(g, 0);
+    const uint32_t pos = g->pos;
+    bool ok = true;
+    for (int t = 0; t < DS4_MAX_GPUS && ok; t++) {
+        if (t == first) continue;
+        ds4_gpu_tensor *pos3 = t == g->cur_tier ? g->pos3 : g->on_tier[t].pos3;
+        if (!pos3) continue;
+        ok = ds4_gpu_tensor_write(pos3, (uint64_t)pos * 16u, g->host_pos3, (uint64_t)T * 16u) &&
+             qwen4_cpipe_switch(g, t) && qwen4_graph_use_tier(g, first, 0);
+    }
+    /* the first later layer: the rows cross before the window run ahead
+     * stages its own into the first tier's */
+    int back_tier = qwen4_layer_tier(g, split);
+    ok = ok && qwen4_graph_use_tier(g, back_tier, T) && qwen4_cpipe_layer(g, m, w, split, pos, T);
+    bool front = ok && *ahead;
+    if (front) {
+        g->pos = pos + T;
+        front = qwen4_la_front_begin(g, m, w, toks, T);
+        g->pos = pos;
+    }
+    uint32_t fl = 0;
+    for (uint32_t il = split + 1; il < n_trunk && ok; il++) {
+        if (front && fl < split) {
+            ok = qwen4_cpipe_switch(g, first) && qwen4_cpipe_layer(g, m, w, fl, pos + T, T);
+            fl++;
+        }
+        const int t = qwen4_layer_tier(g, il);
+        ok = ok && qwen4_cpipe_switch(g, back_tier) && qwen4_graph_use_tier(g, t, T) &&
+             qwen4_cpipe_layer(g, m, w, il, pos, T);
+        back_tier = t;
+    }
+    for (; ok && front && fl < split; fl++) ok = qwen4_cpipe_switch(g, first) && qwen4_cpipe_layer(g, m, w, fl, pos + T, T);
+    if (g->la_active) qwen4_la_swap_snaps(g);
+    ok = ok && qwen4_cpipe_switch(g, back_tier) && qwen4_graph_use_tier(g, g->head_tier, T) &&
+         qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
+         qwen4_gemv(g->logits, m, w->output, g->mixed, T);
+    if (ok) g->pos = pos + T;
+    *ahead = front && ok;
+    return ok;
+}
+
+static bool qwen4_la_interleave(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_QWEN4_LA_INTERLEAVE"); on = !e || strcmp(e, "0") != 0; }
+    return on != 0;
 }
 
 /* the window run ahead becomes the window being verified */
@@ -72550,7 +72625,9 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
          * ones take a layer more at a time.  Entry 0 is the embedding, then
          * the layers, the nextn block and the head. */
         const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
-        for (uint32_t shift = 0; total <= cap && !getenv("DS4_QWEN4_BYTE_SPLIT") && shift < n_trunk; shift++) {
+        const char *shift_env = getenv("DS4_QWEN4_SPLIT_SHIFT");
+        const uint32_t shift0 = shift_env && shift_env[0] ? (uint32_t)strtoul(shift_env, NULL, 10) : 0u;
+        for (uint32_t shift = shift0; total <= cap && !getenv("DS4_QWEN4_BYTE_SPLIT") && shift < n_trunk; shift++) {
             size_t want[DS4_LAYER_PACK_MAX_GPUS], cum = 0, rest = 0;
             uint32_t next = 0;
             bool fits = true;
@@ -77820,8 +77897,13 @@ static int qwen4_spec_lookahead_w(ds4_session *s, const int *first, uint32_t W, 
                     a[i] >= 0;
             ap[i] = g->mtp_draft_p;
         }
-        ok = ok && qwen4_cpipe_back(g, m, w, W, true, true);
-        const bool queued = ok && ahead && qwen4_la_front(g, m, w, a, W);
+        bool queued = ahead;
+        if (qwen4_la_interleave()) {
+            ok = ok && qwen4_la_back_front(g, m, w, W, a, &queued);
+        } else {
+            ok = ok && qwen4_cpipe_back(g, m, w, W, true, true);
+            queued = ok && ahead && qwen4_la_front(g, m, w, a, W);
+        }
         /* DS4_QWEN4_VROWS_HOST=1 reads all the rows and scans them on the host for A/B */
         static int vrows_host = -1;
         if (vrows_host < 0) vrows_host = getenv("DS4_QWEN4_VROWS_HOST") != NULL;
@@ -77882,14 +77964,20 @@ static int qwen4_spec_lookahead_w(ds4_session *s, const int *first, uint32_t W, 
         }
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
-        const float *rl = qwen4_vrow(g, rows, W - 1u);
-        if (!rl) {
-            qwen4_la_discard(g);
-            if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: verify row read failed");
-            s->checkpoint_valid = false;
-            return -1;
+        /* The loop ends in a settle, which sets the logits from its own
+         * window, so a greedy hit's row stays on the GPU (a 1 MB read,
+         * 0.4 ms of the window with the second GPU idle); sampling read it
+         * for the draw. */
+        if (temperature > 0.0f) {
+            const float *rl = qwen4_vrow(g, rows, W - 1u);
+            if (!rl) {
+                qwen4_la_discard(g);
+                if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: verify row read failed");
+                s->checkpoint_valid = false;
+                return -1;
+            }
+            memcpy(s->logits, rl, (size_t)V * sizeof(float));
         }
-        memcpy(s->logits, rl, (size_t)V * sizeof(float));
         int next[4];
         for (uint32_t i = 0; i + 1u < W; i++) next[i] = toks[i + 1];
         next[W - 1u] = a[0];
