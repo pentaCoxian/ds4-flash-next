@@ -62407,6 +62407,13 @@ struct ds4_session {
     float qwen4_c2_seen[3], qwen4_c2_hit[3];   /* the same per band of the first draft's p1 (qwen4_spec_p1_band) */
     int qwen4_cycle_depth;        /* rows of the cycle that just ran */
     int qwen4_cycle_windows;      /* windows a lookahead call verified (qwen4_spec_lookahead) */
+    /* A sampled lookahead drew the token after its last window and kept it:
+     * ds4_session_sample returns it for these logits and settings, so the
+     * caller does not draw again (that would favor the run-ahead token). */
+    bool qwen4_presample_valid;
+    int qwen4_presample, qwen4_presample_len, qwen4_presample_top_k;
+    float qwen4_presample_temp, qwen4_presample_top_p, qwen4_presample_min_p;
+    const uint64_t *qwen4_presample_rng;
     bool qwen4_cycle_warm[4];     /* CUDA: a depth's first cycle has run (its allocations are not its cost) */
     uint64_t qwen4_cycle_count, qwen4_cycle_last[4];   /* cycles run, and when each depth last ran */
     int glm_mtp_parent;
@@ -76962,7 +76969,8 @@ static int qwen4_spec_settle(ds4_session *s, int first_token, int d, int d2, boo
  * and settle this one as a plain cycle does.  Everything is settled before
  * the call returns, up to cap tokens; DS4_QWEN4_LOOKAHEAD=0 turns it off. */
 static int qwen4_spec_lookahead(ds4_session *s, int first_token, int d, int d2, float *rows,
-                                int *accepted, int cap, char *err, size_t errlen) {
+                                int *accepted, int cap, float temperature, int top_k, float top_p,
+                                float min_p, uint64_t *rng, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     const ds4_model *m = &e->model;
@@ -77002,13 +77010,38 @@ static int qwen4_spec_lookahead(ds4_session *s, int first_token, int d, int d2, 
             return -1;
         }
         g->snap_valid = g->snap2_valid = true;
-        const bool hit = queued && sample_argmax(rows, V) == toks[1] && sample_argmax(rows + V, V) == toks[2] &&
-                         sample_argmax(rows + 2u * V, V) == a[0];
+        /* Sampled decode draws the token after a whole window here, with the
+         * caller's settings: a hit needs it to be a0 and a0 the argmax, the
+         * token greedy tool syntax would take too, as accepted drafts are.
+         * Otherwise the draw is kept for the caller's next sample. */
+        const bool whole = sample_argmax(rows, V) == toks[1] && sample_argmax(rows + V, V) == toks[2];
+        int bonus = -1;
+        bool hit = false;
+        if (queued && whole) {
+            const int top = sample_argmax(rows + 2u * V, V);
+            if (temperature > 0.0f) {
+                if (!s->sample_probs) s->sample_probs = xmalloc((size_t)V * sizeof(s->sample_probs[0]));
+                bonus = sample_top_p_min_p(rows + 2u * V, V, temperature, top_k, top_p, min_p, rng, s->sample_probs);
+            } else {
+                bonus = top;
+            }
+            hit = bonus == a[0] && top == a[0];
+        }
         if (!hit) {
             qwen4_la_discard(g);
             const int r = qwen4_spec_settle(s, toks[0], toks[1], toks[2], true, 3u, 3, false, pos, rows,
-                                            0.0f, 0, 0.0f, 0.0f, NULL, false, accepted + n, err, errlen);
+                                            temperature, top_k, top_p, min_p, rng, false, accepted + n, err, errlen);
             s->qwen4_cycle_windows = windows;   /* the depth policy prices one window */
+            if (r == 3 && temperature > 0.0f && bonus >= 0) {
+                s->qwen4_presample_valid = true;
+                s->qwen4_presample = bonus;
+                s->qwen4_presample_len = s->checkpoint.len;
+                s->qwen4_presample_rng = rng;
+                s->qwen4_presample_temp = temperature;
+                s->qwen4_presample_top_k = top_k;
+                s->qwen4_presample_top_p = top_p;
+                s->qwen4_presample_min_p = min_p;
+            }
             return r < 0 ? -1 : n + r;
         }
         /* the whole window is accepted, as qwen4_spec_settle would count it */
@@ -77058,6 +77091,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
                                         char *err, size_t errlen) {
     s->qwen4_chain_dt = 0.0;
     s->qwen4_cycle_windows = 1;
+    s->qwen4_presample_valid = false;   /* only the sample right after its call */
     const double t0 = now_sec();
     const int rc = ds4_session_qwen4_spec_cycle_once(s, first_token, temperature, top_k, top_p, min_p, rng,
                                                     exact_sampling, accepted, accepted_cap, err, errlen);
@@ -77182,9 +77216,11 @@ static int ds4_session_qwen4_spec_cycle_once(ds4_session *s, int first_token, fl
      * the 3-row verify), so a rejected draft only needs the snapshot
      * restored, not a replay of the accepted prefix */
 #if !defined(__APPLE__)
-    if (deep && !pinned && !exact_sampling && temperature <= 0.0f && accepted_cap >= 6 && !g->snap0_valid &&
-        qwen4_la_on(g)) {
-        return qwen4_spec_lookahead(s, first_token, d, d2, rows, accepted, accepted_cap, err, errlen);
+    /* greedy, or opportunistic sampling (drafts accepted as the argmax) */
+    if (deep && !pinned && !exact_sampling && (temperature <= 0.0f || rng) && accepted_cap >= 6 &&
+        !g->snap0_valid && qwen4_la_on(g)) {
+        return qwen4_spec_lookahead(s, first_token, d, d2, rows, accepted, accepted_cap,
+                                    temperature, top_k, top_p, min_p, rng, err, errlen);
     }
 #endif
     g->snap_after_first = g->snap_ple_hist != NULL;
@@ -78227,6 +78263,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "missing session or prompt");
         return 1;
     }
+#ifndef DS4_NO_GPU
+    s->qwen4_presample_valid = false;
+#endif
     if (prompt->len <= 0) {
         snprintf(err, errlen, "empty prompt");
         return 1;
@@ -79514,6 +79553,16 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+#ifndef DS4_NO_GPU
+    if (s->qwen4_presample_valid) {
+        s->qwen4_presample_valid = false;
+        if (s->qwen4_presample_len == s->checkpoint.len && s->qwen4_presample_rng == rng &&
+            s->qwen4_presample_temp == temperature && s->qwen4_presample_top_k == top_k &&
+            s->qwen4_presample_top_p == top_p && s->qwen4_presample_min_p == min_p) {
+            return s->qwen4_presample;
+        }
+    }
+#endif
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
@@ -80294,6 +80343,9 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+#ifndef DS4_NO_GPU
+    s->qwen4_presample_valid = false;
+#endif
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
@@ -88251,6 +88303,9 @@ bool ds4_session_anchor_restore(ds4_session *s) {
 
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
+#ifndef DS4_NO_GPU
+    s->qwen4_presample_valid = false;
+#endif
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
     if (ds4_session_tp_leader(s) &&
