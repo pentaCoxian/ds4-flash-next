@@ -116,50 +116,150 @@ __global__ void tile_max(unsigned *out, const float *scores, unsigned N, unsigne
     out[(uint64_t)t * tiles + tile] = v;
 }
 
-/* Exact radix threshold and stable gather, with the same greater-than then
- * equal-score ordering as Metal. No context-dependent candidate truncation. */
-__global__ void idx_select(int *out, const float *score, unsigned N, unsigned K) {
-    const unsigned tid = threadIdx.x, t = blockIdx.x;
-    __shared__ unsigned hist[256], gt[256], eq[256], threshold, need;
-    const float *row = score + (uint64_t)t * N;
-    if (!tid) { threshold = 0; need = K; }
-    __syncthreads();
+/* Indexer top-k: the K largest of a row's N block scores (as unsigned keys
+ * of the scores clamped at 0), the blocks above the K-th largest score in
+ * block order, then as many of those equal to it as K takes, in block order.
+ * The K-th largest comes from four 8-bit radix passes; their histograms add
+ * a warp's equal bins in one atomic (scores of one magnitude share their top
+ * byte), and warp 0 picks the bin.  With N at least 8K the passes
+ * run on the maxima of the eight-score tiles first: the K-th largest score
+ * is at least the K-th largest tile maximum (K tiles each hold a score that
+ * high), so the second search only needs the scores from that bound up, at
+ * most cap of them and usually little over K (more ties than cap search the
+ * whole row).  The passes over the row keep eight reads a thread in flight.
+ * One block a row. */
+/* warp 0: the bin, from the top, that holds the need-th key */
+__device__ __forceinline__ void radix_pick(const unsigned *hist, unsigned shift, unsigned *threshold, unsigned *need) {
+    if (threadIdx.x >= 32) return;
+    const unsigned lane = threadIdx.x, nd = *need;
+    unsigned c[8], own = 0;
+    #pragma unroll
+    for (unsigned k = 0; k < 8; k++) { c[k] = hist[255 - 8 * lane - k]; own += c[k]; }
+    unsigned upto = own;
+    for (unsigned o = 1; o < 32; o <<= 1) {
+        const unsigned v = __shfl_up_sync(0xffffffffu, upto, o);
+        if (lane >= o) upto += v;
+    }
+    if (upto - own < nd && upto >= nd) {
+        unsigned r = nd - (upto - own);
+        for (unsigned k = 0; k < 8; k++) {
+            if (c[k] >= r) { *threshold |= (255 - 8 * lane - k) << shift; *need = r; break; }
+            r -= c[k];
+        }
+    }
+}
+
+/* the K-th largest of n keys key(i): *threshold its value, *need how many
+ * keys equal to it the K largest take */
+template<typename KEY>
+__device__ void radix_kth(KEY key, unsigned n, unsigned K, unsigned *hist, unsigned *threshold, unsigned *need) {
+    const unsigned tid = threadIdx.x, lane = tid & 31;
+    if (!tid) { *threshold = 0; *need = K; }
     for (unsigned pass = 0; pass < 4; pass++) {
         const unsigned shift = 24 - 8 * pass, mask = pass ? (0xffffffffu << (shift + 8)) : 0;
-        hist[tid] = 0;
+        for (unsigned i = tid; i < 256; i += blockDim.x) hist[i] = 0;
         __syncthreads();
-        for (unsigned i = tid; i < N; i += 256) {
-            const unsigned key = __float_as_uint(fmaxf(row[i], 0));
-            if ((key & mask) == threshold) atomicAdd(hist + ((key >> shift) & 255), 1u);
+        const unsigned th = *threshold;
+        for (unsigned i0 = 0; i0 < n; i0 += blockDim.x) {
+            const unsigned i = i0 + tid, k = i < n ? key(i) : 0;
+            const bool act = i < n && (k & mask) == th;
+            const unsigned b = act ? (k >> shift) & 255 : 256u, peers = __match_any_sync(0xffffffffu, b);
+            if (act && __ffs(peers) - 1 == lane) atomicAdd(hist + b, __popc(peers));
         }
         __syncthreads();
-        if (!tid) for (int d = 255; d >= 0; d--) {
-            if (hist[d] >= need) { threshold |= (unsigned)d << shift; break; }
-            need -= hist[d];
-        }
+        radix_pick(hist, shift, threshold, need);
         __syncthreads();
     }
-    const unsigned chunk = (N + 255) / 256, begin = min(N, tid * chunk), end = min(N, begin + chunk);
+}
+
+/* cap: room for the scores past the tile bound, 0 for no tile search */
+__global__ void __launch_bounds__(1024) idx_select(int *out, const float *score, unsigned N, unsigned K, unsigned cap) {
+    extern __shared__ unsigned smem[];
+    const unsigned tid = threadIdx.x, nth = blockDim.x, lane = tid & 31, warp = tid / 32, nw = nth / 32;
+    const unsigned t = blockIdx.x, NT = (N + 7) / 8, lt = (1u << lane) - 1;
+    unsigned *tiles = smem, *cand = smem + NT;
+    __shared__ unsigned hist[256], bound, threshold, need, count;
+    __shared__ uint64_t scan[32];
+    const float *row = score + (uint64_t)t * N;
+    auto key = [row](unsigned i) { return __float_as_uint(fmaxf(row[i], 0)); };
+    bool full = !cap;
+    if (cap) {
+        /* a warp takes 256 scores in eight coalesced reads; eight lanes share a tile */
+        for (unsigned base = warp * 256; base < N; base += nw * 256) {
+            unsigned k[8];
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) k[j] = base + lane + 32 * j < N ? key(base + lane + 32 * j) : 0;
+            #pragma unroll
+            for (unsigned j = 0; j < 8; j++) {
+                unsigned v = k[j];
+                v = max(v, __shfl_xor_sync(0xffffffffu, v, 1));
+                v = max(v, __shfl_xor_sync(0xffffffffu, v, 2));
+                v = max(v, __shfl_xor_sync(0xffffffffu, v, 4));
+                const unsigned tile = base / 8 + 4 * j + lane / 8;
+                if (!(lane & 7) && tile < NT) tiles[tile] = v;
+            }
+        }
+        __syncthreads();
+        radix_kth([tiles](unsigned i) { return tiles[i]; }, NT, K, hist, &bound, &need);
+        if (!tid) count = 0;
+        __syncthreads();
+        const unsigned bd = bound;
+        for (unsigned i0 = 0; i0 < N; i0 += 8 * nth) {
+            unsigned k[8];
+            #pragma unroll
+            for (unsigned u = 0; u < 8; u++) k[u] = i0 + u * nth + tid < N ? key(i0 + u * nth + tid) : 0;
+            #pragma unroll
+            for (unsigned u = 0; u < 8; u++) {
+                const bool act = i0 + u * nth + tid < N && k[u] >= bd;
+                const unsigned ballot = __ballot_sync(0xffffffffu, act);
+                if (!ballot) continue;
+                unsigned at = 0;
+                if (!lane) at = atomicAdd(&count, __popc(ballot));
+                at = __shfl_sync(0xffffffffu, at, 0) + __popc(ballot & lt);
+                if (act && at < cap) cand[at] = k[u];
+            }
+        }
+        __syncthreads();
+        full = count > cap;
+        if (!full) radix_kth([cand](unsigned i) { return cand[i]; }, count, K, hist, &threshold, &need);
+    }
+    if (full) radix_kth(key, N, K, hist, &threshold, &need);
+    /* the gather: a warp a contiguous range, 32 scores a step and eight
+     * steps in flight, places from ballots and the warps before it */
+    const unsigned th = threshold, nd = need;
+    const unsigned span = ((N + nw - 1) / nw + 255) / 256 * 256, wb = min(N, warp * span), we = min(N, wb + span);
     unsigned ng = 0, ne = 0;
-    for (unsigned i = begin; i < end; i++) {
-        const unsigned key = __float_as_uint(fmaxf(row[i], 0));
-        ng += key > threshold; ne += key == threshold;
-    }
-    gt[tid] = ng; eq[tid] = ne;
-    __syncthreads();
-    if (!tid) {
-        unsigned pg = 0, pe = 0;
-        for (unsigned i = 0; i < 256; i++) {
-            const unsigned g = gt[i], e = eq[i];
-            gt[i] = pg; eq[i] = pe; pg += g; pe += e;
+    for (unsigned i0 = wb; i0 < we; i0 += 256) {
+        unsigned k[8];
+        #pragma unroll
+        for (unsigned u = 0; u < 8; u++) k[u] = i0 + 32 * u + lane < we ? key(i0 + 32 * u + lane) : 0;
+        #pragma unroll
+        for (unsigned u = 0; u < 8; u++) {
+            const bool in = i0 + 32 * u + lane < we;
+            ng += __popc(__ballot_sync(0xffffffffu, in && k[u] > th));
+            ne += __popc(__ballot_sync(0xffffffffu, in && k[u] == th));
         }
     }
+    if (!lane) scan[warp] = (uint64_t)ng << 32 | ne;
     __syncthreads();
-    unsigned g = gt[tid], e = eq[tid];
-    for (unsigned i = begin; i < end; i++) {
-        const unsigned key = __float_as_uint(fmaxf(row[i], 0));
-        if (key > threshold) out[(uint64_t)t * K + g++] = i;
-        else if (key == threshold) { if (e < need) out[(uint64_t)t * K + K - need + e] = i; e++; }
+    uint64_t before = 0;
+    for (unsigned w = 0; w < warp; w++) before += scan[w];
+    unsigned g = (unsigned)(before >> 32), e = (unsigned)before;
+    int *o = out + (uint64_t)t * K;
+    for (unsigned i0 = wb; i0 < we; i0 += 256) {
+        unsigned k[8];
+        #pragma unroll
+        for (unsigned u = 0; u < 8; u++) k[u] = i0 + 32 * u + lane < we ? key(i0 + 32 * u + lane) : 0;
+        #pragma unroll
+        for (unsigned u = 0; u < 8; u++) {
+            const unsigned i = i0 + 32 * u + lane;
+            const unsigned gb = __ballot_sync(0xffffffffu, i < we && k[u] > th);
+            const unsigned eb = __ballot_sync(0xffffffffu, i < we && k[u] == th);
+            if (i < we && k[u] > th) o[g + __popc(gb & lt)] = i;
+            else if (i < we && k[u] == th && e + __popc(eb & lt) < nd) o[K - nd + e + __popc(eb & lt)] = i;
+            g += __popc(gb);
+            e += __popc(eb);
+        }
     }
 }
 
@@ -3125,7 +3225,22 @@ extern "C" int ds4_gpu_qwen4_idx_select_tensor(ds4_gpu_tensor *out, const ds4_gp
     using namespace qwen4_cuda;
     (void)tiles;
     if (!T || !K || K > N || !tensor(out, (uint64_t)T * K * 4) || !tensor(score, (uint64_t)T * N * 4)) return 0;
-    idx_select<<<T, 256, 0, cuda_decode_stream()>>>((int *)out->ptr, (const float *)score->ptr, N, K);
+    /* rows of 8K scores and more search the tile maxima first;
+     * DS4_QWEN4_IDX_SELECT_FULL=1 searches the whole row for A/B */
+    const unsigned NT = (N + 7) / 8, cap = 8 * K;
+    const size_t smem = ((size_t)NT + cap) * 4;
+    static int max_smem[DS4_MAX_GPUS] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    int &ms = max_smem[current_tier()];   /* the attribute is the device's */
+    if (ms < 0) {
+        ms = 0;
+        /* the opt-in limit (96 KB on Volta) holds the static histogram too */
+        if (cudaFuncSetAttribute(idx_select, cudaFuncAttributeMaxDynamicSharedMemorySize, 88 * 1024) == cudaSuccess)
+            ms = 88 * 1024;
+        (void)cudaGetLastError();
+    }
+    const bool tiled = N >= 8192 && NT >= K && smem <= (size_t)ms && !getenv("DS4_QWEN4_IDX_SELECT_FULL");
+    idx_select<<<T, 1024, tiled ? smem : 0, cuda_decode_stream()>>>((int *)out->ptr, (const float *)score->ptr,
+                                                                    N, K, tiled ? cap : 0);
     return launched();
 }
 

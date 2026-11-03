@@ -887,6 +887,33 @@ static void test_idx_select(uint32_t T, uint32_t n, uint32_t k, uint32_t visible
     char name[96];
     snprintf(name, sizeof(name), "idx select T=%u n=%u k=%u visible=%u", T, n, k, visible);
     require_ok(bad == 0, name);
+#ifndef __APPLE__
+    /* the order too: the blocks above the k-th largest score in block order,
+     * then the ones equal to it in block order; the tile search and the whole
+     * row's give the same */
+    for (uint32_t t = 0; t < T; t++) {
+        const float *row = sc + (uint64_t)t * n;
+        for (uint32_t b = 0; b < n; b++) order[b] = (int32_t)b;
+        qsort_r(order, n, 4, cmp_desc_idx, (void *)row);
+        const float kth = fmaxf(row[order[k - 1]], 0.0f);
+        uint32_t above = 0, j = 0;
+        for (uint32_t b = 0; b < n; b++) above += fmaxf(row[b], 0.0f) > kth;
+        uint32_t eq = 0;
+        for (uint32_t b = 0; b < n; b++) {
+            const float v = fmaxf(row[b], 0.0f);
+            if (v > kth) bad += got[(uint64_t)t * k + j++] != (int32_t)b;
+            else if (v == kth && eq < k - above) bad += got[(uint64_t)t * k + above + eq++] != (int32_t)b;
+        }
+    }
+    require_ok(bad == 0, "idx select: block order");
+    setenv("DS4_QWEN4_IDX_SELECT_FULL", "1", 1);
+    require_ok(ds4_gpu_qwen4_idx_select_tensor(gsel, gs, NULL, n, T, k), "idx select full");
+    unsetenv("DS4_QWEN4_IDX_SELECT_FULL");
+    int32_t *full = malloc((uint64_t)T * k * 4);
+    require_ok(ds4_gpu_tensor_read(gsel, 0, full, (uint64_t)T * k * 4), "idx select full read");
+    require_ok(memcmp(full, got, (uint64_t)T * k * 4) == 0, "idx select: tile search = whole-row search");
+    free(full);
+#endif
     printf("  %-44s ok\n", name);
     free(order); free(got); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gs); free(sc);
 }
@@ -4740,6 +4767,9 @@ int main(void) {
     test_idx_select(4, 70001, 512, 69000);
     test_idx_select(3, 600, 512, 599);
     test_idx_select(2, 3000, 512, 520);
+    test_idx_select(3, 8193, 512, 8193);
+    test_idx_select(3, 65537, 512, 60000);
+    test_idx_select(1, 65537, 512, 100);   /* ties at zero past the candidate room */
     test_attn_mm(40, 0, false);
     test_attn_mm(37, 3000, true);
     test_attn_mm(3, 100, true);

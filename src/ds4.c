@@ -72748,6 +72748,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #ifndef DS4_NO_GPU
         g_qwen4_power_percent = (uint32_t)e->power_percent;
 #endif
+        /* CUDA's transients scale with the prefill chunk and, through the
+         * indexer's block scores, with the context: the 8192 rows of the
+         * default take 11.7 GB a GPU at 262K.  2048 rows prefill about as
+         * fast; past 128K, 1024 rows keep 262K with MTP within the auto
+         * budgets of two 32 GB GPUs (6% slower prefill). */
+        if (e->backend == DS4_BACKEND_CUDA && e->prefill_chunk == 0)
+            e->prefill_chunk = opt->context_size >= 131072 ? 1024u : 2048u;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
