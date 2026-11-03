@@ -3425,6 +3425,8 @@ int ds4_gpu_qwen4_gdn_prep_tensor(
 void ds4_gpu_qwen4_set_verify_rows_exact(bool on);
 /* 8-bit K/V cache rows (Metal): set before the graph allocates its caches */
 void ds4_gpu_qwen4_set_kv_q8(bool on);
+/* CUDA: whether Q8 K/V rows suit this GPU (no sm_80 attention tiles) */
+int ds4_gpu_qwen4_kv_q8_preferred(void);
 int ds4_gpu_qwen4_gdn_scan_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,

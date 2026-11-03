@@ -38,7 +38,28 @@ __device__ void apply_rope(float *row, const uint32_t *pos, rope_args r) {
     __syncwarp();
 }
 
-__global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
+/* K/V rows of the attention layers: f16, or (Q8) as on Metal the row's
+ * int8 values followed by an f16 scale per 32 of them, 17/16 bytes a value */
+static bool g_kv_q8;
+
+__host__ __device__ inline uint64_t kv_row_bytes(uint64_t kv_dim, bool q8) {
+    return q8 ? kv_dim + kv_dim / 16 : kv_dim * 2;
+}
+
+/* the warp's 32 values at elements off..off+31 of a Q8 row, one a lane:
+ * the scale amax/127 rounded to f16, the values rounded to nearest
+ * (Metal's qwen4_kv_store) */
+__device__ __forceinline__ void kv_store_q8(char *row, uint64_t kv_dim, unsigned off, float x) {
+    float a = fabsf(x);
+    for (unsigned m = 16; m; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, m));
+    const __half d = __float2half_rn(__fdiv_rn(a, 127.0f));
+    const float id = __half2float(d) > 0 ? __fdiv_rn(1.0f, __half2float(d)) : 0;
+    row[off + (threadIdx.x & 31)] = (char)(int)fminf(fmaxf(rintf(__fmul_rn(x, id)), -127.0f), 127.0f);
+    if (!(threadIdx.x & 31)) ((__half *)(row + kv_dim))[off / 32] = d;
+}
+
+template<bool Q8>
+__global__ void attn_prep(float *qout, float *gate, char *kc, char *vc,
         float *iqout, float *ikc, const float *qg, const float *kp, const float *vp,
         const float *iq, const float *ik, const uint32_t *pos3,
         const float *gq, const float *gk, const float *giq,
@@ -63,13 +84,17 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
     for (unsigned i = lane; i < dim; i += 32) row[i] = src[i] * inv * gamma[i];
     __syncwarp();
     apply_rope(row, pos3 + (uint64_t)pos * 4, rp);
+    const uint64_t kv_dim = (uint64_t)Hkv * D, rb = kv_row_bytes(kv_dim, Q8);
     for (unsigned i = lane; i < dim; i += 32) {
         if (isq) {
             qout[((uint64_t)t * H + h) * D + i] = row[i];
             gate[((uint64_t)t * H + h) * D + i] = src[D + i];
+        } else if (isk && Q8) {
+            kv_store_q8(kc + (uint64_t)pos * rb, kv_dim, h * D + i - lane, row[i]);
+            kv_store_q8(vc + (uint64_t)pos * rb, kv_dim, h * D + i - lane, vp[((uint64_t)t * Hkv + h) * D + i]);
         } else if (isk) {
-            kc[((uint64_t)pos * Hkv + h) * D + i] = __float2half_rn(row[i]);
-            vc[((uint64_t)pos * Hkv + h) * D + i] = __float2half_rn(vp[((uint64_t)t * Hkv + h) * D + i]);
+            ((__half *)kc)[((uint64_t)pos * Hkv + h) * D + i] = __float2half_rn(row[i]);
+            ((__half *)vc)[((uint64_t)pos * Hkv + h) * D + i] = __float2half_rn(vp[((uint64_t)t * Hkv + h) * D + i]);
         } else iqout[((uint64_t)t * Hi + h) * Di + i] = row[i];
     }
 }
@@ -273,36 +298,71 @@ __global__ void idx_expand(int *out, unsigned *count, const int *blocks,
     if (!threadIdx.x) count[t] = K * ratio + pos + 1 - tail;
 }
 
-template<unsigned D>
+__device__ __forceinline__ float sbyte_f(uint64_t v, unsigned k);
+
+/* N int8 values of a Q8 K/V row as floats (N of 1, 4 or 8, aligned) */
+template<unsigned N>
+__device__ __forceinline__ void kv_load_q8(const char *p, float *out) {
+    uint64_t v = 0;
+    if (N == 8) { const int2 w = *(const int2 *)p; v = (uint32_t)w.x | (uint64_t)(uint32_t)w.y << 32; }
+    else if (N == 4) v = *(const uint32_t *)p;
+    else v = (uint8_t)*p;
+    #pragma unroll
+    for (unsigned k = 0; k < N; k++) out[k] = sbyte_f(v, k);
+}
+
+/* A warp per head and token.  With f16 rows a lane takes elements lane +
+ * 32i; with Q8 rows elements lane*D/32 + i, so its values are consecutive
+ * bytes under one scale. */
+template<unsigned D, bool Q8>
 __global__ void attention(float *out, float *partial, const float *q, const float *gate,
-        const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
+        const char *kc, const char *vc, const int *sel, const unsigned *counts,
         unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse,
         unsigned splits, unsigned per, float scale) {
+    constexpr unsigned NPT = D / 32;
     const unsigned h = blockIdx.x * 4 + threadIdx.x / 32, t = blockIdx.y, split = blockIdx.z;
     if (h >= H) return;
     const unsigned lane = threadIdx.x & 31, kh = h / (H / Hkv), n = sparse ? counts[t] : pos0 + t + 1;
-    float qv[D / 32], acc[D / 32] = {}, m = -3e38f, denom = 0;
-    for (unsigned i = 0; i < D / 32; i++) qv[i] = q[((uint64_t)t * H + h) * D + lane + 32 * i] * scale;
+    const uint64_t kv_dim = (uint64_t)Hkv * D, rb = kv_row_bytes(kv_dim, Q8);
+    const unsigned e0 = Q8 ? lane * NPT : lane, es = Q8 ? 1 : 32;
+    float qv[NPT], acc[NPT] = {}, m = -3e38f, denom = 0;
+    for (unsigned i = 0; i < NPT; i++) qv[i] = q[((uint64_t)t * H + h) * D + e0 + es * i] * scale;
     for (unsigned j = split * per; j < min(n, (split + 1) * per); j++) {
         const unsigned p = sparse ? (unsigned)sel[(uint64_t)t * stride + j] : j;
         if (p > pos0 + t) continue;
-        float score = 0;
-        for (unsigned i = 0; i < D / 32; i++) score += qv[i] * __half2float(kc[((uint64_t)p * Hkv + kh) * D + lane + 32 * i]);
+        float score = 0, x[NPT];
+        if (Q8) {
+            const char *row = kc + (uint64_t)p * rb;
+            kv_load_q8<NPT>(row + kh * D + e0, x);
+            for (unsigned i = 0; i < NPT; i++) score += qv[i] * x[i];
+            score *= __half2float(((const __half *)(row + kv_dim))[(kh * D + e0) / 32]);
+        } else {
+            const __half *row = (const __half *)kc + ((uint64_t)p * Hkv + kh) * D;
+            for (unsigned i = 0; i < NPT; i++) score += qv[i] * __half2float(row[e0 + es * i]);
+        }
         score = sum(score);
         const float nm = fmaxf(m, score), correction = expf(m - nm), w = expf(score - nm);
         denom = denom * correction + w;
-        for (unsigned i = 0; i < D / 32; i++) acc[i] = acc[i] * correction + w * __half2float(vc[((uint64_t)p * Hkv + kh) * D + lane + 32 * i]);
+        if (Q8) {
+            const char *row = vc + (uint64_t)p * rb;
+            kv_load_q8<NPT>(row + kh * D + e0, x);
+            const float ws = w * __half2float(((const __half *)(row + kv_dim))[(kh * D + e0) / 32]);
+            for (unsigned i = 0; i < NPT; i++) acc[i] = acc[i] * correction + ws * x[i];
+        } else {
+            const __half *row = (const __half *)vc + ((uint64_t)p * Hkv + kh) * D;
+            for (unsigned i = 0; i < NPT; i++) acc[i] = acc[i] * correction + w * __half2float(row[e0 + es * i]);
+        }
         m = nm;
     }
     if (splits == 1) {
-        for (unsigned i = 0; i < D / 32; i++) {
-            const uint64_t p = ((uint64_t)t * H + h) * D + lane + 32 * i;
+        for (unsigned i = 0; i < NPT; i++) {
+            const uint64_t p = ((uint64_t)t * H + h) * D + e0 + es * i;
             out[p] = (denom > 0 ? acc[i] / denom : 0) * sigmoid(gate[p]);
         }
     } else {
         float *dst = partial + (((uint64_t)t * H + h) * splits + split) * (D + 2);
         if (!lane) { dst[0] = m; dst[1] = denom; }
-        for (unsigned i = 0; i < D / 32; i++) dst[2 + lane + 32 * i] = acc[i];
+        for (unsigned i = 0; i < NPT; i++) dst[2 + e0 + es * i] = acc[i];
     }
 }
 
@@ -3412,15 +3472,19 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         (uint64_t)pos0 + T > cap || !tensor(q, qb) || !tensor(gate, qb) || !tensor(qg, qb * 2) ||
         !tensor(kp, kb) || !tensor(vp, kb) || !tensor(iq, ib) || !tensor(iqout, ib) ||
         !tensor(ik, (uint64_t)T * Di * 4) || !tensor(ikc, (uint64_t)cap * Di * 4) ||
-        !tensor(kc, (uint64_t)cap * Hkv * D * 2) || !tensor(vc, (uint64_t)cap * Hkv * D * 2) ||
+        !tensor(kc, (uint64_t)cap * kv_row_bytes((uint64_t)Hkv * D, g_kv_q8)) ||
+        !tensor(vc, (uint64_t)cap * kv_row_bytes((uint64_t)Hkv * D, g_kv_q8)) ||
         !tensor(pos3, (uint64_t)cap * 16)) return 0;
     const char *gq = weight(map, size, qo, D * 4), *gk = weight(map, size, ko, D * 4), *giq = weight(map, size, io, Di * 4);
     if (!gq || !gk || !giq) return 0;
-    attn_prep<<<dim3(H + Hkv + Hi + 1, T), 32, 0, cuda_decode_stream()>>>((float *)q->ptr,
-        (float *)gate->ptr, (__half *)kc->ptr, (__half *)vc->ptr, (float *)iqout->ptr, (float *)ikc->ptr,
-        (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr, (const float *)iq->ptr,
-        (const float *)ik->ptr, (const uint32_t *)pos3->ptr, (const float *)gq, (const float *)gk, (const float *)giq,
-        H, Hkv, D, Hi, Di, pos0, eps, rope(nrot, base));
+#define QWEN_PREP(Q8) attn_prep<Q8><<<dim3(H + Hkv + Hi + 1, T), 32, 0, cuda_decode_stream()>>>((float *)q->ptr, \
+        (float *)gate->ptr, (char *)kc->ptr, (char *)vc->ptr, (float *)iqout->ptr, (float *)ikc->ptr, \
+        (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr, (const float *)iq->ptr, \
+        (const float *)ik->ptr, (const uint32_t *)pos3->ptr, (const float *)gq, (const float *)gk, (const float *)giq, \
+        H, Hkv, D, Hi, Di, pos0, eps, rope(nrot, base))
+    if (g_kv_q8) QWEN_PREP(true);
+    else QWEN_PREP(false);
+#undef QWEN_PREP
     return launched();
 }
 
@@ -3701,6 +3765,13 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
 }
 
 extern "C" int ds4_gpu_qwen4_decode_fusions_enabled(void) { return 1; }
+
+/* the graph sets the K/V format before it allocates its caches */
+extern "C" void ds4_gpu_qwen4_set_kv_q8(bool on) { qwen4_cuda::g_kv_q8 = on; }
+
+/* Q8 K/V suits the GPUs without sm_80's tensor-core attention tiles
+ * (attention_group stages f16 rows) */
+extern "C" int ds4_gpu_qwen4_kv_q8_preferred(void) { return !ds4_cuda_attn_tokentile_arch_ok(); }
 /* the half expert tiles: sm_80's, and Volta's for the types volta_tiles takes */
 extern "C" int ds4_gpu_qwen4_tensor_tiles(void) {
     return (ds4_cuda_attn_tokentile_arch_ok() || qwen4_cuda::volta()) && !getenv("DS4_CUDA_NO_TF32");
@@ -3844,12 +3915,12 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
         const ds4_gpu_tensor *sel, const ds4_gpu_tensor *count, ds4_gpu_tensor *partial,
         uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0, bool sparse, uint32_t stride, float scale) {
     using namespace qwen4_cuda;
-    const uint64_t n = (uint64_t)T * H * D * 4, cb = ((uint64_t)pos0 + T) * Hkv * D * 2;
+    const uint64_t n = (uint64_t)T * H * D * 4, cb = ((uint64_t)pos0 + T) * kv_row_bytes((uint64_t)Hkv * D, g_kv_q8);
     if (!T || !H || !Hkv || H % Hkv || (D != 32 && D != 128 && D != 256) ||
         !tensor(out, n) || !tensor(q, n) || !tensor(gate, n) || !tensor(kc, cb) || !tensor(vc, cb) ||
         (sparse && (!stride || !tensor(sel, (uint64_t)T * stride * 4) || !tensor(count, (uint64_t)T * 4)))) return 0;
     const unsigned keys = sparse ? stride : pos0 + T;
-    if (!partial && T >= 32 && D == 256 && H/Hkv <= 16 &&
+    if (!partial && T >= 32 && D == 256 && H/Hkv <= 16 && !g_kv_q8 &&
         !((uintptr_t)kc->ptr&15) && !((uintptr_t)vc->ptr&15) &&
         ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode && !getenv("DS4_QWEN4_NO_ATTN_MM")) {
         attention_group<<<dim3(Hkv,T),256,0,cuda_decode_stream()>>>((float *)out->ptr,
@@ -3861,13 +3932,13 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
     const unsigned splits = partial ? std::min(64u, (keys + 31) / 32) : 1;
     if (partial && !tensor(partial, (uint64_t)T * H * splits * (D + 2) * 4)) return 0;
     const dim3 grid((H + 3) / 4, T, splits);
-#define QWEN_ATTN(DIM) attention<DIM><<<grid, 128, 0, cuda_decode_stream()>>>((float *)out->ptr, \
+#define QWEN_ATTN(DIM, Q8) attention<DIM,Q8><<<grid, 128, 0, cuda_decode_stream()>>>((float *)out->ptr, \
         partial ? (float *)partial->ptr : NULL, (const float *)q->ptr, (const float *)gate->ptr, \
-        (const __half *)kc->ptr, (const __half *)vc->ptr, sparse ? (const int *)sel->ptr : NULL, \
+        (const char *)kc->ptr, (const char *)vc->ptr, sparse ? (const int *)sel->ptr : NULL, \
         sparse ? (const unsigned *)count->ptr : NULL, H, Hkv, pos0, stride, sparse, splits, (keys + splits - 1) / splits, scale)
-    if (D == 32) { QWEN_ATTN(32); }
-    else if (D == 128) { QWEN_ATTN(128); }
-    else { QWEN_ATTN(256); }
+    if (D == 32) { if (g_kv_q8) QWEN_ATTN(32, true); else QWEN_ATTN(32, false); }
+    else if (D == 128) { if (g_kv_q8) QWEN_ATTN(128, true); else QWEN_ATTN(128, false); }
+    else { if (g_kv_q8) QWEN_ATTN(256, true); else QWEN_ATTN(256, false); }
 #undef QWEN_ATTN
     if (!launched()) return 0;
     if (splits > 1) attn_merge<<<dim3(H, T), D, 0, cuda_decode_stream()>>>((float *)out->ptr,

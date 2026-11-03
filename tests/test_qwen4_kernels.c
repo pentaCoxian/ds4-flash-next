@@ -948,6 +948,22 @@ static void *test_kv_rows(const _Float16 *src, uint64_t rows, uint64_t kv_dim) {
     return dst;
 }
 
+/* the values cache rows hold, as floats */
+static float *test_kv_values(const void *rows, uint64_t n_rows, uint64_t kv_dim) {
+    float *out = malloc(n_rows * kv_dim * sizeof(float));
+    require_ok(out != NULL, "kv values allocation");
+    for (uint64_t r = 0; r < n_rows; r++) {
+        const uint8_t *row = (const uint8_t *)rows + r * test_kv_row_bytes(kv_dim);
+        for (uint64_t i = 0; i < kv_dim; i++) {
+            if (!g_test_kv_q8) { out[r * kv_dim + i] = (float)((const _Float16 *)row)[i]; continue; }
+            _Float16 d;
+            memcpy(&d, row + kv_dim + i / 32u * 2u, 2u);
+            out[r * kv_dim + i] = (float)((const int8_t *)row)[i] * (float)d;
+        }
+    }
+    return out;
+}
+
 static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks, uint32_t H, bool split) {
     const uint32_t Hkv = 2, D = 256, ratio = 4, sel_stride = k_blocks * ratio + ratio;
     const uint32_t cap = pos0 + T;
@@ -992,6 +1008,7 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     ds4_gpu_tensor *gq = upload(q, qn), *ggate = upload(gate, qn);
     const uint64_t kv_bytes = (uint64_t)cap * test_kv_row_bytes((uint64_t)Hkv * D);
     void *krows = test_kv_rows(kc, cap, (uint64_t)Hkv * D), *vrows = test_kv_rows(vc, cap, (uint64_t)Hkv * D);
+    float *kval = test_kv_values(krows, cap, (uint64_t)Hkv * D), *vval = test_kv_values(vrows, cap, (uint64_t)Hkv * D);
     ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kv_bytes), *gv = ds4_gpu_tensor_alloc(kv_bytes);
     ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * sel_stride * 4), *gcnt = ds4_gpu_tensor_alloc(T * 4);
     ds4_gpu_tensor *go_ref = upload(NULL, qn), *go_new = upload(NULL, qn);
@@ -1033,7 +1050,7 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
             double dot = 0;
             if (pos > pos0+t) { scores[j] = -INFINITY; continue; }
             for (uint32_t d = 0; d < D; d++)
-                dot += (double)q[((uint64_t)t*H+h)*D+d] * (double)kc[((uint64_t)pos*Hkv+kh)*D+d];
+                dot += (double)q[((uint64_t)t*H+h)*D+d] * (double)kval[((uint64_t)pos*Hkv+kh)*D+d];
             scores[j] = dot * 0.0625;
             peak = fmax(peak,scores[j]);
         }
@@ -1042,7 +1059,7 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
             if (pos > pos0+t) continue;
             const double weight = exp(scores[j]-peak);
             denom += weight;
-            for (uint32_t d = 0; d < D; d++) acc[d] += weight * (double)vc[((uint64_t)pos*Hkv+kh)*D+d];
+            for (uint32_t d = 0; d < D; d++) acc[d] += weight * (double)vval[((uint64_t)pos*Hkv+kh)*D+d];
         }
         for (uint32_t d = 0; d < D; d++) {
             const uint64_t i = ((uint64_t)t*H+h)*D+d;
@@ -1058,7 +1075,8 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
 #endif
     if (T <= 8u && !split) require_ok(worst == 0.0, "short attention tails keep decode arithmetic");
     printf("  %-44s ok  max|d|=%.2e (scale %.2e)\n", name, worst, scale);
-    free(ref); free(got); free(q); free(gate); free(kc); free(vc); free(krows); free(vrows); free(sel); free(cnt);
+    free(ref); free(got); free(q); free(gate); free(kc); free(vc); free(krows); free(vrows); free(kval); free(vval);
+    free(sel); free(cnt);
     ds4_gpu_tensor_free(gq); ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gv);
     ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(go_ref); ds4_gpu_tensor_free(go_new);
     ds4_gpu_tensor_free(partial);
@@ -1819,6 +1837,25 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     snprintf(name, sizeof(name), "attention H=%u/%u D=%u k=%u n=%u%s", H, Hkv, D, k_blocks, n_pos, g_test_kv_q8 ? " q8 KV" : "");
     /* half or 8-bit KV; block order differs */
     check_tensor(name, gout, ref_out, (uint64_t)n_pos * H * D, g_test_kv_q8 ? 1e-2 : 5e-4);
+    if (g_test_kv_q8) {
+        /* each 8-bit value within half a step of its group's scale of the row value */
+        const uint64_t kv_dim = (uint64_t)Hkv * D, bytes = (uint64_t)n_pos * test_kv_row_bytes(kv_dim);
+        for (int kv = 0; kv < 2; kv++) {
+            uint8_t *rows = malloc(bytes);
+            require_ok(rows && ds4_gpu_tensor_read(kv ? gvc : gkc, 0, rows, bytes), "q8 cache read");
+            float *got = test_kv_values(rows, n_pos, kv_dim);
+            const double *want = kv ? vc : kc;
+            for (uint64_t r = 0; r < n_pos; r++)
+                for (uint64_t i = 0; i < kv_dim; i++) {
+                    _Float16 d;
+                    memcpy(&d, rows + r * test_kv_row_bytes(kv_dim) + kv_dim + i / 32u * 2u, 2u);
+                    const double w = want[r * kv_dim + i];
+                    require_ok(fabs(got[r * kv_dim + i] - w) <= 0.5 * (double)d * 1.01 + 1e-3 * fabs(w) + 1e-7,
+                               kv ? "q8 V cache rounding" : "q8 K cache rounding");
+                }
+            free(got); free(rows);
+        }
+    }
 
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gnsel); ds4_gpu_tensor_free(gselt); ds4_gpu_tensor_free(gselb);
     ds4_gpu_tensor_free(gscore); ds4_gpu_tensor_free(gbk); ds4_gpu_tensor_free(gikc); ds4_gpu_tensor_free(giqo);
@@ -4863,19 +4900,20 @@ int main(void) {
     printf("attention\n");
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
-#ifdef __APPLE__
-    /* the same with the 8-bit K/V rows the Metal graph keeps */
+    /* the same with the 8-bit K/V rows the Metal graph keeps, as does CUDA
+     * without sm_80's attention tiles */
     ds4_gpu_qwen4_set_kv_q8(true);
     g_test_kv_q8 = true;
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+#ifdef __APPLE__
     test_attention_rows(&arena);
+#endif
     test_attn_mm(32, 4093, false);
     test_attn_mm(33, 8193, true);
     test_attn_mm(4, 100, false);
     ds4_gpu_qwen4_set_kv_q8(false);
     g_test_kv_q8 = false;
-#endif
 #ifdef __APPLE__
     test_attention_rows(&arena);
 #endif

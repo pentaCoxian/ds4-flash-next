@@ -40070,13 +40070,20 @@ static uint32_t qwen4_ik_cache_rows(uint32_t ctx_cap, uint32_t cap_tokens) {
     return ctx_cap;
 }
 
-/* K/V rows of the attention layers: on Metal 8-bit values with an f16
- * scale per 32 (metal/qwen4.metal qwen4_kv_load), 47% of the f16 rows' bytes
- * (3.05 GiB less at 262K); DS4_QWEN4_KV_F16=1 keeps f16, the CUDA layout. */
+/* K/V rows of the attention layers: 8-bit values with an f16 scale per 32
+ * (metal/qwen4.metal qwen4_kv_load, attention in ds4_qwen4_cuda.cuh), 47% of
+ * the f16 rows' bytes (3.05 GiB less at 262K); DS4_QWEN4_KV_F16=1 keeps f16.
+ * CUDA takes them where it has no sm_80 attention tiles, which read f16
+ * rows (DS4_QWEN4_KV_Q8=1 forces them). */
 static bool qwen4_kv_q8(void) {
 #if defined(__APPLE__)
     static int v = -1;
     if (v < 0) v = getenv("DS4_QWEN4_KV_F16") == NULL;
+    return v != 0;
+#elif defined(DS4_HAS_QWEN4_GPU)
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4_KV_F16") == NULL &&
+                   (getenv("DS4_QWEN4_KV_Q8") != NULL || ds4_gpu_qwen4_kv_q8_preferred());
     return v != 0;
 #else
     return false;
@@ -40128,7 +40135,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
          * prefill chunk */
         const uint64_t T = prefill_chunk ? prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
         const uint64_t blocks = ctx / 4u + 1u;
-        const bool kv_q8 = backend == DS4_BACKEND_METAL && qwen4_kv_q8();
+        const bool kv_q8 = (backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA) && qwen4_kv_q8();
         const uint64_t kv_row = 2ull * qwen4_kv_row_bytes(kv_q8);
         uint32_t n_attn = 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) n_attn += !ds4_qwen4_layer_is_linear(il);
@@ -58735,9 +58742,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     }
     g->tier = tier;
     g->head_tier = tier ? tier[DS4_N_LAYER] : 0;
-#ifdef DS4_HAS_QWEN4_METAL
     ds4_gpu_qwen4_set_kv_q8(qwen4_kv_q8());
-#endif
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
     const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
@@ -71452,7 +71457,7 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
             const uint32_t T = e->prefill_chunk ? e->prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 const uint64_t state = ds4_qwen4_layer_is_linear(il) ? 4u * qwen4_gdn_state_bytes()
-                                                                     : qwen4_attn_cache_bytes(ctx, T, false);
+                                                                     : qwen4_attn_cache_bytes(ctx, T, qwen4_kv_q8());
                 out[il + 1] = engine_size_add_sat(out[il + 1],
                                                   engine_size_mul_sat((size_t)state, engine_placement_session_count(e)));
             }
