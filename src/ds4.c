@@ -59776,8 +59776,8 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
     /* All-sparse rows whose 2/1-row sub-batches would see the same block
      * universe (three cycles in four) take one 3-row pass: the scorer, the
      * selection, the expansion and the split-key attention all work per row
-     * with a split count fixed by the selection stride, so each row gets
-     * its sub-batch's bits. */
+     * (CUDA splits a row's keys by its own count), so each row gets its
+     * sub-batch's bits. */
     const uint32_t sparse_pos = (g->k_blocks + 1u) * ratio - 1u;
     static int keep_split = -1;
     if (keep_split < 0) keep_split = getenv("DS4_QWEN4_EXACT_ATTN_SPLIT") != NULL;
@@ -60983,15 +60983,11 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
 }
 
 /* DS4_QWEN4_MTP_FILL=0 leaves the nextn rows of prompts unwritten, as before,
- * to measure what the fill buys.  Metal only until it is measured on CUDA. */
+ * to measure what the fill buys. */
 static bool qwen4_mtp_fill_on(void) {
-#if defined(__APPLE__)
     static int v = -1;
     if (v < 0) { const char *e = getenv("DS4_QWEN4_MTP_FILL"); v = !e || strcmp(e, "0") != 0; }
     return v != 0;
-#else
-    return false;
-#endif
 }
 
 /* The nextn layer's cache rows for prompt rows.  MTP drafts attend over

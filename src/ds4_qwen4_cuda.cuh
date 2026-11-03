@@ -313,7 +313,9 @@ __device__ __forceinline__ void kv_load_q8(const char *p, float *out) {
 
 /* A warp per head and token.  With f16 rows a lane takes elements lane +
  * 32i; with Q8 rows elements lane*D/32 + i, so its values are consecutive
- * bytes under one scale. */
+ * bytes under one scale.  A row's keys split by its own count (up to 64
+ * splits of at least 32 keys, the rest of the grid's splits empty), so a
+ * row of a verify batch sums its keys as the lone row does. */
 template<unsigned D, bool Q8>
 __global__ void attention(float *out, float *partial, const float *q, const float *gate,
         const char *kc, const char *vc, const int *sel, const unsigned *counts,
@@ -323,11 +325,13 @@ __global__ void attention(float *out, float *partial, const float *q, const floa
     const unsigned h = blockIdx.x * 4 + threadIdx.x / 32, t = blockIdx.y, split = blockIdx.z;
     if (h >= H) return;
     const unsigned lane = threadIdx.x & 31, kh = h / (H / Hkv), n = sparse ? counts[t] : pos0 + t + 1;
+    const unsigned ns = min(splits, (n + 31) / 32), per_row = ns ? (n + ns - 1) / ns : 0;
+    (void)per;
     const uint64_t kv_dim = (uint64_t)Hkv * D, rb = kv_row_bytes(kv_dim, Q8);
     const unsigned e0 = Q8 ? lane * NPT : lane, es = Q8 ? 1 : 32;
     float qv[NPT], acc[NPT] = {}, m = -3e38f, denom = 0;
     for (unsigned i = 0; i < NPT; i++) qv[i] = q[((uint64_t)t * H + h) * D + e0 + es * i] * scale;
-    for (unsigned j = split * per; j < min(n, (split + 1) * per); j++) {
+    for (unsigned j = split * per_row; j < min(n, (split + 1) * per_row); j++) {
         const unsigned p = sparse ? (unsigned)sel[(uint64_t)t * stride + j] : j;
         if (p > pos0 + t) continue;
         float score = 0, x[NPT];

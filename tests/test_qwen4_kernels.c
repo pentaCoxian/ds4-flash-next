@@ -1082,6 +1082,58 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     ds4_gpu_tensor_free(partial);
 }
 
+#ifndef __APPLE__
+static void require_same_rows(const char *what, const float *got, const float *ref, uint64_t n);
+
+/* Split-key attention: each row of a verify batch gets the bits of the
+ * lone row at its position, its keys split by its own count. */
+static void test_attn_rows_exact(uint32_t pos0, bool sparse) {
+    const uint32_t T = 3, H = 24, Hkv = 2, D = 256, stride = 40, cap = pos0 + T;
+    const uint64_t qn = (uint64_t)T * H * D, kv_dim = (uint64_t)Hkv * D;
+    float *q = rand_vec(qn, 1.0f), *gate = rand_vec(qn, 2.0f);
+    _Float16 *kc = malloc((uint64_t)cap * kv_dim * 2), *vc = malloc((uint64_t)cap * kv_dim * 2);
+    for (uint64_t i = 0; i < (uint64_t)cap * kv_dim; i++) { kc[i] = (_Float16)(frand() - 0.5f); vc[i] = (_Float16)(frand() - 0.5f); }
+    int32_t *sel = malloc((uint64_t)T * stride * 4);
+    uint32_t cnt[3];
+    for (uint32_t t = 0; t < T; t++) {
+        cnt[t] = 30u + 3u * t;
+        for (uint32_t j = 0; j < stride; j++) sel[t * stride + j] = (int32_t)((j * 37u + t) % (pos0 + t + 1u));
+    }
+    void *krows = test_kv_rows(kc, cap, kv_dim), *vrows = test_kv_rows(vc, cap, kv_dim);
+    const uint64_t kv_bytes = (uint64_t)cap * test_kv_row_bytes(kv_dim);
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kv_bytes), *gv = ds4_gpu_tensor_alloc(kv_bytes);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * stride * 4), *gcnt = ds4_gpu_tensor_alloc(T * 4);
+    ds4_gpu_tensor *partial = ds4_gpu_tensor_alloc((uint64_t)T * H * 64 * (D + 2) * 4);
+    ds4_gpu_tensor *gq = upload(q, qn), *ggate = upload(gate, qn), *out = upload(NULL, qn), *one = upload(NULL, qn / T);
+    require_ok(gk && gv && gsel && gcnt && partial && ds4_gpu_tensor_write(gk, 0, krows, kv_bytes) &&
+               ds4_gpu_tensor_write(gv, 0, vrows, kv_bytes) && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * stride * 4) &&
+               ds4_gpu_tensor_write(gcnt, 0, cnt, T * 4), "attn rows setup");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(out, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0,
+                                                sparse, stride, 0.0625f), "attn rows batch");
+    float *all = download(out, qn);
+    char name[96];
+    for (uint32_t t = 0; t < T; t++) {
+        ds4_gpu_tensor *q1 = ds4_gpu_tensor_view(gq, (uint64_t)t * H * D * 4, (uint64_t)H * D * 4);
+        ds4_gpu_tensor *g1 = ds4_gpu_tensor_view(ggate, (uint64_t)t * H * D * 4, (uint64_t)H * D * 4);
+        ds4_gpu_tensor *s1 = ds4_gpu_tensor_view(gsel, (uint64_t)t * stride * 4, (uint64_t)stride * 4);
+        ds4_gpu_tensor *c1 = ds4_gpu_tensor_view(gcnt, (uint64_t)t * 4, 4);
+        require_ok(ds4_gpu_qwen4_attn_decode_tensor(one, q1, g1, gk, gv, s1, c1, partial, 1, H, Hkv, D, pos0 + t,
+                                                    sparse, stride, 0.0625f), "attn rows lone");
+        float *row = download(one, (uint64_t)H * D);
+        snprintf(name, sizeof(name), "attn rows pos0=%u %s%s row %u", pos0, sparse ? "sparse" : "dense",
+                 g_test_kv_q8 ? " q8" : "", t);
+        require_same_rows(name, all + (uint64_t)t * H * D, row, (uint64_t)H * D);
+        free(row);
+        ds4_gpu_tensor_free(c1); ds4_gpu_tensor_free(s1); ds4_gpu_tensor_free(g1); ds4_gpu_tensor_free(q1);
+    }
+    printf("  %-48s ok  verify rows = lone rows\n", name);
+    free(all); free(krows); free(vrows); free(sel); free(kc); free(vc); free(q); free(gate);
+    ds4_gpu_tensor_free(one); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ggate); ds4_gpu_tensor_free(gq);
+    ds4_gpu_tensor_free(partial); ds4_gpu_tensor_free(gcnt); ds4_gpu_tensor_free(gsel);
+    ds4_gpu_tensor_free(gv); ds4_gpu_tensor_free(gk);
+}
+#endif
+
 static void test_attn_mm(uint32_t T, uint32_t pos0, bool sparse) {
     test_attn_mm_keys(T, pos0, sparse, 6, 24, false);
 }
@@ -4912,6 +4964,16 @@ int main(void) {
     test_attn_mm(32, 4093, false);
     test_attn_mm(33, 8193, true);
     test_attn_mm(4, 100, false);
+#ifndef __APPLE__
+    for (int kvq = 1; kvq >= 0; kvq--) {
+        ds4_gpu_qwen4_set_kv_q8(kvq != 0);
+        g_test_kv_q8 = kvq != 0;
+        test_attn_rows_exact(41, false);
+        test_attn_rows_exact(1000, false);
+        test_attn_rows_exact(5000, false);
+        test_attn_rows_exact(5000, true);
+    }
+#endif
     ds4_gpu_qwen4_set_kv_q8(false);
     g_test_kv_q8 = false;
 #ifdef __APPLE__
