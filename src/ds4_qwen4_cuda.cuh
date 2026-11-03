@@ -1429,9 +1429,10 @@ static int current_tier() {
     return tier;
 }
 
-/* Activations their producer rounds to int8 as it writes them (the hc
- * norm's xn, the GDN output), a few per device by tensor.  A decode-sized
- * writer of such a tensor that does not round it drops its entry. */
+/* Activations their producer rounds to int8 as it writes them (the GDN
+ * output), a few per device by tensor.  A decode-sized writer of such a
+ * tensor that does not round it drops its entry (the hc norm's xn, which
+ * its few threads round slower than quantize_q8 does). */
 struct q8_entry { const void *x; unsigned T, K; int8_t *q; float *d; uint64_t cap; };
 static q8_entry g_q8_out[DS4_MAX_GPUS][4];
 
@@ -3013,12 +3014,12 @@ __global__ void vis_add(float *x, const float *add, const float *bias, unsigned 
  * (read one by one through scalar(), the cold rows cost 13 us a call).  With
  * COMBINE it first adds the block output weighted by the previous injection
  * to R and writes the sum to next: hc_combine and the norm in one pass.
- * With xq it also rounds xn to int8 for the down projection (E a multiple
- * of 256, so a warp's values are whole groups of 32). */
+ * The down projection rounds xn to int8 itself: rounding it here, with the
+ * few threads this kernel has, costs more than quantize_q8's launch. */
 template<unsigned TYPE, bool COMBINE>
 __global__ void hc_norm_rows(float *xn, float *inj, float *next, const float *R, const float *blk,
                              const float *oldinj, const float *gamma, const char *wi, unsigned E,
-                             unsigned hc, unsigned ni, float eps, int8_t *xq, float *xd) {
+                             unsigned hc, unsigned ni, float eps) {
     const unsigned stream = blockIdx.x / 8, chunk = blockIdx.x % 8, tok = blockIdx.y;
     const unsigned tid = threadIdx.x, dim = E * hc;
     const uint64_t base = ((uint64_t)tok * hc + stream) * E;
@@ -3038,13 +3039,6 @@ __global__ void hc_norm_rows(float *xn, float *inj, float *next, const float *R,
         if (COMBINE) next[base + i] = r;
         const float v = r * inv * gamma[stream * E + i];
         xn[base + i] = v;
-        if (xq) {   /* a warp's 32 values are a group: quantize_q8's rounding */
-            float a = fabsf(v);
-            for (unsigned o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, o));
-            const float sc = __fdiv_rn(a, 127.f);
-            xq[base + i] = (int8_t)__float2int_rn(sc > 0 ? __fdiv_rn(v, sc) : 0.f);
-            if (!(tid & 31)) xd[(base + i) / 32] = sc;
-        }
         for (unsigned j = 0; j < ni; j++) acc[j] += value<TYPE>(wi, j * dim + stream * E + i) * v;
     }
     for (unsigned j = 0; j < ni; j++) {
@@ -3496,9 +3490,7 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
     const char *gamma = weight(map, size, go, (uint64_t)E * hc * 4);
     const char *wi = ni ? weight(map, size, io, row_bytes(type, (uint64_t)E * hc) * ni) : gamma;
     if (!gamma || !wi || (type != 0 && type != 1 && type != 8 && type != 30)) return 0;
-    int8_t *xq = NULL;
-    float *xd = NULL;
-    if (T > 8 || E % 256 || !q8_out(xn->ptr, T, E * hc, &xq, &xd)) q8_out_drop(xn->ptr);
+    q8_out_drop(xn->ptr);
     if (T > 8) {
 #define QWEN_HC_NORM(TYPE) hc_norm_prefill<TYPE><<<dim3(hc,T),256,0,cuda_decode_stream()>>>((float *)xn->ptr, \
         ni ? (float *)inj->ptr : NULL,(const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps)
@@ -3510,7 +3502,7 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
         return launched();
     }
 #define QWEN_HC_ROWS(TYPE) hc_norm_rows<TYPE,false><<<dim3(hc*8,T),128,0,cuda_decode_stream()>>>((float *)xn->ptr, \
-        ni ? (float *)inj->ptr : NULL,NULL,(const float *)R->ptr,NULL,NULL,(const float *)gamma,wi,E,hc,ni,eps,xq,xd)
+        ni ? (float *)inj->ptr : NULL,NULL,(const float *)R->ptr,NULL,NULL,(const float *)gamma,wi,E,hc,ni,eps)
     if (type == 0) { QWEN_HC_ROWS(0); }
     else if (type == 1) { QWEN_HC_ROWS(1); }
     else if (type == 30) { QWEN_HC_ROWS(30); }
@@ -3941,12 +3933,10 @@ extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const 
         using namespace qwen4_cuda;
         const char *gamma = weight(map,size,go,(uint64_t)E*hc*4), *wi = weight(map,size,io,row_bytes(type,(uint64_t)E*hc)*ni);
         if (!gamma || !wi) return 0;
-        int8_t *xq = NULL;
-        float *xd = NULL;
-        if (E % 256 || !q8_out(xn->ptr, T, E * hc, &xq, &xd)) q8_out_drop(xn->ptr);
+        q8_out_drop(xn->ptr);
 #define QWEN_HC_COMBINE(TYPE) hc_norm_rows<TYPE,true><<<dim3(hc*8,T),128,0,cuda_decode_stream()>>>((float *)xn->ptr, \
         (float *)inj->ptr,(float *)next->ptr,(const float *)R->ptr,(const float *)blk->ptr,(const float *)oldinj->ptr, \
-        (const float *)gamma,wi,E,hc,ni,eps,xq,xd)
+        (const float *)gamma,wi,E,hc,ni,eps)
         if (type == 0) { QWEN_HC_COMBINE(0); }
         else if (type == 1) { QWEN_HC_COMBINE(1); }
         else if (type == 30) { QWEN_HC_COMBINE(30); }

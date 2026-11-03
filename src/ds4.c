@@ -60120,9 +60120,7 @@ static bool qwen4_layer_mixer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const 
 }
 
 static bool qwen4_layer_ffn_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
-    /* decode and verify rows, with or without MTP: the combine and the norm
-     * in one pass, each row the separate kernels' bits */
-    if (T <= 3u && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
+    if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
         (l->hc_ffn_inject->type == DS4_TENSOR_F16 || l->hc_ffn_inject->type == DS4_TENSOR_BF16)) {
         if (!ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
                 g->xn, g->inj_alt, g->R, m->map, m->size, l->hc_ffn_norm->abs_offset,
