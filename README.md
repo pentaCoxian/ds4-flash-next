@@ -15,6 +15,22 @@ the Flash-Next fork of [antirez/ds4](https://github.com/antirez/ds4)
 (DwarfStar). Upstream's prebuilt release does not have iq3m8 or the kernels
 that make it fast; build this one from source.
 
+## On two NVIDIA V100s
+
+The `cuda-v100` branch also runs iq3m8 resident on two 32 GB V100s (Volta,
+CUDA 12.x), on PCIe x8 without NVLink:
+
+- **262K context with MTP**, or two 262K conversations at once
+  (`--batched-session 2 --gpu-vram full`).
+- **Decode** at 91 to 178 tok/s greedy across the 11 tasks of the llama.cpp
+  V100 deployment's suite: 9.4% below llama.cpp on the same node at
+  temperature 0.8, and 5.7% below greedy.
+- **Prefill** at 1300 to 2560 tok/s, from 1.5K to 143K-token prompts.
+
+[NVIDIA V100](docs/CUDA_V100.md) covers the build, the files, the commands
+and how it works; [V100 status](docs/CUDA_V100_STATUS.md) has the benchmark
+and the work left.
+
 ## Quick start
 
 ```sh
@@ -164,9 +180,10 @@ for their numbers and [Models](docs/MODELS.md) for what fits where.
 
 ## Status
 
-Experimental, one developer, measured on one M3 Max. Everything else in ds4
-(other models, CUDA, distributed inference, SSD streaming) is inherited from
-upstream and should keep working, but is not the focus here.
+Experimental, one developer, measured on one M3 Max and, for the V100 path,
+one two-V100 node. Everything else in ds4 (other models, other CUDA GPUs,
+distributed inference, SSD streaming) is inherited from upstream and should
+keep working, but is not the focus here.
 
 The weights are under the Qwen Community License 1.0; read it before any
 commercial use. The code is MIT, like upstream.
@@ -176,6 +193,7 @@ commercial use. The code is MIT, like upstream.
 - [The fork in detail](docs/FLASH_NEXT_FORK.md): what changed, which Macs gain, the larger quants, contexts beyond 262K, running `ds4-server` by hand.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
 - [NVIDIA V100](docs/CUDA_V100.md): iq3m8 on two 32 GB V100s, its speeds, switches, and how the CUDA path gets there.
+- [V100 status](docs/CUDA_V100_STATUS.md): the benchmark against llama.cpp on the same node, and what is left.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): Qwen MTP, the depth policy, and sampling.
 - [Serving](docs/SERVER.md): APIs, the live dashboard, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): OpenCode, DSH, Pi, Codex CLI, and Claude Code.

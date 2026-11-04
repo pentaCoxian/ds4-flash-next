@@ -14,11 +14,11 @@ the speed goal is not met yet.
   shared prefill workspace and `--gpu-vram full`.
 - **Decode:** at parity on prose, japanese and math. Long-context (-16% at
   32K, -22% at 128K) and summarize (-15%) trail most.
-- **Prefill:** within 6% of llama.cpp at every prompt size, and slightly
+- **Prefill:** within 7% of llama.cpp at every prompt size, and slightly
   faster at 2.6K tokens.
 - **Two requests at once:** 176 tok/s total sampled and 190 greedy, 1.34x and
   1.41x a single stream.
-- **Code:** three commits on `cuda-v100`, not pushed as of this writing.
+- **Code:** three commits on `cuda-v100`, pushed on 2026-11-04.
 
 All numbers are from build 318b984, measured on 2026-11-03.
 
@@ -117,7 +117,7 @@ at temp 0.8. Greedy is compared against that same reference. The previous run
 on this build gave -8.8% and -5.2%, so the difference is run-to-run
 variation from sampling.
 
-Prefill is within 6% of llama.cpp at every prompt size (first request, no
+Prefill is within 7% of llama.cpp at every prompt size (first request, no
 cache):
 
 | Prompt | ds4 (tok/s) | llama.cpp (tok/s) |
@@ -211,7 +211,8 @@ The benchmark drives the llama.cpp suite's own prompts
 (`/workspace/src/llama.cpp/deploy/qwen38-v100/bench/tasks.py`) with
 llama-server's default sampling and seeds. The llama.cpp reference is
 `/workspace/qwen38/task-bench.json`. The runner scripts (`tasks_ds4.py`,
-`tasks_pair.py`) are not in the repo yet.
+`tasks_pair.py`) are not in the repo yet. [Running](CUDA_V100.md#running)
+says where the draft list comes from.
 
 Switches for experiments, all documented in [CUDA_V100.md](CUDA_V100.md):
 
@@ -227,8 +228,8 @@ Switches for experiments, all documented in [CUDA_V100.md](CUDA_V100.md):
 
 ## Commits and open items
 
-Three commits sit on `cuda-v100`, all from 2026-11-03 and none pushed as of
-this writing.
+The work is in three commits on `cuda-v100` from 2026-11-03, pushed on
+2026-11-04.
 
 | Commit | Change |
 |---|---|
@@ -236,7 +237,6 @@ this writing.
 | 09dc6da | Verify up to three MTP drafts on CUDA, and draft from the sampled token |
 | c75b658 | Two 262K MTP slots on the V100 pair; int8 block keys and faster prefill (CUDA) |
 
-- [ ] Decide whether to push the three commits to `cuda-v100`.
 - [ ] Decide whether the benchmark runner scripts should move into the repo,
   so the suite can be rerun after this session.
 - [ ] Close the remaining decode gap (see next steps above).

@@ -7,45 +7,43 @@ over the two GPUs. The CUDA path for Qwen3.8 has Volta-specific kernels for
 decode, MTP verification and prefill, and it pipelines work over the two GPUs.
 Everything on this page is CUDA-only; the Metal path is unchanged.
 
-The reference machine has two Tesla V100-SXM2-32GB and CUDA 12.9. Its two
-GPUs are linked by NVLink. The intended deployment is two
-PCIe cards (x8/x8) without NVLink or peer access. That case was measured
-by sending every cross-GPU copy through host memory (`DS4_FORCE_HOST_BOUNCE=1`);
-the numbers below stay within 1 to 2% of the NVLink ones.
+Development started on two NVLink-linked Tesla V100-SXM2-32GB with CUDA
+12.9. Every number below comes from the deployment node: the same cards on
+PCIe 3.0 x8 each, on different sockets, without NVLink or peer access, at a
+200 W power limit, with a 2013 Xeon host. Cross-GPU copies go through host
+memory.
 
 ## Speed
 
-iq3m8, two V100s, `--gpu-vram auto`. Decode is 256 generated tokens, greedy
-unless noted; "with MTP" means `--mtp`, which includes the lookahead
-described below.
+262K context, `--gpu-vram 31,31 --prefill-chunk 3072` (see Running), `--mtp`
+with the 64K multilingual draft list. Decode was measured through
+`ds4-server` with the 11-task suite of the
+[llama.cpp V100 deployment](https://github.com/pentaCoxian/Qwen-V100-llama.cpp/tree/qwen38-v100/deploy/qwen38-v100):
+its prompts, seeds and default sampling (temperature 0.8, top_k 40, top_p
+0.95, min_p 0.05), plus a greedy pass. Speed is the tokens after the first
+over the time after the first, the mean of two runs (one for the long
+prompts). llama.cpp ran the same suite on the same node with its own quant,
+IQ3E-Q8D.
 
-| Decode, tok/s | Code | Prose | Tech |
+| Decode, tok/s | ds4, T=0.8 | ds4, greedy | llama.cpp, T=0.8 |
 |---|---|---|---|
-| plain | 72 | 72 | 72 |
-| with MTP, greedy | 142 | 116 | 128 |
-| with MTP, temperature 0.7 (mean of 3 seeds) | 127 | 95 | 119 |
+| prose | 91 | 91 | 94 |
+| explain | 119 | 127 | 130 |
+| codegen | 160 | 169 | 174 |
+| code-edit, 1.4K-token file | 168 | 173 | 189 |
+| summarize, 2.6K-token prompt | 113 | 116 | 132 |
+| translate, 1.1K-token prompt | 140 | 146 | 156 |
+| json, 2.6K-token prompt | 171 | 178 | 187 |
+| japanese | 96 | 91 | 92 |
+| math-think | 142 | 148 | 146 |
+| after a 34K-token prompt | 113 | 124 | 135 |
+| after a 142K-token prompt | 102 | 112 | 130 |
 
-The code, prose and tech prompts are three short questions: a linked-list
-function, why the sky is blue, and TCP against UDP. MTP speed depends on how
-predictable the answer is. A long prompt costs little: a 12K-token prompt
-decodes at 142 tok/s with MTP (66 plain), and a 34K-token prompt at a 262K
-context also at 142.
-
-| Prefill | tok/s |
-|---|---|
-| 630-token prompt | 1000 |
-| 2.4K-token prompt | 1315 |
-| 12K-token prompt | 1900 |
-| 34K-token prompt, 262K context | 1680 |
-
-For comparison, the first working CUDA build decoded at 23 tok/s (33 with
-MTP) and prefilled at 270 tok/s on the same machine.
-
-### Two PCIe x8/x8 cards
-
-Measured on the deployment layout: two V100-SXM2-32GB on PCIe 3.0 x8 each,
-on different sockets, no peer access, 200 W power limit, a 2013 Xeon host.
-262K context, `--gpu-vram 31,31 --prefill-chunk 3072` (see Running).
+Over the 11 tasks ds4 decodes 9.4% slower than llama.cpp at temperature 0.8
+(geometric mean) and 5.7% slower greedy. It matches llama.cpp on prose,
+Japanese and math, and trails most at long context. [Status](CUDA_V100_STATUS.md)
+has the breakdown, what closed the gap so far and what is left. Plain decode
+without MTP runs at 67 tok/s, 62 after a 143K-token prompt.
 
 | Prefill, tok/s | |
 |---|---|
@@ -55,9 +53,14 @@ on different sockets, no peer access, 200 W power limit, a 2013 Xeon host.
 | 143K-token prompt | 2550-2560 |
 | 448K-token prompt, 524K context (YaRN 2, 1024-row chunks) | 1850 |
 
-Decode with MTP, greedy, 512 tokens: code 135, tech 110, prose 99 tok/s; a
-copy-heavy edit of a 1.4K-token file 157-161; 102 after a 148K-token prompt
-and 83 after a 448K-token one.  Plain decode 67 tok/s, 62 at 143K.
+These are engine timings. Through the server, timed to the first streamed
+token, the suite's prompts prefill at 1110 tok/s (1.1K tokens) to 2430
+(142K), within 7% of llama.cpp at every size. At 524K context, MTP decode
+ran at 83 tok/s after the 448K-token prompt (measured before the 4-row
+windows).
+
+The first working CUDA build decoded at 23 tok/s (33 with MTP) and
+prefilled at 270 tok/s.
 
 ## Build
 
@@ -93,6 +96,7 @@ some room.
 M=~/models/flash-next
 export DS4_QWEN_NGRAM_GGUF=$M/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf
 export DS4_QWEN_MTP_GGUF=$M/Qwen3.8-Flash-Next-MTP-block.gguf
+export DS4_QWEN4_MTP_DRAFT_VOCAB=$M/draftvocab-64k-ml.ids   # optional, see below
 W=$M/IQ3_XXS_M64_HC8/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS_M64_HC8-00001-of-00002.gguf
 
 ./ds4 --cuda --gpu-devices 0,1 --gpu-vram auto -m $W --ctx 32768 --mtp
@@ -102,8 +106,17 @@ W=$M/IQ3_XXS_M64_HC8/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS_M64_HC8-00001-of-00002.g
 ```
 
 `--gpu-vram auto` budgets 29 GB a GPU and fits 262K of context with MTP. The prefill chunk defaults to 2048 tokens, and to 1024 at 128K and above
-to keep the transients within those budgets. The speeds above were measured
-with `ds4`; the server runs the same session code.
+to keep the transients within those budgets. The server runs the same
+session code as `ds4`.
+
+The draft list is optional; without it the drafts cover the first 98,304
+vocabulary rows, which leave out many CJK tokens (see MTP). It is the 64K
+list of the llama.cpp deployment, without its comment line:
+
+```sh
+curl -sL https://raw.githubusercontent.com/pentaCoxian/Qwen-V100-llama.cpp/qwen38-v100/deploy/qwen38-v100/draftvocab-64k-ml.txt \
+    | grep -v '^#' > $M/draftvocab-64k-ml.ids
+```
 
 `--gpu-vram auto` leaves each card about 2.5 GB more than it needs. An
 explicit `--gpu-vram 31,31` hands it to the planner, and then 262K takes
@@ -149,6 +162,10 @@ its lookahead.
 | Server chat, greedy, both at once | 102 | 85 | 187 |
 | Server chat, T=0.7, both at once | 92 | 71 | 163 |
 | Server, both after ~240K-token prompts | 72 | 75 | 147 |
+
+Over the 9 short tasks of the llama.cpp suite (see Speed), each sent twice
+at once, the pair averaged 190 tok/s greedy and 176 at temperature 0.8:
+1.41x and 1.34x one stream.
 
 Prefill and decode take turns, in time shares of about half each: a waiting
 prefill gets the model for one quantum between decode cycles, and decode
@@ -374,9 +391,9 @@ model level, two checks catch most regressions:
   these are untested there. The Volta expert tiles stay Volta-only, and 8-bit
   K/V is not the default on sm_80 and later.
 
-For the same model on two PCIe V100s, the patched llama.cpp in
-[qwen38-v100-patches](https://github.com/Warabii1248/qwen38-v100-patches)
-reports 1100 to 2600 tok/s prefill and 92 to 185 tok/s decode, depending on
-prompt length and how well the MTP drafts are accepted. That is a different
-quant on a different machine; the ideas for the prefill pipeline and the
-lookahead come from there.
+The ideas for the prefill pipeline and the lookahead come from the patched
+llama.cpp in
+[qwen38-v100-patches](https://github.com/Warabii1248/qwen38-v100-patches).
+The llama.cpp numbers under Speed are from the
+[Qwen-V100-llama.cpp](https://github.com/pentaCoxian/Qwen-V100-llama.cpp/tree/qwen38-v100/deploy/qwen38-v100)
+deployment on this same node, with a different quant (IQ3E-Q8D).
