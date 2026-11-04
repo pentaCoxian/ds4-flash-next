@@ -1,6 +1,6 @@
 # Qwen3.8 Flash Next on NVIDIA V100
 
-[README](../README.md) | [CUDA GPUs](CUDA_MULTI_GPU.md) | [Qwen3.8 Flash Next](QWEN38_FLASH_NEXT.md)
+[README](../README.md) | [CUDA GPUs](CUDA_MULTI_GPU.md) | [Qwen3.8 Flash Next](QWEN38_FLASH_NEXT.md) | [Status](CUDA_V100_STATUS.md)
 
 iq3m8 runs resident on two 32 GB V100s (Volta, `sm_70`), its layers split
 over the two GPUs. The CUDA path for Qwen3.8 has Volta-specific kernels for
