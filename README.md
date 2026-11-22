@@ -173,6 +173,7 @@ commercial use. The code is MIT, like upstream.
 
 ## More
 
+- [Handover](docs/HANDOVER.md): where the work stands, the branches, open work, and how to measure, for whoever continues it.
 - [The fork in detail](docs/FLASH_NEXT_FORK.md): what changed, which Macs gain, the larger quants, contexts beyond 262K, running `ds4-server` by hand.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): Qwen MTP, the depth policy, and sampling.

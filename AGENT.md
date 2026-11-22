@@ -1,5 +1,8 @@
 # Agent Notes
 
+This fork's state, branches and open work are in
+[docs/HANDOVER.md](docs/HANDOVER.md); read it before starting.
+
 `ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
 GGUF runner. The goal is a small, readable, high-performance C codebase with
 Objective-C only where Metal requires it and Metal kernels under `metal/`.
